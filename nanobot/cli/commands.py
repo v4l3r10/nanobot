@@ -915,6 +915,10 @@ def _run_gateway(
     agent.dream.max_batch_size = dream_cfg.max_batch_size
     agent.dream.max_iterations = dream_cfg.max_iterations
     agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
+    agent.dream.memory_file_max_chars = dream_cfg.memory_file_max_chars
+    agent.dream.soul_file_max_chars = dream_cfg.soul_file_max_chars
+    agent.dream.user_file_max_chars = dream_cfg.user_file_max_chars
+    agent.dream.history_entry_preview_max_chars = dream_cfg.history_entry_preview_max_chars
     from nanobot.cron.types import CronJob, CronPayload
     cron.register_system_job(CronJob(
         id="dream",
