@@ -59,6 +59,15 @@ class DreamConfig(Base):
     # on — set to False to feed MEMORY.md raw if a specific LLM reacts poorly
     # to the `← Nd` suffix or you want deterministic, git-independent prompts.
     annotate_line_ages: bool = True
+    # Caps on file/history previews embedded in Phase 1 (and Phase 2 preview)
+    # prompts. Phase 2 still has the full file via the read_file tool — these
+    # caps only bound what Phase 1 sees in a single LLM call. A value of 0 is
+    # a sentinel meaning "no cap" (truncate_text returns the full content).
+    # Defaults match the historical hardcoded class constants on Dream.
+    memory_file_max_chars: int = Field(default=32_000, ge=0)
+    soul_file_max_chars: int = Field(default=16_000, ge=0)
+    user_file_max_chars: int = Field(default=16_000, ge=0)
+    history_entry_preview_max_chars: int = Field(default=4_000, ge=0)
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""

@@ -307,3 +307,119 @@ class TestDreamPromptCaps:
         history_section = user_msg.split("## Conversation History\n")[1].split("\n\n## Current Date")[0]
         assert len(history_section) < dream._HISTORY_ENTRY_PREVIEW_MAX_CHARS + 500
 
+
+class TestDreamConfigurableCaps:
+    """The four prompt-preview caps (memory/soul/user/history) can be overridden
+    at __init__ so DreamConfig values from config.json take effect. The class
+    constants remain as backward-compatible defaults for callers that don't
+    pass them explicitly."""
+
+    def test_init_defaults_match_class_constants(self, store, mock_provider):
+        d = Dream(store=store, provider=mock_provider, model="m")
+
+        assert d.memory_file_max_chars == Dream._MEMORY_FILE_MAX_CHARS
+        assert d.soul_file_max_chars == Dream._SOUL_FILE_MAX_CHARS
+        assert d.user_file_max_chars == Dream._USER_FILE_MAX_CHARS
+        assert (
+            d.history_entry_preview_max_chars == Dream._HISTORY_ENTRY_PREVIEW_MAX_CHARS
+        )
+
+    def test_init_accepts_custom_caps(self, store, mock_provider):
+        d = Dream(
+            store=store,
+            provider=mock_provider,
+            model="m",
+            memory_file_max_chars=50_000,
+            soul_file_max_chars=8_000,
+            user_file_max_chars=8_000,
+            history_entry_preview_max_chars=2_000,
+        )
+
+        assert d.memory_file_max_chars == 50_000
+        assert d.soul_file_max_chars == 8_000
+        assert d.user_file_max_chars == 8_000
+        assert d.history_entry_preview_max_chars == 2_000
+
+    async def test_phase1_respects_custom_memory_cap(
+        self, store, mock_provider, mock_runner,
+    ):
+        """A small custom memory_file_max_chars truncates more aggressively."""
+        d = Dream(
+            store=store,
+            provider=mock_provider,
+            model="m",
+            max_batch_size=5,
+            memory_file_max_chars=1_000,
+        )
+        d._runner = mock_runner
+
+        store.write_memory("M" * 10_000)
+        store.append_history("event")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await d.run()
+
+        user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        memory_section = user_msg.split("## Current MEMORY.md")[1].split("## Current SOUL.md")[0]
+        assert len(memory_section) < 1_500
+        assert "(truncated)" in memory_section
+
+    async def test_phase1_zero_cap_disables_truncation(
+        self, store, mock_provider, mock_runner,
+    ):
+        """memory_file_max_chars=0 is the truncate_text sentinel for 'no cap'.
+        The full memory file must reach the prompt preview unchanged."""
+        d = Dream(
+            store=store,
+            provider=mock_provider,
+            model="m",
+            max_batch_size=5,
+            memory_file_max_chars=0,
+        )
+        d._runner = mock_runner
+
+        big_memory = "Mline\n" * 10_000  # ~60KB — would truncate under the 32K default
+        store.write_memory(big_memory)
+        store.append_history("event")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await d.run()
+
+        user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        memory_section = user_msg.split("## Current MEMORY.md")[1].split("## Current SOUL.md")[0]
+        assert "(truncated)" not in memory_section
+        assert memory_section.count("Mline") == 10_000
+
+    async def test_phase1_respects_custom_history_cap(
+        self, store, mock_provider, mock_runner,
+    ):
+        """history_entry_preview_max_chars caps each entry independently."""
+        d = Dream(
+            store=store,
+            provider=mock_provider,
+            model="m",
+            max_batch_size=5,
+            history_entry_preview_max_chars=200,
+        )
+        d._runner = mock_runner
+
+        store.history_file.write_text(
+            json.dumps({
+                "cursor": 1,
+                "timestamp": "2026-04-01 10:00",
+                "content": "H" * 5_000,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await d.run()
+
+        user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        history_section = user_msg.split("## Conversation History\n")[1].split("\n\n## Current Date")[0]
+        assert len(history_section) < 400
+        assert "(truncated)" in history_section
+

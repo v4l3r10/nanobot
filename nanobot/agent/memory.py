@@ -794,6 +794,10 @@ class Dream:
     # context window just because a file (or a legacy large history entry) grew
     # unexpectedly. Each file still appears in full via read_file when the agent
     # needs it in Phase 2 — these caps only bound the Phase 1/2 prompt preview.
+    # The class constants below are the historical defaults; runtime values are
+    # held on the instance (`self.memory_file_max_chars` etc.) so they can be
+    # overridden via DreamConfig in config.json. A value of 0 disables the cap
+    # (truncate_text returns the full content unchanged).
     _MEMORY_FILE_MAX_CHARS = 32_000
     _SOUL_FILE_MAX_CHARS = 16_000
     _USER_FILE_MAX_CHARS = 16_000
@@ -808,6 +812,10 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
+        memory_file_max_chars: int | None = None,
+        soul_file_max_chars: int | None = None,
+        user_file_max_chars: int | None = None,
+        history_entry_preview_max_chars: int | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -819,6 +827,28 @@ class Dream:
         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
+        # Prompt-preview caps. None means "use the class default" — keeps
+        # backward compatibility with callers that don't pass these kwargs.
+        self.memory_file_max_chars = (
+            memory_file_max_chars
+            if memory_file_max_chars is not None
+            else self._MEMORY_FILE_MAX_CHARS
+        )
+        self.soul_file_max_chars = (
+            soul_file_max_chars
+            if soul_file_max_chars is not None
+            else self._SOUL_FILE_MAX_CHARS
+        )
+        self.user_file_max_chars = (
+            user_file_max_chars
+            if user_file_max_chars is not None
+            else self._USER_FILE_MAX_CHARS
+        )
+        self.history_entry_preview_max_chars = (
+            history_entry_preview_max_chars
+            if history_entry_preview_max_chars is not None
+            else self._HISTORY_ENTRY_PREVIEW_MAX_CHARS
+        )
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -951,7 +981,7 @@ class Dream:
         # record (e.g. pre-#3412 raw_archive dump) can't blow up the prompt.
         history_text = "\n".join(
             f"[{e['timestamp']}] "
-            f"{truncate_text(e['content'], self._HISTORY_ENTRY_PREVIEW_MAX_CHARS)}"
+            f"{truncate_text(e['content'], self.history_entry_preview_max_chars)}"
             for e in batch
         )
 
@@ -965,12 +995,12 @@ class Dream:
             if self.annotate_line_ages
             else raw_memory
         )
-        current_memory = truncate_text(annotated_memory, self._MEMORY_FILE_MAX_CHARS)
+        current_memory = truncate_text(annotated_memory, self.memory_file_max_chars)
         current_soul = truncate_text(
-            self.store.read_soul() or "(empty)", self._SOUL_FILE_MAX_CHARS,
+            self.store.read_soul() or "(empty)", self.soul_file_max_chars,
         )
         current_user = truncate_text(
-            self.store.read_user() or "(empty)", self._USER_FILE_MAX_CHARS,
+            self.store.read_user() or "(empty)", self.user_file_max_chars,
         )
 
         file_context = (
