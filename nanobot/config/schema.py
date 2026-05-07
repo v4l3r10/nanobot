@@ -59,6 +59,12 @@ class DreamConfig(Base):
     soul_file_max_chars: int = Field(default=16_000, ge=0)
     user_file_max_chars: int = Field(default=16_000, ge=0)
     history_entry_preview_max_chars: int = Field(default=4_000, ge=0)
+    # Cap on the size of a single Phase 2 tool result (e.g. read_file MEMORY.md)
+    # before it gets re-injected into the LLM context as a tool message. Mirrors
+    # AgentDefaults.max_tool_result_chars but isolated for Dream so users can
+    # raise it for memory-heavy Phase 2 reads without enlarging tool spam in
+    # regular sessions. 0 disables the cap (truncate_text sentinel).
+    max_tool_result_chars: int = Field(default=16_000, ge=0)
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""

@@ -62,6 +62,9 @@ def test_dream_config_default_prompt_caps_match_dream_class_constants() -> None:
         == Dream._HISTORY_ENTRY_PREVIEW_MAX_CHARS
         == 4_000
     )
+    # max_tool_result_chars default mirrors the historical Dream.__init__ default,
+    # which itself mirrors AgentDefaults.max_tool_result_chars.
+    assert cfg.max_tool_result_chars == 16_000
 
 
 def test_dream_config_accepts_camel_case_prompt_caps() -> None:
@@ -70,12 +73,14 @@ def test_dream_config_accepts_camel_case_prompt_caps() -> None:
         "soulFileMaxChars": 8_000,
         "userFileMaxChars": 8_000,
         "historyEntryPreviewMaxChars": 2_000,
+        "maxToolResultChars": 32_000,
     })
 
     assert cfg.memory_file_max_chars == 50_000
     assert cfg.soul_file_max_chars == 8_000
     assert cfg.user_file_max_chars == 8_000
     assert cfg.history_entry_preview_max_chars == 2_000
+    assert cfg.max_tool_result_chars == 32_000
 
 
 def test_dream_config_accepts_snake_case_prompt_caps() -> None:
@@ -83,18 +88,25 @@ def test_dream_config_accepts_snake_case_prompt_caps() -> None:
     cfg = DreamConfig.model_validate({
         "memory_file_max_chars": 64_000,
         "history_entry_preview_max_chars": 8_000,
+        "max_tool_result_chars": 64_000,
     })
 
     assert cfg.memory_file_max_chars == 64_000
     assert cfg.history_entry_preview_max_chars == 8_000
+    assert cfg.max_tool_result_chars == 64_000
 
 
 def test_dream_config_zero_disables_cap() -> None:
     """A cap of 0 is the truncate_text sentinel for 'no truncation'."""
-    cfg = DreamConfig(memory_file_max_chars=0, history_entry_preview_max_chars=0)
+    cfg = DreamConfig(
+        memory_file_max_chars=0,
+        history_entry_preview_max_chars=0,
+        max_tool_result_chars=0,
+    )
 
     assert cfg.memory_file_max_chars == 0
     assert cfg.history_entry_preview_max_chars == 0
+    assert cfg.max_tool_result_chars == 0
 
 
 def test_dream_config_rejects_negative_prompt_caps() -> None:
@@ -104,10 +116,12 @@ def test_dream_config_rejects_negative_prompt_caps() -> None:
 
     with pytest.raises(ValidationError):
         DreamConfig(memory_file_max_chars=-1)
+    with pytest.raises(ValidationError):
+        DreamConfig(max_tool_result_chars=-1)
 
 
 def test_dream_config_dump_uses_camel_case_for_prompt_caps() -> None:
-    cfg = DreamConfig(memory_file_max_chars=24_000)
+    cfg = DreamConfig(memory_file_max_chars=24_000, max_tool_result_chars=24_000)
 
     dumped = cfg.model_dump(by_alias=True)
 
@@ -115,3 +129,20 @@ def test_dream_config_dump_uses_camel_case_for_prompt_caps() -> None:
     assert dumped["soulFileMaxChars"] == 16_000
     assert dumped["userFileMaxChars"] == 16_000
     assert dumped["historyEntryPreviewMaxChars"] == 4_000
+    assert dumped["maxToolResultChars"] == 24_000
+
+
+def test_dream_config_max_tool_result_chars_independent_from_agent_defaults() -> None:
+    """DreamConfig.max_tool_result_chars is a Dream-scoped value: setting it does NOT
+    change AgentDefaults.max_tool_result_chars, and vice versa. This isolates the cap
+    used by Dream's Phase 2 read_file from the cap used by regular session tool calls.
+    """
+    from nanobot.config.schema import AgentDefaults
+
+    defaults = AgentDefaults.model_validate({
+        "max_tool_result_chars": 8_000,
+        "dream": {"max_tool_result_chars": 64_000},
+    })
+
+    assert defaults.max_tool_result_chars == 8_000
+    assert defaults.dream.max_tool_result_chars == 64_000
