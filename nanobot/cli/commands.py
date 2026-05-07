@@ -1206,6 +1206,7 @@ def _run_gateway(
     agent.dream.soul_file_max_chars = dream_cfg.soul_file_max_chars
     agent.dream.user_file_max_chars = dream_cfg.user_file_max_chars
     agent.dream.history_entry_preview_max_chars = dream_cfg.history_entry_preview_max_chars
+    agent.dream.max_tool_result_chars = dream_cfg.max_tool_result_chars
     from nanobot.cron.types import CronJob, CronPayload, CronSchedule
     if dream_cfg.enabled:
         cron.register_system_job(CronJob(
