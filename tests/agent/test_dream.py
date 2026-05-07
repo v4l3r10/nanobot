@@ -333,12 +333,22 @@ class TestDreamConfigurableCaps:
             soul_file_max_chars=8_000,
             user_file_max_chars=8_000,
             history_entry_preview_max_chars=2_000,
+            max_tool_result_chars=64_000,
         )
 
         assert d.memory_file_max_chars == 50_000
         assert d.soul_file_max_chars == 8_000
         assert d.user_file_max_chars == 8_000
         assert d.history_entry_preview_max_chars == 2_000
+        assert d.max_tool_result_chars == 64_000
+
+    def test_init_max_tool_result_chars_default(self, store, mock_provider):
+        """Default mirrors AgentDefaults.max_tool_result_chars (16_000) so Dream's
+        Phase 2 tool-result truncation matches the historical behavior when the
+        config doesn't override it."""
+        d = Dream(store=store, provider=mock_provider, model="m")
+
+        assert d.max_tool_result_chars == 16_000
 
     async def test_phase1_respects_custom_memory_cap(
         self, store, mock_provider, mock_runner,
