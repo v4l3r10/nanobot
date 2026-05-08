@@ -1218,6 +1218,7 @@ class Dream:
 
         tools = self._tools
         skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
+        journal_path = f"memory/journal/{current_date}.md"
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
@@ -1225,6 +1226,8 @@ class Dream:
                     "agent/dream_phase2.md",
                     strip=True,
                     skill_creator_path=str(skill_creator_path),
+                    journal_path=journal_path,
+                    daily_notes_enabled=self.daily_notes_enabled,
                 ),
             },
             {"role": "user", "content": phase2_prompt},

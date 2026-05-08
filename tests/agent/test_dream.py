@@ -606,3 +606,68 @@ class TestDreamJournalInjection:
         assert "[DAILY]" in system_msg
         assert "Daily journal" in system_msg or "daily journal" in system_msg.lower()
 
+
+class TestDreamPhase2DailyJournal:
+    """Phase 2's system prompt must teach the LLM how to write/append the
+    journal note for today, using edit_file with old_text='' for create."""
+
+    async def test_phase2_prompt_includes_today_journal_path(self, dream, mock_provider, mock_runner, store):
+        store.append_history("anything")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[DAILY] Eventi: shipped")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await dream.run()
+
+        phase2_system = mock_runner.run.call_args[0][0].initial_messages[0]["content"]
+        # Path must follow memory/journal/YYYY-MM-DD.md, today's date.
+        today = dream._today()
+        assert f"memory/journal/{today}.md" in phase2_system
+
+    async def test_phase2_prompt_documents_create_and_append_rules(self, dream, mock_provider, mock_runner, store):
+        store.append_history("anything")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[DAILY] Eventi: shipped")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await dream.run()
+
+        phase2_system = mock_runner.run.call_args[0][0].initial_messages[0]["content"]
+        # Create rule: edit_file with old_text=""
+        assert "old_text=\"\"" in phase2_system or 'old_text=""' in phase2_system
+        # Standard skeleton sections must be in the prompt so the LLM seeds
+        # the file consistently across days.
+        for section in ("Conversazioni", "Decisioni", "Eventi", "Pending"):
+            assert f"## {section}" in phase2_system
+
+    async def test_phase2_prompt_omits_daily_section_when_disabled(self, store, mock_provider, mock_runner):
+        store.append_history("anything")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        d = Dream(
+            store=store, provider=mock_provider, model="m",
+            daily_notes_enabled=False,
+        )
+        d._runner = mock_runner
+        await d.run()
+
+        phase2_system = mock_runner.run.call_args[0][0].initial_messages[0]["content"]
+        assert "Daily journal note" not in phase2_system
+        assert "memory/journal/" not in phase2_system
+
+    async def test_edit_file_can_create_journal_when_missing(self, dream, store):
+        """Sanity: the existing edit_file tool already supports old_text=''
+        create-on-empty inside workspace, so no new tool wiring is needed."""
+        edit_tool = dream._tools.get("edit_file")
+        assert edit_tool is not None
+
+        target = "memory/journal/2026-05-08.md"
+        result = await edit_tool.execute(
+            path=target,
+            old_text="",
+            new_text="# 2026-05-08\n\n## Eventi\n",
+        )
+
+        assert "Successfully created" in result
+        assert (store.workspace / target).exists()
+        assert "# 2026-05-08" in (store.workspace / target).read_text(encoding="utf-8")
+
