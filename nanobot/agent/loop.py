@@ -298,6 +298,7 @@ class AgentLoop:
             store=self.context.memory,
             provider=provider,
             model=self.model,
+            timezone=timezone,
         )
         self._register_default_tools()
         if _tc.my.enable:
