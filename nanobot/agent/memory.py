@@ -775,6 +775,9 @@ class Dream:
         user_file_max_chars: int | None = None,
         history_entry_preview_max_chars: int | None = None,
         timezone: str | None = None,
+        daily_notes_enabled: bool = True,
+        daily_notes_context_days: int = 2,
+        daily_notes_max_chars: int = 8_000,
     ):
         self.store = store
         self.provider = provider
@@ -813,6 +816,13 @@ class Dream:
             if history_entry_preview_max_chars is not None
             else self._HISTORY_ENTRY_PREVIEW_MAX_CHARS
         )
+        # Daily notes — episodic per-day layer Dream produces under
+        # memory/journal/. Phase 1 loads the most recent N notes (yesterday
+        # + today by default) so it has temporal context without re-reading
+        # the full unprocessed history every cycle.
+        self.daily_notes_enabled = daily_notes_enabled
+        self.daily_notes_context_days = daily_notes_context_days
+        self.daily_notes_max_chars = daily_notes_max_chars
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -892,6 +902,25 @@ class Dream:
             tz = None
         now = datetime.now(tz=tz) if tz else datetime.now().astimezone()
         return now.strftime("%Y-%m-%d")
+
+    def _build_journal_section(self) -> str:
+        """Render the recent journal notes as a Phase 1 prompt section.
+
+        Returns an empty string when the feature is disabled, no notes
+        exist, or the configured cap is 0 (no slot to show them in).
+        The combined text is truncated as a whole to ``daily_notes_max_chars``
+        so a single very long note cannot crowd out the rest of the prompt.
+        """
+        if not self.daily_notes_enabled:
+            return ""
+        notes = self.store.list_recent_journal_notes(self.daily_notes_context_days)
+        if not notes:
+            return ""
+        rendered = "\n\n".join(
+            f"### {date}.md\n{content}" for date, content in notes
+        )
+        capped = truncate_text(rendered, self.daily_notes_max_chars)
+        return f"## Recent Journal Notes ({len(capped)} chars)\n{capped}"
 
     def _annotate_with_ages(self, content: str) -> str:
         """Append per-line age suffixes to MEMORY.md content.
@@ -979,10 +1008,12 @@ class Dream:
         current_user = truncate_text(
             self.store.read_user() or "(empty)", self.user_file_max_chars,
         )
+        journal_section = self._build_journal_section()
 
         file_context = (
             f"## Current Date\n{current_date}\n\n"
-            f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
+            + (f"{journal_section}\n\n" if journal_section else "")
+            + f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
             f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
             f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
         )

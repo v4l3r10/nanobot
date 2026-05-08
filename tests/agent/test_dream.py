@@ -500,3 +500,109 @@ class TestDreamTimezone:
         user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
         assert "## Current Date\n2026-05-09" in user_msg
 
+
+class TestDreamJournalInjection:
+    """Phase 1 must surface the most recent journal notes so Dream has temporal
+    context when deciding what to add/remove/forward."""
+
+    async def test_journal_section_omitted_when_disabled(self, store, mock_provider, mock_runner):
+        store.append_history("anything")
+        store.write_journal("2026-05-08", "# 2026-05-08\n- yesterday's stuff")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        d = Dream(
+            store=store, provider=mock_provider, model="m",
+            daily_notes_enabled=False,
+        )
+        d._runner = mock_runner
+        await d.run()
+
+        user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        assert "Recent Journal Notes" not in user_msg
+
+    async def test_journal_section_omitted_when_no_notes(self, dream, mock_provider, mock_runner, store):
+        store.append_history("anything")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await dream.run()
+
+        user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        assert "Recent Journal Notes" not in user_msg
+
+    async def test_journal_section_includes_recent_notes_newest_first(self, dream, mock_provider, mock_runner, store):
+        store.append_history("anything")
+        store.write_journal("2026-05-06", "older content")
+        store.write_journal("2026-05-08", "newest content")
+        store.write_journal("2026-05-07", "middle content")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        # Default daily_notes_context_days=2 → only newest two
+        await dream.run()
+
+        user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        assert "Recent Journal Notes" in user_msg
+        idx_newest = user_msg.find("2026-05-08.md")
+        idx_middle = user_msg.find("2026-05-07.md")
+        idx_older = user_msg.find("2026-05-06.md")
+        assert idx_newest != -1 and idx_middle != -1
+        assert idx_newest < idx_middle  # newest first
+        assert idx_older == -1  # context_days=2 caps the window
+
+    async def test_journal_section_respects_context_days(self, store, mock_provider, mock_runner):
+        store.append_history("anything")
+        for day in (4, 5, 6, 7, 8):
+            store.write_journal(f"2026-05-0{day}", f"day {day} content")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        d = Dream(
+            store=store, provider=mock_provider, model="m",
+            daily_notes_context_days=3,
+        )
+        d._runner = mock_runner
+        await d.run()
+
+        user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        for keep in ("2026-05-08", "2026-05-07", "2026-05-06"):
+            assert f"{keep}.md" in user_msg
+        for drop in ("2026-05-05", "2026-05-04"):
+            assert f"{drop}.md" not in user_msg
+
+    async def test_journal_section_truncated_to_max_chars(self, store, mock_provider, mock_runner):
+        store.append_history("anything")
+        big = "X" * 5_000
+        store.write_journal("2026-05-08", big)
+        store.write_journal("2026-05-07", big)
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        d = Dream(
+            store=store, provider=mock_provider, model="m",
+            daily_notes_max_chars=500,
+        )
+        d._runner = mock_runner
+        await d.run()
+
+        user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        # Extract the journal section between its header and the next "## " header
+        start = user_msg.index("## Recent Journal Notes")
+        end = user_msg.index("## Current MEMORY.md", start)
+        journal_block = user_msg[start:end]
+        # Header line itself adds ~40 chars; bound the body within cap + small slack
+        assert len(journal_block) < 700
+
+    async def test_phase1_prompt_documents_daily_verb(self, dream, mock_provider, mock_runner, store):
+        """The system prompt must teach the LLM the [DAILY] verb."""
+        store.append_history("anything")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await dream.run()
+
+        system_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][0]["content"]
+        assert "[DAILY]" in system_msg
+        assert "Daily journal" in system_msg or "daily journal" in system_msg.lower()
+
