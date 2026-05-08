@@ -929,6 +929,7 @@ class Dream:
         soul_file_max_chars: int | None = None,
         user_file_max_chars: int | None = None,
         history_entry_preview_max_chars: int | None = None,
+        timezone: str | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -936,6 +937,11 @@ class Dream:
         self.max_batch_size = max_batch_size
         self.max_iterations = max_iterations
         self.max_tool_result_chars = max_tool_result_chars
+        # IANA timezone (e.g. "Europe/Rome") used to derive Phase 1's
+        # current_date and the YYYY-MM-DD path of the daily journal note.
+        # None falls back to the system's local timezone so behavior matches
+        # the historical datetime.now() default before this kwarg existed.
+        self.timezone = timezone
         # Kill switch for the git-blame-based per-line age annotation in Phase 1.
         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
@@ -1029,6 +1035,24 @@ class Dream:
 
     # -- main entry ----------------------------------------------------------
 
+    def _today(self) -> str:
+        """Return today's date as ``YYYY-MM-DD`` in the configured timezone.
+
+        Mirrors the pattern of utils.helpers.current_time_str: an IANA tz
+        name resolves via ZoneInfo; None falls back to the system local
+        timezone so behavior matches the historical datetime.now() default.
+        Bad/unknown tz names degrade silently to local — Dream should never
+        crash on a typo in agents.defaults.timezone.
+        """
+        from zoneinfo import ZoneInfo
+
+        try:
+            tz = ZoneInfo(self.timezone) if self.timezone else None
+        except Exception:
+            tz = None
+        now = datetime.now(tz=tz) if tz else datetime.now().astimezone()
+        return now.strftime("%Y-%m-%d")
+
     def _annotate_with_ages(self, content: str) -> str:
         """Append per-line age suffixes to MEMORY.md content.
 
@@ -1101,7 +1125,7 @@ class Dream:
         # Current file contents + per-line age annotations (MEMORY.md only).
         # Each file is capped in the *prompt preview* only; Phase 2 still sees
         # the full file via the read_file tool.
-        current_date = datetime.now().strftime("%Y-%m-%d")
+        current_date = self._today()
         raw_memory = self.store.read_memory() or "(empty)"
         annotated_memory = (
             self._annotate_with_ages(raw_memory)

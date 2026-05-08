@@ -433,3 +433,70 @@ class TestDreamConfigurableCaps:
         assert len(history_section) < 400
         assert "(truncated)" in history_section
 
+
+class TestDreamTimezone:
+    """Phase 1 current_date and the journal note path both depend on the
+    configured timezone. Without it, the day rolls over at UTC midnight even
+    when the agent runs in Europe/Rome — wrong file, wrong date in prompt."""
+
+    def test_today_returns_iso_date(self, store, mock_provider):
+        import re
+
+        d = Dream(store=store, provider=mock_provider, model="t")
+
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", d._today())
+
+    def test_today_with_invalid_timezone_falls_back_silently(self, store, mock_provider):
+        """A typo in agents.defaults.timezone must not crash Dream."""
+        import re
+
+        d = Dream(store=store, provider=mock_provider, model="t", timezone="Not/Real")
+
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", d._today())
+
+    def test_today_uses_configured_timezone(self, store, mock_provider):
+        """At the same UTC instant, UTC and Asia/Tokyo can show different dates."""
+        from datetime import datetime as _dt, timezone as _tz
+        from unittest.mock import patch
+
+        fixed_utc = _dt(2026, 5, 8, 23, 30, tzinfo=_tz.utc)
+
+        def fake_now(tz=None):
+            return fixed_utc.astimezone(tz) if tz else fixed_utc.astimezone()
+
+        with patch("nanobot.agent.memory.datetime") as mock_dt:
+            mock_dt.now.side_effect = fake_now
+
+            d_utc = Dream(store=store, provider=mock_provider, model="t", timezone="UTC")
+            d_tokyo = Dream(store=store, provider=mock_provider, model="t", timezone="Asia/Tokyo")
+
+            # 23:30 UTC on May 8 → 08:30 May 9 in Tokyo (UTC+9)
+            assert d_utc._today() == "2026-05-08"
+            assert d_tokyo._today() == "2026-05-09"
+
+    async def test_run_uses_today_for_current_date_section(self, store, mock_provider, mock_runner):
+        """Phase 1 prompt must show the TZ-aware date, not raw UTC."""
+        from datetime import datetime as _dt, timezone as _tz
+        from unittest.mock import patch
+
+        fixed_utc = _dt(2026, 5, 8, 23, 30, tzinfo=_tz.utc)
+        store.append_history("some event")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        with patch("nanobot.agent.memory.datetime") as mock_dt:
+            def fake_now(tz=None):
+                return fixed_utc.astimezone(tz) if tz else fixed_utc.astimezone()
+            mock_dt.now.side_effect = fake_now
+            mock_dt.fromtimestamp = _dt.fromtimestamp  # used by line_ages
+
+            d = Dream(
+                store=store, provider=mock_provider, model="m",
+                timezone="Asia/Tokyo",
+            )
+            d._runner = mock_runner
+            await d.run()
+
+        user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        assert "## Current Date\n2026-05-09" in user_msg
+

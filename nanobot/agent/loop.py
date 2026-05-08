@@ -322,6 +322,7 @@ class AgentLoop:
             store=self.context.memory,
             provider=provider,
             model=self.model,
+            timezone=timezone,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
         self._active_preset: str | None = None
