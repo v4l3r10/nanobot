@@ -36,6 +36,19 @@ from nanobot.utils.runtime import (
 
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
+_WORKSPACE_VIOLATION_USER_MESSAGE = (
+    "I stopped because the request would access a path outside my workspace."
+)
+
+
+class WorkspaceViolation(RuntimeError):
+    """Tool error class signalling a workspace/safety boundary violation.
+
+    Distinct from a generic RuntimeError so the main loop can produce a
+    user-facing message instead of leaking the internal Python exception text,
+    and so channel adapters can choose to suppress the outbound (e.g. peer
+    plane drops these to avoid waking the receiver into an error-loop).
+    """
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
@@ -344,9 +357,18 @@ class AgentRunner:
                             await hook.on_stream_end(context, resuming=False)
                         await hook.after_iteration(context)
                         break
-                    error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
-                    final_content = error
-                    stop_reason = "tool_error"
+                    if isinstance(fatal_error, WorkspaceViolation):
+                        # Don't leak Python type names / raw boundary messages
+                        # to channels. The detailed cause is preserved in the
+                        # tool result and in the runner's warning log; the
+                        # final_content is what users / peers actually see.
+                        final_content = _WORKSPACE_VIOLATION_USER_MESSAGE
+                        stop_reason = "workspace_violation"
+                        error = str(fatal_error)
+                    else:
+                        error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
+                        final_content = error
+                        stop_reason = "tool_error"
                     self._append_final_message(messages, final_content)
                     context.final_content = final_content
                     context.error = error
@@ -772,7 +794,7 @@ class AgentRunner:
                 )
                 event["detail"] = ("workspace_violation: "
                                    + prep_error.replace("\n", " ").strip())[:160]
-                return prep_error, event, RuntimeError(prep_error)
+                return prep_error, event, WorkspaceViolation(prep_error)
             return prep_error + hint, event, RuntimeError(prep_error) if spec.fail_on_tool_error else None
         try:
             if tool is not None:
@@ -798,7 +820,7 @@ class AgentRunner:
                 )
                 event["detail"] = ("workspace_violation: "
                                    + str(exc).replace("\n", " ").strip())[:160]
-                return f"Error: {type(exc).__name__}: {exc}", event, exc
+                return f"Error: {type(exc).__name__}: {exc}", event, WorkspaceViolation(str(exc))
             if spec.fail_on_tool_error:
                 return f"Error: {type(exc).__name__}: {exc}", event, exc
             return f"Error: {type(exc).__name__}: {exc}", event, None
@@ -819,7 +841,7 @@ class AgentRunner:
                 )
                 event["detail"] = ("workspace_violation: "
                                    + result.replace("\n", " ").strip())[:160]
-                return result, event, RuntimeError(result)
+                return result, event, WorkspaceViolation(result)
             if spec.fail_on_tool_error:
                 return result + hint, event, RuntimeError(result)
             return result + hint, event, None
