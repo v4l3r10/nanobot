@@ -214,3 +214,105 @@ class TestNestedRepoProtection:
 
         assert result is False
         assert not (workspace / ".git").exists()
+
+
+class TestTrackedDirs:
+    """Whitelist *.md files inside open-ended directories (e.g. memory/journal)."""
+
+    @pytest.fixture
+    def git_with_journal(self, tmp_path):
+        g = GitStore(
+            tmp_path,
+            tracked_files=["MEMORY.md"],
+            tracked_dirs=["memory/journal"],
+        )
+        g.init()
+        return g
+
+    def test_default_tracked_dirs_is_empty_list(self, tmp_path):
+        g = GitStore(tmp_path, tracked_files=["MEMORY.md"])
+        assert g._tracked_dirs == []
+
+    def test_gitignore_whitelists_tracked_dir_and_md_files(self, tmp_path):
+        g = GitStore(
+            tmp_path,
+            tracked_files=["MEMORY.md"],
+            tracked_dirs=["memory/journal"],
+        )
+        content = g._build_gitignore()
+        assert "!memory/\n" in content
+        assert "!memory/journal/\n" in content
+        assert "!memory/journal/*.md\n" in content
+
+    def test_gitignore_whitelists_nested_ancestors(self, tmp_path):
+        """Multi-level tracked_dirs unblock every parent path."""
+        g = GitStore(
+            tmp_path,
+            tracked_files=["MEMORY.md"],
+            tracked_dirs=["a/b/c/notes"],
+        )
+        content = g._build_gitignore()
+        for d in ("a", "a/b", "a/b/c", "a/b/c/notes"):
+            assert f"!{d}/\n" in content
+
+    def test_init_creates_empty_tracked_dir(self, git_with_journal, tmp_path):
+        assert (tmp_path / "memory" / "journal").is_dir()
+
+    def test_auto_commit_picks_up_new_md_inside_tracked_dir(self, git_with_journal, tmp_path):
+        note = tmp_path / "memory" / "journal" / "2026-05-08.md"
+        note.write_text("# 2026-05-08\n- worked on dream\n", encoding="utf-8")
+
+        sha = git_with_journal.auto_commit("first journal note")
+
+        assert sha is not None
+        commits = git_with_journal.log()
+        assert any("first journal note" in c.message for c in commits)
+
+    def test_auto_commit_tracks_subsequent_edits_inside_tracked_dir(self, git_with_journal, tmp_path):
+        note = tmp_path / "memory" / "journal" / "2026-05-08.md"
+        note.write_text("first\n", encoding="utf-8")
+        sha1 = git_with_journal.auto_commit("create note")
+        note.write_text("first\nsecond\n", encoding="utf-8")
+        sha2 = git_with_journal.auto_commit("extend note")
+
+        assert sha1 is not None and sha2 is not None
+        assert sha1 != sha2
+
+    def test_auto_commit_ignores_non_md_files_inside_tracked_dir(self, git_with_journal, tmp_path):
+        """*.txt files inside tracked_dirs are excluded by the gitignore pattern."""
+        (tmp_path / "memory" / "journal" / "scratch.txt").write_text("ignored", encoding="utf-8")
+
+        sha = git_with_journal.auto_commit("nothing real")
+
+        # Pure .txt drop must not produce a commit; staging is empty.
+        assert sha is None
+
+    def test_revert_restores_modified_md_inside_tracked_dir(self, git_with_journal, tmp_path):
+        note = tmp_path / "memory" / "journal" / "2026-05-08.md"
+        note.write_text("v1\n", encoding="utf-8")
+        sha_v1 = git_with_journal.auto_commit("v1")
+        note.write_text("v2\n", encoding="utf-8")
+        sha_v2 = git_with_journal.auto_commit("v2")
+        assert sha_v1 and sha_v2
+
+        revert_sha = git_with_journal.revert(sha_v2)
+
+        assert revert_sha is not None
+        assert note.read_text(encoding="utf-8") == "v1\n"
+
+    def test_revert_does_not_resurrect_files_added_after_target(self, git_with_journal, tmp_path):
+        """Additive revert: V1 keeps post-target files on disk untouched."""
+        existing = tmp_path / "memory" / "journal" / "2026-05-07.md"
+        existing.write_text("yesterday\n", encoding="utf-8")
+        sha_anchor = git_with_journal.auto_commit("anchor")
+
+        new_note = tmp_path / "memory" / "journal" / "2026-05-08.md"
+        new_note.write_text("today\n", encoding="utf-8")
+        sha_added = git_with_journal.auto_commit("added today's note")
+        assert sha_anchor and sha_added
+
+        git_with_journal.revert(sha_added)
+
+        # Anchor file untouched, post-target file remains on disk (caveat documented).
+        assert existing.read_text(encoding="utf-8") == "yesterday\n"
+        assert new_note.exists()
