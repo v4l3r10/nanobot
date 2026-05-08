@@ -1207,6 +1207,9 @@ def _run_gateway(
     agent.dream.user_file_max_chars = dream_cfg.user_file_max_chars
     agent.dream.history_entry_preview_max_chars = dream_cfg.history_entry_preview_max_chars
     agent.dream.max_tool_result_chars = dream_cfg.max_tool_result_chars
+    agent.dream.daily_notes_enabled = dream_cfg.daily_notes_enabled
+    agent.dream.daily_notes_context_days = dream_cfg.daily_notes_context_days
+    agent.dream.daily_notes_max_chars = dream_cfg.daily_notes_max_chars
     from nanobot.cron.types import CronJob, CronPayload, CronSchedule
     if dream_cfg.enabled:
         cron.register_system_job(CronJob(
