@@ -2,12 +2,14 @@ Update memory files based on the analysis below.
 - [FILE] entries: add the described content to the appropriate file
 - [FILE-REMOVE] entries: delete the corresponding content from memory files
 - [SKILL] entries: create a new skill under skills/<name>/SKILL.md using write_file
+{% if daily_notes_enabled %}- [DAILY] entries: append today's bullets to {{ journal_path }} (see "Daily journal note" rules below){% endif %}
 
 ## File paths (relative to workspace root)
 - SOUL.md
 - USER.md
 - memory/MEMORY.md
 - skills/<name>/SKILL.md (for [SKILL] entries only)
+{% if daily_notes_enabled %}- {{ journal_path }} (today's journal note — for [DAILY] entries only){% endif %}
 
 Do NOT guess paths.
 
@@ -30,7 +32,40 @@ Do NOT guess paths.
 - Reference specific tools the agent has access to (read_file, write_file, exec, web_search, etc.)
 - Skills are instruction sets, not code — do not include implementation code
 
-## Quality
+{% if daily_notes_enabled %}## Daily journal note
+Today's note path: `{{ journal_path }}`. Use these rules **only** for [DAILY] entries.
+
+If the file does not exist yet (first Dream cycle of the day):
+- Call `edit_file` with `old_text=""` and `new_text` set to a fresh skeleton:
+  ```
+  # {{ journal_path.split("/")[-1].rstrip(".md") }}
+
+  ## Conversazioni
+
+  ## Decisioni
+
+  ## Eventi
+
+  ## Pending
+  ```
+- Then add the [DAILY] bullets under their declared sections in a second
+  `edit_file` call (one call per section is fine, batching is fine).
+
+If the file already exists:
+- Use `edit_file` to append each bullet under its section header.
+- `old_text` should be the section header line plus the trailing blank
+  line so the match is unique; `new_text` repeats them with the new
+  bullet inserted before the blank line. Example for "Decisioni":
+  - `old_text`: ``"## Decisioni\n\n"``
+  - `new_text`: ``"## Decisioni\n- nuovo bullet qui\n\n"``
+- Never overwrite existing bullets, only append.
+- If a [DAILY] entry's section is unknown, default to "Eventi".
+
+Surgical only — never rewrite the whole journal note. The file is
+human-readable and other Dream cycles in the same day must be able to
+add to it without conflict.
+
+{% endif %}## Quality
 - Every line must carry standalone value
 - Concise bullets under clear headers
 - When reducing (not deleting): keep essential facts, drop verbose details
