@@ -169,6 +169,32 @@ class PeerChannel(BaseChannel):
     def own_agent_id(self) -> str:
         return self._cfg.agent_id
 
+    async def fetch_thread(
+        self, peer: str, *, last_n: int = 20
+    ) -> list[dict[str, Any]]:
+        """Fetch up to *last_n* recent messages exchanged with *peer* from
+        the router's authoritative DB. Used by the ``peer_thread_show`` tool.
+
+        Returns messages in chronological order (oldest→newest) as a list of
+        dicts with keys: id, from, to, text, ts, in_reply_to, thread_id,
+        delivered. Empty list if no messages exist.
+
+        Raises RuntimeError on auth/network failure so the tool can surface
+        the issue to the agent rather than pretend the thread is empty.
+        """
+        if self._http is None:
+            raise RuntimeError("peer: HTTP client not initialized")
+        resp = await self._http.get(
+            "/messages", params={"peer": peer, "last_n": last_n},
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"peer router /messages returned HTTP {resp.status_code}: "
+                f"{resp.text[:200]}"
+            )
+        data = resp.json()
+        return list(data.get("messages", []))
+
     # --- lifecycle ----------------------------------------------------------
 
     async def start(self) -> None:
@@ -324,6 +350,18 @@ class PeerChannel(BaseChannel):
             logger.warning("peer frame bad text type")
             return
 
+        # closing=True signals "this is the sender's last word — don't expect
+        # a reply". The router has already persisted the row, so the message
+        # is visible via peer_thread_show. We deliberately skip publish_inbound
+        # here so the agent loop is NOT awakened: this is the system-level
+        # break that prevents pleasantry/echo loops without any LLM call.
+        if frame.get("closing") is True:
+            logger.info(
+                "peer closing received from {} (msg_id={}); agent not awoken",
+                from_agent, frame.get("id"),
+            )
+            return
+
         media_paths: list[str] = []
         attachments = frame.get("attachments") or []
         if isinstance(attachments, list):
@@ -409,6 +447,26 @@ class PeerChannel(BaseChannel):
     # --- outbound -----------------------------------------------------------
 
     async def send(self, msg: OutboundMessage) -> None:
+        meta = msg.metadata or {}
+        # Filter out progress/streaming events meant for human-facing channels.
+        # Without this guard, the agent loop's progress callbacks (tool hints,
+        # streaming deltas, retry-wait notices, stream-end markers) would be
+        # forwarded as peer messages — they have no closing=true so they wake
+        # the receiver's agent loop, generating a ghost-twin loop alongside
+        # legitimate peer_say outputs. Peer plane is request/response only.
+        for noise_flag in (
+            "_progress", "_tool_hint", "_retry_wait",
+            "_stream_delta", "_stream_end", "_streamed",
+        ):
+            if meta.get(noise_flag):
+                return
+        # Empty / whitespace-only content also has no place on the peer plane:
+        # it's typically a bookkeeping placeholder from the agent loop and
+        # would arrive at the receiver as a wake-up-with-no-payload.
+        if not (msg.content or "").strip():
+            logger.debug("peer skipping empty outbound (no content to deliver)")
+            return
+
         peer = _peer_from_chat_id(msg.chat_id)
         if peer is None:
             raise ValueError(
@@ -427,7 +485,6 @@ class PeerChannel(BaseChannel):
             # the recipient to see.
             attachment_ids = await self._upload_media(msg.media)
 
-        meta = msg.metadata or {}
         client_ref = uuid.uuid4().hex
         frame: dict[str, Any] = {
             "v": FRAME_VERSION,
@@ -440,6 +497,12 @@ class PeerChannel(BaseChannel):
         }
         if attachment_ids:
             frame["attachment_ids"] = attachment_ids
+        # closing=True is the explicit "thread terminator" flag set by the
+        # peer_say tool when the agent decides this is its last word in the
+        # exchange. Routed unmodified; the recipient channel uses it to skip
+        # waking its agent loop, breaking pleasantry loops by design.
+        if meta.get("peer_closing") is True:
+            frame["closing"] = True
 
         loop = asyncio.get_running_loop()
         ack_future: asyncio.Future = loop.create_future()

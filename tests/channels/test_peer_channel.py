@@ -8,6 +8,7 @@ validation.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import types
 
@@ -222,6 +223,165 @@ async def test_send_swallows_ack_timeout_as_warning() -> None:
     msg = OutboundMessage(channel="peer", chat_id="peer:grocco", content="hi")
     await ch.send(msg)  # must not raise
     assert ch._pending_acks == {}  # cleaned up on timeout
+
+
+@pytest.mark.asyncio
+async def test_inbound_closing_frame_does_not_wake_agent_loop() -> None:
+    """The defining contract of the closing=true protocol: a frame with
+    closing=true must NOT trigger publish_inbound (the agent loop stays
+    asleep), so two polite bots can't loop on goodbyes."""
+    ch = _make_channel()
+    captured: list[InboundMessage] = []
+
+    async def _capture(msg: InboundMessage) -> None:
+        captured.append(msg)
+
+    ch.bus.publish_inbound = _capture  # type: ignore[assignment]
+
+    await ch._on_frame(json.dumps({
+        "v": 1, "type": "msg",
+        "id": "msg_close_1", "from": "grocco", "to": "bronzo",
+        "text": "task done", "thread_id": "thr_x",
+        "in_reply_to": None, "ts": "2026-05-08T18:00:00.000Z",
+        "closing": True,
+    }))
+    assert captured == [], "closing=true must not wake agent loop"
+
+
+@pytest.mark.asyncio
+async def test_inbound_normal_frame_still_wakes_agent_loop() -> None:
+    """Sanity: only closing=true is filtered, regular messages still flow."""
+    ch = _make_channel()
+    captured: list[InboundMessage] = []
+
+    async def _capture(msg: InboundMessage) -> None:
+        captured.append(msg)
+
+    ch.bus.publish_inbound = _capture  # type: ignore[assignment]
+
+    await ch._on_frame(json.dumps({
+        "v": 1, "type": "msg",
+        "id": "msg_normal", "from": "grocco", "to": "bronzo",
+        "text": "ciao Bronzo", "thread_id": "thr_x",
+        "in_reply_to": None, "ts": "2026-05-08T18:00:00.000Z",
+    }))
+    assert len(captured) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_filters_progress_noise_outbound() -> None:
+    """Progress / streaming bookkeeping events from the agent loop must NOT
+    reach the peer plane: they have no closing flag and would wake the
+    receiver's agent loop with empty bodies (the 'ghost twin' bug).
+    """
+    ch = _make_channel()
+
+    sent_payloads: list[str] = []
+
+    class _RecorderWS:
+        async def send(self, payload: str) -> None:
+            sent_payloads.append(payload)
+
+    ch._ws = _RecorderWS()  # type: ignore[assignment]
+
+    for noise_meta in (
+        {"_progress": True},
+        {"_tool_hint": True},
+        {"_retry_wait": True},
+        {"_stream_delta": True},
+        {"_stream_end": True},
+        {"_streamed": True},
+    ):
+        msg = OutboundMessage(
+            channel="peer", chat_id="peer:grocco",
+            content="bookkeeping noise", metadata=noise_meta,
+        )
+        await ch.send(msg)
+    assert sent_payloads == [], "no progress event should reach the wire"
+
+
+@pytest.mark.asyncio
+async def test_send_filters_empty_content() -> None:
+    """An OutboundMessage with empty/whitespace-only content is dropped at
+    the peer client — keeps the receiver's agent asleep when there's
+    literally nothing to say."""
+    ch = _make_channel()
+    sent: list[str] = []
+
+    class _RecorderWS:
+        async def send(self, payload: str) -> None:
+            sent.append(payload)
+
+    ch._ws = _RecorderWS()  # type: ignore[assignment]
+
+    for empty in ("", "   ", "\n\t  "):
+        await ch.send(OutboundMessage(
+            channel="peer", chat_id="peer:grocco", content=empty,
+        ))
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_send_propagates_closing_metadata_into_frame() -> None:
+    """If OutboundMessage.metadata.peer_closing == True, the wire frame must
+    include closing=true so the router can mark the row and the recipient
+    channel can apply the no-wake rule."""
+    ch = _make_channel()
+    ch._cfg.ack_timeout_s = 1.0  # type: ignore[attr-defined]
+    sent_payloads: list[str] = []
+
+    class _AckingFakeWS:
+        def __init__(self, channel: PeerChannel) -> None:
+            self._ch = channel
+
+        async def send(self, payload: str) -> None:
+            sent_payloads.append(payload)
+            frame = json.loads(payload)
+            asyncio.get_running_loop().call_soon(
+                lambda: asyncio.ensure_future(self._ch._on_frame(json.dumps({
+                    "v": 1, "type": "ack",
+                    "client_ref": frame["client_ref"], "id": "msg_X",
+                })))
+            )
+
+    ch._ws = _AckingFakeWS(ch)  # type: ignore[assignment]
+    msg = OutboundMessage(
+        channel="peer", chat_id="peer:grocco", content="task done",
+        metadata={"peer_closing": True},
+    )
+    await ch.send(msg)
+    frame = json.loads(sent_payloads[0])
+    assert frame["closing"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_omits_closing_field_when_not_set() -> None:
+    """Default outbound (no peer_closing in metadata) must not include the
+    closing field on the wire — keeps frames small and unambiguous."""
+    import asyncio as _asyncio  # local import to keep module-top tidy
+    ch = _make_channel()
+    ch._cfg.ack_timeout_s = 1.0  # type: ignore[attr-defined]
+    sent_payloads: list[str] = []
+
+    class _AckingFakeWS:
+        def __init__(self, channel: PeerChannel) -> None:
+            self._ch = channel
+
+        async def send(self, payload: str) -> None:
+            sent_payloads.append(payload)
+            frame = json.loads(payload)
+            _asyncio.get_running_loop().call_soon(
+                lambda: _asyncio.ensure_future(self._ch._on_frame(json.dumps({
+                    "v": 1, "type": "ack",
+                    "client_ref": frame["client_ref"], "id": "msg_Y",
+                })))
+            )
+
+    ch._ws = _AckingFakeWS(ch)  # type: ignore[assignment]
+    msg = OutboundMessage(channel="peer", chat_id="peer:grocco", content="ciao")
+    await ch.send(msg)
+    frame = json.loads(sent_payloads[0])
+    assert "closing" not in frame
 
 
 @pytest.mark.asyncio

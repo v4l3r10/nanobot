@@ -34,7 +34,11 @@ class JsonLineFormatter(logging.Formatter):
             payload[key] = value
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
+        # default=str catches non-JSON-serializable objects that arbitrary
+        # libraries (e.g. websockets) attach as extras on their LogRecord.
+        # Without this, a single weird extra would crash the entire format()
+        # and we'd lose the message itself.
+        return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 def configure_logging() -> None:

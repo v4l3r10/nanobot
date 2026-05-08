@@ -89,6 +89,7 @@ class Database:
         priority: Priority = "normal",
         in_reply_to: str | None = None,
         thread_id: str | None = None,
+        closing: bool = False,
     ) -> tuple[str, str]:
         msg_id = new_message_id()
         thread = thread_id
@@ -99,8 +100,9 @@ class Database:
         async with self._lock:
             await self.conn.execute(
                 "INSERT INTO messages (id, thread_id, in_reply_to, from_agent, to_agent,"
-                " type, subject, body, priority) VALUES (?,?,?,?,?,?,?,?,?)",
-                (msg_id, thread, in_reply_to, from_agent, to_agent, type, subject, body, priority),
+                " type, subject, body, priority, closing) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (msg_id, thread, in_reply_to, from_agent, to_agent, type, subject, body, priority,
+                 1 if closing else 0),
             )
             await self.conn.commit()
         return msg_id, thread
@@ -314,7 +316,7 @@ class Database:
         async with self._lock:
             cursor = await self.conn.execute(
                 "SELECT id, thread_id, in_reply_to, from_agent, to_agent,"
-                " body, created_at"
+                " body, created_at, closing"
                 " FROM messages"
                 " WHERE to_agent = ? AND delivered_at IS NULL"
                 " ORDER BY created_at ASC LIMIT ?",
@@ -323,6 +325,101 @@ class Database:
             rows = await cursor.fetchall()
             await cursor.close()
             return list(rows)
+
+    async def fetch_recent_messages(self, *, limit: int = 10) -> list[aiosqlite.Row]:
+        """Return the most recent messages across all peers, newest first.
+
+        Powers the observer's ``/last N`` command — a flat global tail rather
+        than the per-peer thread view served by :meth:`fetch_thread_between`.
+        """
+        cursor = await self.conn.execute(
+            "SELECT id, thread_id, from_agent, to_agent, body, created_at, closing"
+            " FROM messages ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return list(rows)
+
+    async def fetch_thread_between(
+        self, agent_a: AgentId, agent_b: AgentId, *, last_n: int = 20
+    ) -> list[aiosqlite.Row]:
+        """Return up to *last_n* most recent messages exchanged between two
+        agents, sorted oldest→newest.
+
+        Used by the ``peer_thread_show`` tool so an agent can recall what it
+        recently said to / heard from a specific peer, even across container
+        restarts (the local session file may be rotated; the DB is durable).
+        """
+        async with self._lock:
+            cursor = await self.conn.execute(
+                "SELECT id, thread_id, in_reply_to, from_agent, to_agent,"
+                " body, created_at, delivered_at, closing"
+                " FROM messages"
+                " WHERE (from_agent = ? AND to_agent = ?)"
+                "    OR (from_agent = ? AND to_agent = ?)"
+                " ORDER BY created_at DESC LIMIT ?",
+                (agent_a, agent_b, agent_b, agent_a, last_n),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            # The query returns newest-first to honour LIMIT semantics; the
+            # caller wants chronological reading order, so we reverse.
+            return list(reversed(rows))
+
+    # --- telegram observer subscribers -------------------------------------
+
+    async def tg_subscriber_add(self, *, chat_id: int, user_id: int) -> None:
+        """Persist (or refresh) a Telegram subscriber.
+
+        Called by the embedded observer on ``/start``. Upsert keeps the same
+        row across re-subscribes so we don't accumulate duplicates if a user
+        toggles /stop and /start.
+        """
+        async with self._lock:
+            await self.conn.execute(
+                "INSERT INTO tg_subscribers (chat_id, user_id, muted) VALUES (?,?,0)"
+                " ON CONFLICT(chat_id) DO UPDATE SET user_id = excluded.user_id, muted = 0",
+                (chat_id, user_id),
+            )
+            await self.conn.commit()
+
+    async def tg_subscriber_remove(self, chat_id: int) -> None:
+        async with self._lock:
+            await self.conn.execute(
+                "DELETE FROM tg_subscribers WHERE chat_id = ?", (chat_id,)
+            )
+            await self.conn.commit()
+
+    async def tg_subscriber_set_muted(self, *, chat_id: int, muted: bool) -> bool:
+        """Set the muted flag for *chat_id*. Returns True if a row matched."""
+        async with self._lock:
+            cursor = await self.conn.execute(
+                "UPDATE tg_subscribers SET muted = ? WHERE chat_id = ?",
+                (1 if muted else 0, chat_id),
+            )
+            updated = cursor.rowcount
+            await cursor.close()
+            await self.conn.commit()
+            return updated > 0
+
+    async def tg_subscribers_active(self) -> list[int]:
+        """Return chat_ids that should currently receive the dump (not muted)."""
+        cursor = await self.conn.execute(
+            "SELECT chat_id FROM tg_subscribers WHERE muted = 0 ORDER BY chat_id"
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [int(r["chat_id"]) for r in rows]
+
+    async def tg_subscribers_all(self) -> list[aiosqlite.Row]:
+        cursor = await self.conn.execute(
+            "SELECT chat_id, user_id, muted, started_at FROM tg_subscribers"
+            " ORDER BY started_at"
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return list(rows)
 
     async def mark_delivered(self, message_ids: Iterable[str]) -> int:
         ids = list(message_ids)

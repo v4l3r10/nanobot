@@ -62,6 +62,19 @@ class PeerHub:
         self._conns: dict[str, WebSocket] = {}
         self._send_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
+        # Optional observer (e.g. embedded Telegram bot) that wants a
+        # read-only copy of every forwarded frame and presence event. Set
+        # via :meth:`set_observer` from the server lifespan, may stay None.
+        self._observer: Any = None
+
+    def set_observer(self, observer: Any) -> None:
+        """Attach an observer with on_msg / on_presence callbacks.
+
+        Both callbacks are synchronous (non-awaiting) by contract: the hub
+        must never block on observer I/O. An observer that needs to do
+        network calls should enqueue internally (see TelegramObserver).
+        """
+        self._observer = observer
 
     async def register(self, agent_id: str, ws: WebSocket) -> WebSocket | None:
         """Register *ws* as the live connection for *agent_id*.
@@ -121,6 +134,7 @@ class PeerHub:
         thread_id: str | None,
         in_reply_to: str | None,
         attachment_ids: list[int] | None = None,
+        closing: bool = False,
     ) -> dict[str, Any]:
         """Persist a frame and forward to recipient if connected.
 
@@ -161,6 +175,7 @@ class PeerHub:
             body=text,
             in_reply_to=in_reply_to,
             thread_id=thread_id,
+            closing=closing,
         )
 
         attachments_meta: list[dict[str, Any]] = []
@@ -193,10 +208,17 @@ class PeerHub:
             id=msg_id, from_agent=from_agent, to_agent=to_agent,
             text=text, thread_id=thread, in_reply_to=in_reply_to,
             attachments=attachments_meta,
+            closing=closing,
         )
         delivered = await self._deliver(to_agent, envelope)
         if delivered:
             await self._db.mark_delivered([msg_id])
+        if self._observer is not None:
+            try:
+                self._observer.on_msg(envelope)
+            except Exception:  # noqa: BLE001
+                # An observer must never break the hub. Swallow and keep going.
+                log.exception("observer on_msg raised")
         return envelope
 
     async def drain_inbox(self, agent_id: str) -> int:
@@ -227,6 +249,7 @@ class PeerHub:
                 in_reply_to=row["in_reply_to"],
                 attachments=attachments_meta,
                 ts=row["created_at"],
+                closing=bool(row["closing"]),
             )
             if not await self._deliver(agent_id, envelope):
                 break
@@ -290,6 +313,7 @@ class PeerHub:
         in_reply_to: str | None,
         attachments: list[dict[str, Any]] | None = None,
         ts: str | None = None,
+        closing: bool = False,
     ) -> dict[str, Any]:
         envelope: dict[str, Any] = {
             "v": FRAME_VERSION,
@@ -304,6 +328,8 @@ class PeerHub:
         }
         if attachments:
             envelope["attachments"] = attachments
+        if closing:
+            envelope["closing"] = True
         return envelope
 
 
@@ -336,6 +362,13 @@ def make_peer_endpoint(hub: PeerHub, registry: TokenRegistry):
         # this one) of the new roster. Done outside the registry lock so we
         # do not hold it across a fan-out.
         await hub.broadcast_presence()
+        if hub._observer is not None:
+            try:
+                hub._observer.on_presence(
+                    event="up", agent_id=agent_id, online=await hub.online_peers(),
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("observer on_presence(up) raised")
         try:
             # Drain pending offline traffic in successive batches; a single
             # call is capped at INBOX_DRAIN_BATCH (100). Loop until either
@@ -366,6 +399,13 @@ def make_peer_endpoint(hub: PeerHub, registry: TokenRegistry):
             await hub.unregister(agent_id, ws)
             log.info("peer disconnected", extra={"agent_id": agent_id})
             await hub.broadcast_presence()
+            if hub._observer is not None:
+                try:
+                    hub._observer.on_presence(
+                        event="down", agent_id=agent_id, online=await hub.online_peers(),
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("observer on_presence(down) raised")
 
     return endpoint
 
@@ -432,6 +472,7 @@ async def _handle_frame(hub: PeerHub, from_agent: str, frame: dict) -> None:
             thread_id=frame.get("thread_id"),
             in_reply_to=frame.get("in_reply_to"),
             attachment_ids=raw_attachments or None,
+            closing=bool(frame.get("closing")),
         )
     except ValueError as exc:
         log.warning(

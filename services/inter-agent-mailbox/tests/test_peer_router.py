@@ -164,6 +164,73 @@ async def test_broadcast_presence_to_all_connections(hub) -> None:
         assert frame["online"] == ["bronzo", "grocco", "naldo"]
 
 
+class _RecordingObserver:
+    """Captures hub callbacks so we can assert the wiring fires."""
+
+    def __init__(self) -> None:
+        self.msgs: list[dict] = []
+        self.presence: list[dict] = []
+
+    def on_msg(self, envelope: dict) -> None:
+        self.msgs.append(envelope)
+
+    def on_presence(self, *, event: str, agent_id: str, online: list[str]) -> None:
+        self.presence.append({"event": event, "agent_id": agent_id, "online": list(online)})
+
+
+@pytest.mark.asyncio
+async def test_observer_receives_forwarded_msg(hub) -> None:
+    obs = _RecordingObserver()
+    hub.set_observer(obs)
+    grocco_ws = _FakeWS()
+    await hub.register("grocco", grocco_ws)
+
+    await hub.forward(
+        from_agent="bronzo", to_agent="grocco", text="ciao",
+        thread_id=None, in_reply_to=None,
+    )
+
+    assert len(obs.msgs) == 1
+    assert obs.msgs[0]["from"] == "bronzo"
+    assert obs.msgs[0]["to"] == "grocco"
+    assert obs.msgs[0]["text"] == "ciao"
+
+
+@pytest.mark.asyncio
+async def test_observer_msg_for_offline_peer_still_fires(hub) -> None:
+    # We want the operator to see the traffic even if the recipient is
+    # offline (the message is queued, but the conversation is the point of
+    # the dump).
+    obs = _RecordingObserver()
+    hub.set_observer(obs)
+
+    await hub.forward(
+        from_agent="bronzo", to_agent="grocco", text="offline ciao",
+        thread_id=None, in_reply_to=None,
+    )
+
+    assert len(obs.msgs) == 1
+    assert obs.msgs[0]["text"] == "offline ciao"
+
+
+@pytest.mark.asyncio
+async def test_observer_failure_does_not_break_forward(hub) -> None:
+    # The observer is a watcher, not a router: a buggy on_msg must never
+    # surface as a peer-side error.
+    class _Boom:
+        def on_msg(self, envelope):  # noqa: ARG002
+            raise RuntimeError("observer broken")
+        def on_presence(self, **_kwargs):
+            pass
+
+    hub.set_observer(_Boom())
+    envelope = await hub.forward(
+        from_agent="bronzo", to_agent="grocco", text="ok",
+        thread_id=None, in_reply_to=None,
+    )
+    assert envelope["text"] == "ok"
+
+
 @pytest.mark.asyncio
 async def test_broadcast_presence_skips_disconnected_socket(hub) -> None:
     a, b = _FakeWS(), _FakeWS()
@@ -266,6 +333,40 @@ async def test_handle_frame_sends_error_on_unknown_recipient(hub) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_thread_between_returns_chronological_pair_messages(hub, db) -> None:
+    """The DB helper backing peer_thread_show must return only A↔B messages,
+    sorted oldest→newest, and ignore traffic involving third parties."""
+    # bronzo↔grocco (3 messages)
+    await hub.forward(from_agent="bronzo", to_agent="grocco", text="A1",
+                      thread_id=None, in_reply_to=None)
+    await hub.forward(from_agent="grocco", to_agent="bronzo", text="A2",
+                      thread_id=None, in_reply_to=None)
+    await hub.forward(from_agent="bronzo", to_agent="grocco", text="A3",
+                      thread_id=None, in_reply_to=None)
+    # bronzo↔naldo (1 message — must NOT show up in bronzo↔grocco fetch)
+    await hub.forward(from_agent="bronzo", to_agent="naldo", text="B1",
+                      thread_id=None, in_reply_to=None)
+    # grocco↔naldo (1 message — must NOT show up either)
+    await hub.forward(from_agent="grocco", to_agent="naldo", text="C1",
+                      thread_id=None, in_reply_to=None)
+
+    rows = await db.fetch_thread_between("bronzo", "grocco", last_n=10)
+    bodies = [r["body"] for r in rows]
+    assert bodies == ["A1", "A2", "A3"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_thread_between_respects_last_n_keeps_newest(hub, db) -> None:
+    """last_n caps the result to the most recent N pair-messages, but the
+    returned slice is still in chronological order."""
+    for i in range(5):
+        await hub.forward(from_agent="bronzo", to_agent="grocco", text=f"m{i}",
+                          thread_id=None, in_reply_to=None)
+    rows = await db.fetch_thread_between("bronzo", "grocco", last_n=3)
+    assert [r["body"] for r in rows] == ["m2", "m3", "m4"]
+
+
+@pytest.mark.asyncio
 async def test_forward_rejects_invalid_attachments_without_orphan(hub, db) -> None:
     """Bad attachment_ids must fail BEFORE the message row is inserted, so a
     rejected forward leaves no orphan row to be replayed at reconnect."""
@@ -278,6 +379,66 @@ async def test_forward_rejects_invalid_attachments_without_orphan(hub, db) -> No
         )
     after = await db.count_messages()
     assert after == before
+
+
+@pytest.mark.asyncio
+async def test_forward_persists_closing_flag(hub, db) -> None:
+    """A frame with closing=true must persist closing=1 in the messages row
+    and emit envelope with closing=true so the receiver channel can skip
+    waking its agent."""
+    grocco_ws = _FakeWS()
+    await hub.register("grocco", grocco_ws)
+
+    envelope = await hub.forward(
+        from_agent="bronzo", to_agent="grocco",
+        text="task done", thread_id=None, in_reply_to=None,
+        closing=True,
+    )
+    assert envelope.get("closing") is True
+
+    delivered = json.loads(grocco_ws.sent[-1])
+    assert delivered["closing"] is True
+
+    # DB row stores closing=1
+    rows = await db.fetch_thread_between("bronzo", "grocco", last_n=5)
+    assert any(r["closing"] == 1 and r["body"] == "task done" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_forward_omits_closing_when_false(hub, db) -> None:
+    """closing=False (default) must not pollute the envelope and must store
+    closing=0 in DB so peer_thread_show can render the flag accurately."""
+    grocco_ws = _FakeWS()
+    await hub.register("grocco", grocco_ws)
+    await hub.forward(
+        from_agent="bronzo", to_agent="grocco",
+        text="hi", thread_id=None, in_reply_to=None,
+    )
+    delivered = json.loads(grocco_ws.sent[-1])
+    assert "closing" not in delivered
+    rows = await db.fetch_thread_between("bronzo", "grocco", last_n=5)
+    assert all(r["closing"] == 0 for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_handle_frame_propagates_closing_flag(hub) -> None:
+    """A msg frame from a client with closing=true is honoured end-to-end."""
+    from nanobot_mailbox.peer_router import _handle_frame
+
+    bronzo_ws = _FakeWS()
+    grocco_ws = _FakeWS()
+    await hub.register("bronzo", bronzo_ws)
+    await hub.register("grocco", grocco_ws)
+    bronzo_ws.sent.clear()
+    grocco_ws.sent.clear()
+
+    await _handle_frame(hub, "bronzo", {
+        "type": "msg", "to": "grocco", "text": "fine",
+        "client_ref": "ref_close", "closing": True,
+    })
+    msgs = [json.loads(s) for s in grocco_ws.sent if json.loads(s).get("type") == "msg"]
+    assert len(msgs) == 1
+    assert msgs[0]["closing"] is True
 
 
 def test_is_valid_agent_id_pattern() -> None:

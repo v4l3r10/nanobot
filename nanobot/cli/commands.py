@@ -786,7 +786,11 @@ def _run_gateway(
     _peer_channel = channels.channels.get("peer")
     if _peer_channel is not None:
         import re as _re
-        from nanobot.agent.tools.peer import PeerListTool, PeerSayTool
+        from nanobot.agent.tools.peer import (
+            PeerListTool,
+            PeerSayTool,
+            PeerThreadShowTool,
+        )
 
         _AGENT_ID_RE = _re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
@@ -801,6 +805,16 @@ def _run_gateway(
         agent.tools.register(PeerListTool(
             list_peers_callback=getattr(_peer_channel, "list_peers", lambda: []),
             own_agent_id=getattr(_peer_channel, "own_agent_id", ""),
+        ))
+        agent.tools.register(PeerThreadShowTool(
+            fetch_thread_callback=getattr(
+                _peer_channel, "fetch_thread",
+                lambda *a, **kw: (_ for _ in ()).throw(
+                    RuntimeError("peer channel has no fetch_thread method")
+                ),
+            ),
+            own_agent_id=getattr(_peer_channel, "own_agent_id", ""),
+            peer_validator=_is_valid_agent_id,
         ))
 
     def _pick_heartbeat_target() -> tuple[str, str]:
