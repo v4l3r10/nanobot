@@ -77,6 +77,17 @@ class DreamConfig(Base):
     # raise it for memory-heavy Phase 2 reads without enlarging tool spam in
     # regular sessions. 0 disables the cap (truncate_text sentinel).
     max_tool_result_chars: int = Field(default=16_000, ge=0)
+    # Per-day journal notes layer: an episodic compressed log Dream produces
+    # under memory/journal/YYYY-MM-DD.md, sitting between raw history.jsonl
+    # and the durable MEMORY.md. Lets Dream feed itself recent temporal
+    # context without re-loading the full unprocessed history every cycle.
+    daily_notes_enabled: bool = True
+    # How many recent journal notes (newest first) to inject into Phase 1's
+    # prompt for temporal context. Default 2 = yesterday + today.
+    daily_notes_context_days: int = Field(default=2, ge=1)
+    # Cap on the combined character size of the journal notes Phase 1 sees
+    # in a single LLM call. 0 disables the cap (truncate_text sentinel).
+    daily_notes_max_chars: int = Field(default=8_000, ge=0)
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""
