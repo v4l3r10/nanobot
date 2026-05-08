@@ -399,3 +399,79 @@ class TestLegacyHistoryMigration:
         assert entries[0]["timestamp"] == "2026-04-01 10:00"
         assert "Broken" in entries[0]["content"]
         assert "migration." in entries[0]["content"]
+
+
+class TestJournal:
+    """Per-day episodic notes — the daily-notes layer Dream writes between
+    history.jsonl (raw) and MEMORY.md (semantic, durable)."""
+
+    def test_journal_dir_created_eagerly(self, store):
+        assert store.journal_dir.is_dir()
+        assert store.journal_dir == store.memory_dir / "journal"
+
+    def test_journal_path_uses_date_as_filename(self, store):
+        assert store.journal_path("2026-05-08") == store.journal_dir / "2026-05-08.md"
+
+    def test_read_journal_returns_empty_when_missing(self, store):
+        assert store.read_journal("2026-05-08") == ""
+
+    def test_write_and_read_journal(self, store):
+        store.write_journal("2026-05-08", "# 2026-05-08\n- test")
+        assert store.read_journal("2026-05-08") == "# 2026-05-08\n- test"
+
+    def test_journal_exists(self, store):
+        assert not store.journal_exists("2026-05-08")
+        store.write_journal("2026-05-08", "x")
+        assert store.journal_exists("2026-05-08")
+
+    def test_list_recent_returns_newest_first(self, store):
+        store.write_journal("2026-05-06", "old")
+        store.write_journal("2026-05-08", "new")
+        store.write_journal("2026-05-07", "mid")
+
+        recent = store.list_recent_journal_notes(2)
+
+        assert [date for date, _ in recent] == ["2026-05-08", "2026-05-07"]
+        assert recent[0][1] == "new"
+        assert recent[1][1] == "mid"
+
+    def test_list_recent_returns_empty_when_no_notes(self, store):
+        assert store.list_recent_journal_notes(5) == []
+
+    def test_list_recent_with_zero_returns_empty(self, store):
+        store.write_journal("2026-05-08", "x")
+        assert store.list_recent_journal_notes(0) == []
+
+    def test_list_recent_skips_non_dated_files(self, store):
+        """A stray markdown file in the journal dir must not break selection."""
+        store.write_journal("2026-05-08", "valid")
+        (store.journal_dir / "README.md").write_text("not a journal note", encoding="utf-8")
+        (store.journal_dir / "2026-05.md").write_text("partial date", encoding="utf-8")
+
+        recent = store.list_recent_journal_notes(5)
+
+        assert recent == [("2026-05-08", "valid")]
+
+    def test_list_recent_skips_subdirectories(self, store):
+        (store.journal_dir / "archive").mkdir()
+        store.write_journal("2026-05-08", "x")
+
+        recent = store.list_recent_journal_notes(5)
+
+        assert recent == [("2026-05-08", "x")]
+
+    def test_list_recent_caps_at_n(self, store):
+        for day in range(1, 6):
+            store.write_journal(f"2026-05-0{day}", f"day {day}")
+
+        recent = store.list_recent_journal_notes(2)
+
+        assert len(recent) == 2
+        assert recent[0][0] == "2026-05-05"
+        assert recent[1][0] == "2026-05-04"
+
+    def test_write_journal_overwrites(self, store):
+        store.write_journal("2026-05-08", "first")
+        store.write_journal("2026-05-08", "second")
+
+        assert store.read_journal("2026-05-08") == "second"
