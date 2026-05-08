@@ -55,9 +55,11 @@ class MemoryStore:
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
-        self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md",
-        ])
+        self._git = GitStore(
+            workspace,
+            tracked_files=["SOUL.md", "USER.md", "memory/MEMORY.md"],
+            tracked_dirs=["memory/journal"],
+        )
         self._maybe_migrate_legacy_history()
 
     @property

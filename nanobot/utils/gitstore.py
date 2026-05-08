@@ -45,9 +45,19 @@ def _compute_line_ages(annotated) -> list[LineAge]:
 class GitStore:
     """Git-backed version control for memory files."""
 
-    def __init__(self, workspace: Path, tracked_files: list[str]):
+    def __init__(
+        self,
+        workspace: Path,
+        tracked_files: list[str],
+        tracked_dirs: list[str] | None = None,
+    ):
         self._workspace = workspace
         self._tracked_files = tracked_files
+        # Tracked directories whitelist *.md files inside the given relative
+        # paths (e.g. "memory/journal" tracks every memory/journal/*.md).
+        # Used by Dream's per-day journal layer where the file set is open-
+        # ended and fixed-list tracked_files would not work.
+        self._tracked_dirs = list(tracked_dirs or [])
 
     def is_initialized(self) -> bool:
         """Check if the git repo has been initialized."""
@@ -102,8 +112,17 @@ class GitStore:
                 if not p.exists():
                     p.write_text("", encoding="utf-8")
 
+            # Tracked dirs are created empty — git itself does not track empty
+            # directories, but they will be picked up the moment a file lands
+            # inside (e.g. the first journal note Dream writes).
+            for rel in self._tracked_dirs:
+                (self._workspace / rel).mkdir(parents=True, exist_ok=True)
+
             # Initial commit
-            porcelain.add(str(self._workspace), paths=[".gitignore"] + self._tracked_files)
+            porcelain.add(
+                str(self._workspace),
+                paths=[".gitignore"] + self._tracked_files + self._enumerate_tracked_dir_files(),
+            )
             porcelain.commit(
                 str(self._workspace),
                 message=b"init: nanobot memory store",
@@ -129,14 +148,21 @@ class GitStore:
         try:
             from dulwich import porcelain
 
-            # .gitignore excludes everything except tracked files,
-            # so any staged/unstaged change must be in our files.
+            # Stage explicitly first so new files inside tracked_dirs (e.g.
+            # a fresh journal note) get picked up — dulwich's status() with
+            # the /* gitignore in place does not always descend into ignored-
+            # then-rewhitelisted directories to surface untracked files.
+            # The .gitignore guarantees only our files are staged so this is
+            # safe; if nothing changed, status.staged is empty and we no-op.
+            porcelain.add(
+                str(self._workspace),
+                paths=self._tracked_files + self._enumerate_tracked_dir_files(),
+            )
             st = porcelain.status(str(self._workspace))
-            if not st.unstaged and not any(st.staged.values()):
+            if not any(st.staged.values()):
                 return None
 
             msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
-            porcelain.add(str(self._workspace), paths=self._tracked_files)
             sha_bytes = porcelain.commit(
                 str(self._workspace),
                 message=msg_bytes,
@@ -153,6 +179,22 @@ class GitStore:
             return None
 
     # -- internal helpers ------------------------------------------------------
+
+    def _enumerate_tracked_dir_files(self) -> list[str]:
+        """Return workspace-relative paths of every ``*.md`` inside tracked_dirs.
+
+        Used to extend ``add`` calls so the open-ended file set inside a
+        tracked directory (e.g. ``memory/journal/*.md``) is staged the same
+        way as fixed tracked_files.
+        """
+        files: list[str] = []
+        for rel in self._tracked_dirs:
+            base = self._workspace / rel
+            if not base.is_dir():
+                continue
+            for md in sorted(base.glob("*.md")):
+                files.append(str(md.relative_to(self._workspace)))
+        return files
 
     def _resolve_sha(self, short_sha: str) -> bytes | None:
         """Resolve a short SHA prefix to the full SHA bytes."""
@@ -193,17 +235,27 @@ class GitStore:
         return False
 
     def _build_gitignore(self) -> str:
-        """Generate .gitignore content from tracked files."""
+        """Generate .gitignore content from tracked files and directories."""
         dirs: set[str] = set()
         for f in self._tracked_files:
             parent = str(Path(f).parent)
             if parent != ".":
                 dirs.add(parent)
+        # Each tracked_dir contributes the dir itself and every parent so the
+        # whitelist chain from root to leaf is uninterrupted by the leading /*.
+        for d in self._tracked_dirs:
+            p = Path(d)
+            for ancestor in [p, *p.parents]:
+                a = str(ancestor)
+                if a != ".":
+                    dirs.add(a)
         lines = ["/*"]
         for d in sorted(dirs):
             lines.append(f"!{d}/")
         for f in self._tracked_files:
             lines.append(f"!{f}")
+        for d in self._tracked_dirs:
+            lines.append(f"!{d}/*.md")
         lines.append("!.gitignore")
         return "\n".join(lines) + "\n"
 
@@ -359,6 +411,22 @@ class GitStore:
                         dest = self._workspace / filepath
                         dest.write_text(content, encoding="utf-8")
                         restored.append(filepath)
+                # Tracked dirs (e.g. memory/journal) — additive revert: for
+                # each currently-on-disk *.md, restore the parent's version
+                # if the file existed at that point. Files added after the
+                # target commit stay on disk; this is a known V1 limitation
+                # but the common case (rollback of MEMORY.md) is unaffected
+                # because journal notes are append-mostly per-day artifacts.
+                for tracked_dir in self._tracked_dirs:
+                    base = self._workspace / tracked_dir
+                    if not base.is_dir():
+                        continue
+                    for md in sorted(base.glob("*.md")):
+                        rel = str(md.relative_to(self._workspace))
+                        content = self._read_blob_from_tree(repo, tree, rel)
+                        if content is not None:
+                            md.write_text(content, encoding="utf-8")
+                            restored.append(rel)
 
             if not restored:
                 return None
