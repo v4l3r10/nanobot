@@ -146,3 +146,52 @@ def test_dream_config_max_tool_result_chars_independent_from_agent_defaults() ->
 
     assert defaults.max_tool_result_chars == 8_000
     assert defaults.dream.max_tool_result_chars == 64_000
+
+
+def test_dream_config_default_daily_notes_settings() -> None:
+    """Daily notes layer is on by default with yesterday+today context window."""
+    cfg = DreamConfig()
+
+    assert cfg.daily_notes_enabled is True
+    assert cfg.daily_notes_context_days == 2
+    assert cfg.daily_notes_max_chars == 8_000
+
+
+def test_dream_config_accepts_camel_case_daily_notes() -> None:
+    cfg = DreamConfig.model_validate({
+        "dailyNotesEnabled": False,
+        "dailyNotesContextDays": 5,
+        "dailyNotesMaxChars": 16_000,
+    })
+
+    assert cfg.daily_notes_enabled is False
+    assert cfg.daily_notes_context_days == 5
+    assert cfg.daily_notes_max_chars == 16_000
+
+
+def test_dream_config_dump_uses_camel_case_for_daily_notes() -> None:
+    cfg = DreamConfig(daily_notes_max_chars=12_000)
+
+    dumped = cfg.model_dump(by_alias=True)
+
+    assert dumped["dailyNotesEnabled"] is True
+    assert dumped["dailyNotesContextDays"] == 2
+    assert dumped["dailyNotesMaxChars"] == 12_000
+
+
+def test_dream_config_zero_daily_notes_max_chars_disables_cap() -> None:
+    """0 is the truncate_text sentinel for 'no truncation'."""
+    cfg = DreamConfig(daily_notes_max_chars=0)
+
+    assert cfg.daily_notes_max_chars == 0
+
+
+def test_dream_config_rejects_invalid_daily_notes_settings() -> None:
+    """context_days must be ≥ 1 (a 0-day window is meaningless), max_chars must be ≥ 0."""
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        DreamConfig(daily_notes_context_days=0)
+    with pytest.raises(ValidationError):
+        DreamConfig(daily_notes_max_chars=-1)
