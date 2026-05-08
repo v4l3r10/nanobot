@@ -47,6 +47,7 @@ class MemoryStore:
     _LEGACY_RAW_MESSAGE_RE = re.compile(
         r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
     )
+    _JOURNAL_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
     def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
         self.workspace = workspace
@@ -55,6 +56,7 @@ class MemoryStore:
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
+        self.journal_dir = ensure_dir(self.memory_dir / "journal")
         self.soul_file = workspace / "SOUL.md"
         self.user_file = workspace / "USER.md"
         self._cursor_file = self.memory_dir / ".cursor"
@@ -223,6 +225,39 @@ class MemoryStore:
 
     def write_user(self, content: str) -> None:
         self.user_file.write_text(content, encoding="utf-8")
+
+    # -- journal (per-day episodic notes) ------------------------------------
+
+    def journal_path(self, date: str) -> Path:
+        return self.journal_dir / f"{date}.md"
+
+    def read_journal(self, date: str) -> str:
+        return self.read_file(self.journal_path(date))
+
+    def write_journal(self, date: str, content: str) -> None:
+        self.journal_path(date).write_text(content, encoding="utf-8")
+
+    def journal_exists(self, date: str) -> bool:
+        return self.journal_path(date).exists()
+
+    def list_recent_journal_notes(self, n: int) -> list[tuple[str, str]]:
+        """Return up to *n* most recent daily notes as ``(date, content)``.
+
+        Newest first, sorted by ISO date in the filename. Files whose stem
+        does not match ``YYYY-MM-DD`` are skipped so a stray markdown file
+        in the journal directory cannot break Dream's prompt assembly.
+        """
+        if n <= 0:
+            return []
+        candidates = [
+            entry.stem
+            for entry in self.journal_dir.iterdir()
+            if entry.is_file()
+            and entry.suffix == ".md"
+            and self._JOURNAL_DATE_RE.match(entry.stem)
+        ]
+        candidates.sort(reverse=True)
+        return [(date, self.read_journal(date)) for date in candidates[:n]]
 
     # -- context injection (used by context.py) ------------------------------
 
