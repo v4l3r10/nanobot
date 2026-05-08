@@ -182,3 +182,153 @@ async def test_exec_ignores_workspace_check_when_not_restricted(tmp_path):
     result = await tool.execute(command="echo ok", working_dir=str(other))
     assert "ok" in result
     assert "outside the configured workspace" not in result
+
+
+# --- Relaxed deny_patterns: avoid false positives ------------------------
+#
+# Background: the previous regex `\brm\s+-[rf]{1,2}\b` blocked every `rm -rf`
+# regardless of target. Confirmed production block: `rm -rf squashfs-root`
+# during AppImage extraction in /tmp aborted the agent turn.
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf squashfs-root",                  # production case
+        "rm -rf node_modules",
+        "rm -rf ./build",
+        "rm -rf /tmp/foo",
+        "rm -rf /tmp/extract-dir/",
+        "rm -r dist",
+        "rm -fr cache",
+    ],
+)
+def test_exec_allows_rm_rf_on_local_paths(command):
+    tool = ExecTool()
+    assert tool._guard_command(command, "/tmp") is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf /",
+        "rm -rf / ",
+        "rm -rf /etc",
+        "rm -rf /etc/passwd",
+        "rm -rf /usr/bin",
+        "rm -rf /home",
+        "rm -rf /var/log",
+        "rm -rf /lib",
+        "rm -rf ~",
+        "rm -rf ~/",
+        "rm -rf $HOME",
+    ],
+)
+def test_exec_blocks_rm_rf_on_system_roots(command):
+    tool = ExecTool()
+    assert tool._guard_command(command, "/tmp") is not None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # shutdown/reboot should NOT match when used as text in other commands
+        "grep shutdown /var/log/syslog",
+        'echo "system will shutdown soon"',
+        "cat /var/log/reboot.log",
+        "ls /etc/format-rules.d/",
+        "cd ~/projects/diskpart-tool",
+    ],
+)
+def test_exec_allows_keywords_inside_other_commands(command):
+    tool = ExecTool()
+    assert tool._guard_command(command, "/tmp") is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "shutdown -h now",
+        "sudo reboot",
+        "poweroff",
+        "halt",
+        "init 0",
+        "init 6",
+        "mkfs.ext4 /dev/sda1",
+        "sudo mkfs.xfs /dev/nvme0n1p1",
+        "diskpart",
+        "dd if=/dev/zero of=/dev/sda",
+        "dd if=disk.img of=/dev/nvme0n1",
+        "echo data > /dev/sda1",
+        ":(){ :|:& };:",
+    ],
+)
+def test_exec_blocks_truly_dangerous_commands(command):
+    tool = ExecTool()
+    assert tool._guard_command(command, "/tmp") is not None, command
+
+
+# --- Marker decoupling --------------------------------------------------
+#
+# Soft policy errors (deny_patterns, allow_patterns, internal URL) should
+# return "rejected by policy" so runner._is_workspace_violation does NOT
+# abort the turn. Workspace boundary errors (path traversal, path outside
+# workdir) keep "blocked by safety guard" so the runner aborts.
+
+def test_deny_pattern_uses_rejected_by_policy_prefix():
+    tool = ExecTool()
+    result = tool._guard_command("rm -rf /etc", "/tmp")
+    assert result is not None
+    assert "rejected by policy" in result.lower()
+    assert "blocked by safety guard" not in result.lower()
+
+
+def test_allowlist_uses_rejected_by_policy_prefix():
+    tool = ExecTool(allow_patterns=[r"^echo "])
+    result = tool._guard_command("ls", "/tmp")
+    assert result is not None
+    assert "rejected by policy" in result.lower()
+    assert "blocked by safety guard" not in result.lower()
+
+
+def test_internal_url_uses_rejected_by_policy_prefix():
+    tool = ExecTool()
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_localhost):
+        result = tool._guard_command("curl http://localhost:8080/x", "/tmp")
+    assert result is not None
+    assert "rejected by policy" in result.lower()
+    assert "blocked by safety guard" not in result.lower()
+
+
+def test_path_outside_workdir_keeps_safety_guard_marker(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = tool._guard_command("cat /etc/passwd", str(workspace))
+    assert result is not None
+    assert "blocked by safety guard" in result.lower()
+
+
+# --- Opt-in internal URL block (block_internal_urls) ---------------------
+
+def test_block_internal_urls_default_true_blocks():
+    tool = ExecTool()  # default block_internal_urls=True
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_localhost):
+        result = tool._guard_command("curl http://localhost/api", "/tmp")
+    assert result is not None
+    assert "internal" in result.lower() or "private" in result.lower()
+
+
+def test_block_internal_urls_false_allows():
+    """With block_internal_urls=False the LLM can curl LAN/Docker services."""
+    tool = ExecTool(block_internal_urls=False)
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_localhost):
+        result = tool._guard_command("curl http://nanobot-arnaldo:8080/health", "/tmp")
+    assert result is None
+
+
+def test_block_internal_urls_false_still_blocks_dangerous_patterns():
+    """Disabling internal URL block doesn't disable other guards."""
+    tool = ExecTool(block_internal_urls=False)
+    result = tool._guard_command("rm -rf /etc", "/tmp")
+    assert result is not None
+    assert "rejected by policy" in result.lower()

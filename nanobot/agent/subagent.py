@@ -176,6 +176,7 @@ class SubagentManager:
                     sandbox=self.exec_config.sandbox,
                     path_append=self.exec_config.path_append,
                     allowed_env_keys=self.exec_config.allowed_env_keys,
+                    block_internal_urls=self.exec_config.block_internal_urls,
                 ))
             if self.web_config.enable:
                 tools.register(

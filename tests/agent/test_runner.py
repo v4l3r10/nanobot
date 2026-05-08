@@ -353,6 +353,77 @@ async def test_runner_stops_on_workspace_violation_without_fail_on_tool_error():
 
 
 @pytest.mark.asyncio
+async def test_runner_does_not_abort_on_policy_error():
+    """A "rejected by policy" tool error must not match _is_workspace_violation,
+    so the LLM gets the error string and can retry on the next iteration."""
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="trying",
+            tool_calls=[ToolCallRequest(id="call_1", name="exec", arguments={"command": "rm -rf /etc"})],
+        ),
+        LLMResponse(content="recovered", tool_calls=[]),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(
+        return_value="Error: Command rejected by policy (dangerous pattern detected)"
+    )
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    # Loop continued past the error: provider was called twice.
+    assert provider.chat_with_retry.await_count == 2
+    assert result.stop_reason != "tool_error"
+    assert result.tool_events[0]["status"] == "error"
+    # Detail must NOT have the workspace_violation prefix used for boundary blocks.
+    assert "workspace_violation" not in result.tool_events[0]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_runner_aborts_on_safety_guard_workspace_marker():
+    """A "blocked by safety guard" string still triggers turn abort
+    (preserves boundary-violation behavior for path traversal / outside workdir)."""
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="trying",
+            tool_calls=[ToolCallRequest(id="call_1", name="exec", arguments={"command": "cat /etc/passwd"})],
+        ),
+        LLMResponse(content="should not be reached", tool_calls=[]),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(
+        return_value="Error: Command blocked by safety guard (path outside working dir)"
+    )
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert provider.chat_with_retry.await_count == 1
+    assert result.stop_reason == "tool_error"
+    assert "workspace_violation" in result.tool_events[0]["detail"]
+
+
+@pytest.mark.asyncio
 async def test_runner_persists_large_tool_results_for_follow_up_calls(tmp_path):
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 

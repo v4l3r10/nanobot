@@ -47,20 +47,35 @@ class ExecTool(Tool):
         sandbox: str = "",
         path_append: str = "",
         allowed_env_keys: list[str] | None = None,
+        block_internal_urls: bool = True,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
         self.sandbox = sandbox
+        self.block_internal_urls = block_internal_urls
+        # System-critical roots: rm -rf on these is almost always catastrophic.
+        # Note: /tmp, /proc, /run, /mnt, /media intentionally excluded — legit
+        # cleanup targets. /dev included because removing device nodes breaks
+        # the system without obvious recovery.
+        _system_roots = r"(?:bin|boot|etc|root|home|usr|var|opt|sys|lib|sbin|dev|lib32|lib64|libx32)"
         self.deny_patterns = deny_patterns or [
-            r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
-            r"\bdel\s+/[fq]\b",              # del /f, del /q
-            r"\brmdir\s+/s\b",               # rmdir /s
-            r"(?:^|[;&|]\s*)format\b",       # format (as standalone command only)
-            r"\b(mkfs|diskpart)\b",          # disk operations
-            r"\bdd\s+if=",                   # dd
-            r">\s*/dev/sd",                  # write to disk
-            r"\b(shutdown|reboot|poweroff)\b",  # system power
-            r":\(\)\s*\{.*\};\s*:",          # fork bomb
+            # rm -rf targeting system roots, $HOME, or ~ (allows rm -rf node_modules,
+            # rm -rf /tmp/foo, rm -rf squashfs-root, etc.)
+            rf"\brm\s+-[rf]+\s+(?:/\s|/$|/{_system_roots}(?:/|\s|$)|~(?:/?\s|/?$)|\$home\b)",
+            # Windows destructive deletes (anchored to command start)
+            r"(?:^|[;&|]\s*)\bdel\s+/[fq]\b",
+            r"(?:^|[;&|]\s*)\brmdir\s+/s\b",
+            # format / mkfs / diskpart (anchored — avoids matching inside grep/echo)
+            r"(?:^|[;&|]\s*)\b(?:sudo\s+)?format\b",
+            r"(?:^|[;&|]\s*)\b(?:sudo\s+)?(?:mkfs(?:\.\w+)?|diskpart)\b",
+            # System power (anchored — avoids matching `grep shutdown /var/log/...`)
+            r"(?:^|[;&|]\s*)\b(?:sudo\s+)?(?:shutdown|reboot|poweroff|halt|init\s+[06])\b",
+            # dd writing to a block device (the dangerous direction)
+            r"\bdd\b[^|;&<>]*\bof=\s*/dev/(?:sd|nvme|hd|mmcblk|xvd|loop|vd)",
+            # Redirect to block device
+            r">\s*/dev/(?:sd|nvme|hd|mmcblk|xvd|loop|vd)",
+            # Fork bomb
+            r":\(\)\s*\{.*\};\s*:",
             # Block writes to nanobot internal state files (#2989).
             # history.jsonl / .dream_cursor are managed by append_history();
             # direct writes corrupt the cursor format and crash /dream.
@@ -269,21 +284,29 @@ class ExecTool(Tool):
         return env
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
-        """Best-effort safety guard for potentially destructive commands."""
+        """Best-effort safety guard for potentially destructive commands.
+
+        Two error prefixes are used intentionally:
+        - "rejected by policy" for soft denials (deny_patterns, allowlist,
+          internal URL): the LLM may retry with a different command.
+        - "blocked by safety guard" for workspace-boundary violations
+          (path traversal, path outside workdir): runner aborts the turn.
+        """
         cmd = command.strip()
         lower = cmd.lower()
 
         for pattern in self.deny_patterns:
             if re.search(pattern, lower):
-                return "Error: Command blocked by safety guard (dangerous pattern detected)"
+                return "Error: Command rejected by policy (dangerous pattern detected)"
 
         if self.allow_patterns:
             if not any(re.search(p, lower) for p in self.allow_patterns):
-                return "Error: Command blocked by safety guard (not in allowlist)"
+                return "Error: Command rejected by policy (not in allowlist)"
 
-        from nanobot.security.network import contains_internal_url
-        if contains_internal_url(cmd):
-            return "Error: Command blocked by safety guard (internal/private URL detected)"
+        if self.block_internal_urls:
+            from nanobot.security.network import contains_internal_url
+            if contains_internal_url(cmd):
+                return "Error: Command rejected by policy (internal/private URL detected)"
 
         if self.restrict_to_workspace:
             if "..\\" in cmd or "../" in cmd:

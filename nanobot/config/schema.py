@@ -229,6 +229,7 @@ class ExecToolConfig(Base):
     path_append: str = ""
     sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
     allowed_env_keys: list[str] = Field(default_factory=list)  # Env var names to pass through to subprocess (e.g. ["GOPATH", "JAVA_HOME"])
+    block_internal_urls: bool = True  # block commands referencing RFC1918/loopback/link-local URLs (set False for setups that talk to LAN/Docker services)
 
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
