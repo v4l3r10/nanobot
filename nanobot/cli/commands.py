@@ -777,6 +777,46 @@ def _run_gateway(
     # can serve the embedded webui's REST surface).
     channels = ChannelManager(config, bus, session_manager=session_manager)
 
+    # Wire peer-to-peer agent tools to the live PeerChannel instance, if any.
+    # The peer channel lazily exposes the online roster (presence-pushed by the
+    # router) and accepts OutboundMessages with chat_id "peer:<agent>" to
+    # forward via its long-lived WebSocket. Both tools become discoverable to
+    # the LLM only when the operator opted into inter-agent messaging by
+    # enabling the channel in config.
+    _peer_channel = channels.channels.get("peer")
+    if _peer_channel is not None:
+        import re as _re
+        from nanobot.agent.tools.peer import (
+            PeerListTool,
+            PeerSayTool,
+            PeerThreadShowTool,
+        )
+
+        _AGENT_ID_RE = _re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+        def _is_valid_agent_id(value: str) -> bool:
+            return isinstance(value, str) and bool(_AGENT_ID_RE.match(value))
+
+        agent.tools.register(PeerSayTool(
+            send_callback=bus.publish_outbound,
+            own_agent_id=getattr(_peer_channel, "own_agent_id", ""),
+            peer_validator=_is_valid_agent_id,
+        ))
+        agent.tools.register(PeerListTool(
+            list_peers_callback=getattr(_peer_channel, "list_peers", lambda: []),
+            own_agent_id=getattr(_peer_channel, "own_agent_id", ""),
+        ))
+        agent.tools.register(PeerThreadShowTool(
+            fetch_thread_callback=getattr(
+                _peer_channel, "fetch_thread",
+                lambda *a, **kw: (_ for _ in ()).throw(
+                    RuntimeError("peer channel has no fetch_thread method")
+                ),
+            ),
+            own_agent_id=getattr(_peer_channel, "own_agent_id", ""),
+            peer_validator=_is_valid_agent_id,
+        ))
+
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)

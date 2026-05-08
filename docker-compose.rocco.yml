@@ -1,0 +1,62 @@
+name: rocco
+
+x-common-config: &common-config
+  build:
+    context: .
+    dockerfile: Dockerfile
+  volumes:
+    - /home/nanobot/nanobot_workspace/rocco:/home/nanobot/.nanobot
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  cap_drop:
+    - ALL
+  cap_add:
+    - SYS_ADMIN
+  security_opt:
+    - apparmor=unconfined
+    - seccomp=unconfined
+  networks:
+    - default
+    - bronzo-shared
+
+services:
+  nanobot-gateway-rocco:
+    container_name: nanobot-gateway-rocco
+    <<: *common-config
+    command: ["gateway"]
+    restart: unless-stopped
+    ports:
+      - 18791:18790
+    expose:
+      - "8765"
+    group_add:
+      - "101"
+    environment:
+      - TELEGRAM_API_BASE=http://telegram-bot-api:8081/bot
+      - TELEGRAM_FILE_BASE=http://telegram-bot-api:8081/file/bot
+      - TELEGRAM_LOCAL_MODE=1
+      - PYTHONPATH=/home/nanobot/.nanobot/pythonpath
+      - MAILBOX_GROCCO_TOKEN=${MAILBOX_GROCCO_TOKEN}
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  nanobot-cli-rocco:
+    <<: *common-config
+    profiles:
+      - cli
+    command: ["status"]
+    stdin_open: true
+    tty: true
+
+networks:
+  default:
+    name: rocco_default
+  bronzo-shared:
+    name: nanobot_default
+    external: true

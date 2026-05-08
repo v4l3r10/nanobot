@@ -987,6 +987,13 @@ class AgentLoop:
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
+        # Reset per-turn flag on PeerSayTool so we can detect whether the
+        # agent already addressed the peer via the structured tool (and thus
+        # suppress the duplicated narrative final_content).
+        if peer_say_tool := self.tools.get("peer_say"):
+            start_turn = getattr(peer_say_tool, "start_turn", None)
+            if callable(start_turn):
+                start_turn()
 
         _hist_kwargs: dict[str, Any] = {
             "max_messages": self._max_messages,
@@ -1096,6 +1103,30 @@ class AgentLoop:
         # came from MessageTool.
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             if not had_injections or stop_reason == "empty_final_response":
+                return None
+        # Same suppression for peer_say: when the agent has already addressed
+        # the peer through the structured tool (which knows about closing=true
+        # and the receiver-side wake protocol), the narrative final_content
+        # would arrive at the peer as a SECOND message without closing,
+        # defeating the loop-break and waking the receiver again. Skip it.
+        # We only suppress for peer_say's own channel (peer:*) so other
+        # channels (telegram, etc.) are unaffected.
+        if msg.channel == "peer":
+            peer_tool = self.tools.get("peer_say")
+            if peer_tool is not None and getattr(peer_tool, "_sent_in_turn", False):
+                if not had_injections or stop_reason == "empty_final_response":
+                    return None
+            # Drop workspace-violation outbounds on the peer plane: the error
+            # is fully captured in the originating agent's logs, and forwarding
+            # it as a regular `msg` frame (no closing=true) wakes the peer's
+            # agent loop into a meta-narrative ping-pong where the receiver
+            # asks "what were you trying to do?" and the sender retries the
+            # same blocked operation. Local-only failure breaks the loop.
+            if stop_reason == "workspace_violation":
+                logger.info(
+                    "Suppressing workspace_violation outbound to peer:{}",
+                    msg.sender_id,
+                )
                 return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content

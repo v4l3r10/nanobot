@@ -332,3 +332,49 @@ def test_block_internal_urls_false_still_blocks_dangerous_patterns():
     result = tool._guard_command("rm -rf /etc", "/tmp")
     assert result is not None
     assert "rejected by policy" in result.lower()
+
+
+# --- Safe device pseudo-files in redirects --------------------------------
+#
+# Common shell idioms like `2>/dev/null` were misclassified as
+# "path outside working dir" because the regex extracts `/dev/null`
+# as a path argument. /dev/null and friends are not data targets and
+# must not trigger the boundary guard.
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'find . -name "x" -type f 2>/dev/null',
+        "ls -la 2>/dev/null && echo ok",
+        "grep foo bar.txt >/dev/null",
+        "cat </dev/stdin",
+        "echo hi >/dev/stderr",
+        "cmd >/dev/null 2>&1",
+    ],
+)
+def test_redirect_to_safe_device_does_not_trigger_workspace_guard(tmp_path, command):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = tool._guard_command(command, str(workspace))
+    assert result is None or "blocked by safety guard" not in result.lower(), command
+
+
+def test_real_path_outside_workspace_still_blocks(tmp_path):
+    """Whitelist only covers /dev/* pseudo-files, not arbitrary paths."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = tool._guard_command("find /etc -name passwd 2>/dev/null", str(workspace))
+    assert result is not None
+    assert "blocked by safety guard" in result.lower()
+
+
+def test_redirect_to_arbitrary_outside_path_still_blocks(tmp_path):
+    """Redirecting to a non-device path outside workspace stays blocked."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = tool._guard_command("echo data >/etc/exfil", str(workspace))
+    assert result is not None
+    assert "blocked by safety guard" in result.lower()

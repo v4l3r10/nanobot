@@ -1,0 +1,19 @@
+[project]
+name = "nanobot-mailbox"
+version = "0.1.0"
+description = "Inter-agent messaging service for nanobot multi-instance setups"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

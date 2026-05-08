@@ -4,6 +4,9 @@ x-common-config: &common-config
     dockerfile: Dockerfile
   volumes:
     - ~/.nanobot:/home/nanobot/.nanobot
+    - ~/.nanobot/bash_profile:/home/nanobot/.bash_profile:ro
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   cap_drop:
     - ALL
   cap_add:
@@ -13,6 +16,43 @@ x-common-config: &common-config
     - seccomp=unconfined
 
 services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_LOCAL=1
+      - TELEGRAM_VERBOSITY=2
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "nc 127.0.0.1 8081 < /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: tailscale-sidecar
+    hostname: nanobot-detective
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_HOSTNAME=nanobot-detective
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=true
+      - TS_ACCEPT_DNS=false
+      - TS_EXTRA_ARGS=--exit-node=100.72.216.10 --exit-node-allow-lan-access
+      - TS_OUTBOUND_HTTP_PROXY_LISTEN=:1055
+      - TS_SOCKS5_SERVER=:1056
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    restart: unless-stopped
+
   nanobot-gateway:
     container_name: nanobot-gateway
     <<: *common-config
@@ -20,11 +60,31 @@ services:
     restart: unless-stopped
     ports:
       - 18790:18790
+    expose:
+      - "8765"
+    volumes:
+      - ~/.nanobot:/home/nanobot/.nanobot
+      - ~/.nanobot/bash_profile:/home/nanobot/.bash_profile:ro
+      - telegram-bot-api-data:/var/lib/telegram-bot-api:ro
+    group_add:
+      - "101"
+    environment:
+      - TELEGRAM_API_BASE=http://telegram-bot-api:8081/bot
+      - TELEGRAM_FILE_BASE=http://telegram-bot-api:8081/file/bot
+      - TELEGRAM_LOCAL_MODE=1
+      - PYTHONPATH=/home/nanobot/.nanobot/pythonpath
+      - HOME_PROXY=http://tailscale:1055
+      - MAILBOX_BRONZO_TOKEN=${MAILBOX_BRONZO_TOKEN}
+    depends_on:
+      tailscale:
+        condition: service_started
+      telegram-bot-api:
+        condition: service_healthy
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: 1G
+          cpus: "4"
+          memory: 4G
         reservations:
           cpus: "0.25"
           memory: 256M
@@ -32,8 +92,7 @@ services:
   nanobot-api:
     container_name: nanobot-api
     <<: *common-config
-    command:
-      ["serve", "--host", "0.0.0.0", "-w", "/home/nanobot/.nanobot/api-workspace"]
+    command: ["serve", "--host", "0.0.0.0", "-w", "/home/nanobot/.nanobot/api-workspace"]
     restart: unless-stopped
     ports:
       - 127.0.0.1:8900:8900
@@ -53,3 +112,24 @@ services:
     command: ["status"]
     stdin_open: true
     tty: true
+
+  nanobot-mailbox:
+    build: ./services/inter-agent-mailbox
+    container_name: nanobot-mailbox
+    restart: unless-stopped
+    environment:
+      - MAILBOX_LOG_LEVEL=${MAILBOX_LOG_LEVEL:-INFO}
+      - MAILBOX_AGENT_TOKENS=${MAILBOX_AGENT_TOKENS:-}
+    volumes:
+      - /home/nanobot/nanobot_workspace/_shared/inter-agent-mailbox:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8765/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    expose: ["8765"]
+
+volumes:
+  telegram-bot-api-data:
+  tailscale-state:

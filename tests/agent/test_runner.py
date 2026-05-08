@@ -341,8 +341,14 @@ async def test_runner_stops_on_workspace_violation_without_fail_on_tool_error():
     ))
 
     assert provider.chat_with_retry.await_count == 1
-    assert result.stop_reason == "tool_error"
+    assert result.stop_reason == "workspace_violation"
     assert "outside allowed directory" in (result.error or "")
+    # final_content must be the user-facing template, not the raw Python
+    # exception text. The raw boundary message stays in result.error / logs.
+    assert result.final_content
+    assert "RuntimeError" not in result.final_content
+    assert "PermissionError" not in result.final_content
+    assert "outside allowed directory" not in result.final_content
     assert result.tool_events == [
         {
             "name": "read_file",
@@ -419,7 +425,7 @@ async def test_runner_aborts_on_safety_guard_workspace_marker():
     ))
 
     assert provider.chat_with_retry.await_count == 1
-    assert result.stop_reason == "tool_error"
+    assert result.stop_reason == "workspace_violation"
     assert "workspace_violation" in result.tool_events[0]["detail"]
 
 

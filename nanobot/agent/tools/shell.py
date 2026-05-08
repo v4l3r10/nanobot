@@ -17,6 +17,22 @@ from nanobot.config.paths import get_media_dir
 
 _IS_WINDOWS = sys.platform == "win32"
 
+# Pseudo-devices that are safe even when the workspace boundary is enforced.
+# They appear in shell pipelines as redirect targets (`2>/dev/null`) or stream
+# placeholders, never as actual data sinks. Treating them like ordinary paths
+# was the most common cause of false-positive workspace blocks.
+_SAFE_DEVICE_PATHS = frozenset({
+    "/dev/null",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/tty",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/full",
+})
+
 
 @tool_parameters(
     tool_parameters_schema(
@@ -317,6 +333,14 @@ class ExecTool(Tool):
             for raw in self._extract_absolute_paths(cmd):
                 try:
                     expanded = os.path.expandvars(raw.strip())
+                    # Standard device pseudo-files used as redirect sinks/sources
+                    # (`2>/dev/null`, `</dev/stdin`, `>/dev/stderr`, …). They
+                    # are not data targets and were a frequent false-positive
+                    # on otherwise-safe shell pipelines. Checked pre-resolve
+                    # because /dev/stderr et al. are symlinks into /proc/self
+                    # that would otherwise resolve outside the workspace.
+                    if expanded in _SAFE_DEVICE_PATHS:
+                        continue
                     p = Path(expanded).expanduser().resolve()
                 except Exception:
                     continue
