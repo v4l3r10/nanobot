@@ -1008,11 +1008,20 @@ class Dream:
             file_states=file_states,
         ))
         tools.register(EditFileTool(workspace=workspace, allowed_dir=workspace, file_states=file_states))
-        # write_file resolves relative paths from workspace root, but can only
-        # write under skills/ so the prompt can safely use skills/<name>/SKILL.md.
+        # write_file resolves relative paths from workspace root and is restricted
+        # to skills/ (skill creation) and memory/journal/ (daily notes bootstrap —
+        # the prompt steers the LLM to edit_file with old_text="", but some models
+        # use write_file instead, and that's a legitimate use case).
         skills_dir = workspace / "skills"
         skills_dir.mkdir(parents=True, exist_ok=True)
-        tools.register(WriteFileTool(workspace=workspace, allowed_dir=skills_dir, file_states=file_states))
+        journal_dir = workspace / "memory" / "journal"
+        journal_dir.mkdir(parents=True, exist_ok=True)
+        tools.register(WriteFileTool(
+            workspace=workspace,
+            allowed_dir=skills_dir,
+            extra_allowed_dirs=[journal_dir],
+            file_states=file_states,
+        ))
         return tools
 
     # -- skill listing --------------------------------------------------------
