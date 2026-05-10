@@ -100,6 +100,26 @@ def _safe_filename(name: str) -> str:
     return cleaned[:120]
 
 
+# Map mimetypes.guess_type encoding hints (gzip/bzip2/xz/compress) to the
+# correct MIME for the *compressed* payload. Without this, a file like
+# foo.tar.gz reports ('application/x-tar', 'gzip') and we'd ship the
+# uncompressed-format MIME, mislabeling the bytes on the wire.
+_ENCODING_MIME = {
+    "gzip": "application/gzip",
+    "bzip2": "application/x-bzip2",
+    "xz": "application/x-xz",
+    "compress": "application/x-compress",
+    "br": "application/x-brotli",
+}
+
+
+def _guess_mime(filename: str) -> str:
+    base, encoding = mimetypes.guess_type(filename)
+    if encoding and encoding in _ENCODING_MIME:
+        return _ENCODING_MIME[encoding]
+    return base or "application/octet-stream"
+
+
 class PeerConfig(Base):
     """Configuration for the peer-to-peer mailbox channel."""
 
@@ -605,7 +625,7 @@ class PeerChannel(BaseChannel):
             path = Path(path_str)
             if not path.is_file():
                 raise RuntimeError(f"peer upload: not a file: {path_str}")
-            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            mime = _guess_mime(path.name)
             try:
                 with path.open("rb") as f:
                     files = {"file": (path.name, f, mime)}

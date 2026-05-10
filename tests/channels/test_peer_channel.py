@@ -19,6 +19,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.peer import (
     PeerChannel,
     PeerConfig,
+    _guess_mime,
     _peer_chat_id,
     _peer_from_chat_id,
     _ws_to_http_base,
@@ -402,3 +403,29 @@ async def test_disconnect_clears_known_peers_for_freshness() -> None:
     # Simulate the cleanup that runs in _run_session's finally block:
     ch._known_peers.clear()
     assert ch.list_peers() == []
+
+
+# --- _guess_mime: encoding-aware MIME resolution -----------------------------
+
+def test_guess_mime_tar_gz_returns_gzip() -> None:
+    """foo.tar.gz must be reported as application/gzip — without this the
+    router rejects with 415 because mimetypes.guess_type returns
+    ('application/x-tar', 'gzip') and we'd ship the uncompressed type."""
+    assert _guess_mime("foo.tar.gz") == "application/gzip"
+
+
+def test_guess_mime_tar_bz2_returns_bzip2() -> None:
+    assert _guess_mime("foo.tar.bz2") == "application/x-bzip2"
+
+
+def test_guess_mime_tar_xz_returns_xz() -> None:
+    assert _guess_mime("foo.tar.xz") == "application/x-xz"
+
+
+def test_guess_mime_known_type_unchanged() -> None:
+    assert _guess_mime("note.txt") == "text/plain"
+    assert _guess_mime("photo.png") == "image/png"
+
+
+def test_guess_mime_unknown_falls_back_to_octet_stream() -> None:
+    assert _guess_mime("blob.weirdext") == "application/octet-stream"
