@@ -119,7 +119,9 @@ def build_app() -> Starlette:
         # Optional Telegram observer. Built from env so the service runs
         # unchanged when the bot token is absent (the default in tests).
         observer = build_observer_from_env(
-            db=db, hub_status_provider=peer_hub.online_peers,
+            db=db,
+            hub_status_provider=peer_hub.online_peers,
+            forward_callable=peer_hub.forward,
         )
         if observer is not None:
             peer_hub.set_observer(observer)

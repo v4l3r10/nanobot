@@ -6,3 +6,4 @@ starlette>=0.40
 uvicorn[standard]>=0.32
 python-multipart>=0.0.10
 pydantic>=2.8
+python-telegram-bot>=22.6,<23.0
