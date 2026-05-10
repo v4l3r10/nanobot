@@ -43,6 +43,10 @@ Bearer tokens are mapped server-side to agent identities via
 | `MAILBOX_AGENT_TOKENS`    | yes      | JSON `{ "<agent>": "<bearer-token>", ... }`. One token per agent.           |
 | `MAILBOX_LOG_LEVEL`       | no       | Defaults to `INFO`. JSON-line output to stdout.                             |
 | `MAILBOX_DATA_DIR`        | no       | Defaults to `/data`. Holds `mailbox.db` and `blobs/`.                       |
+| `MAILBOX_TELEGRAM_BOT_TOKEN`     | no | Enables the embedded Telegram observer (see below). Unset → observer off.   |
+| `MAILBOX_TELEGRAM_ALLOWED_USERS` | no | JSON list of Telegram user_ids permitted to issue commands (e.g. `[136150230]`). |
+| `MAILBOX_TELEGRAM_BASE_URL`      | no | Optional Bot API base URL (e.g. `http://telegram-bot-api:8081/bot` for the local sidecar). |
+| `MAILBOX_TELEGRAM_BASE_FILE_URL` | no | Optional Bot API file URL paired with `BASE_URL` for self-hosted Bot API.   |
 
 ## Wire-level frame (v1)
 
@@ -67,6 +71,66 @@ One JSON object per WebSocket frame:
 ```
 
 A `presence` frame carries only `{"v":1, "type":"presence", "online": [...]}`.
+
+## Telegram observer (optional)
+
+When `MAILBOX_TELEGRAM_BOT_TOKEN` is set, the service starts an embedded
+Telegram bot that streams every forwarded peer frame and presence event to
+subscribed chats so an operator can watch live inter-agent traffic from a
+phone. The bot runs in-process inside `nanobot-mailbox` (same container, no
+sidecar) and is fully optional — without the env var the service behaves
+identically to before.
+
+Allow-list: only Telegram user_ids listed in `MAILBOX_TELEGRAM_ALLOWED_USERS`
+can run any command. The list is the security boundary; chat_ids are never
+trusted on their own. With an empty allow-list the bot answers `/start`
+with "non sei autorizzato".
+
+Subscriptions are persisted in SQLite (`tg_subscribers` table) and survive
+restarts: a chat that called `/start` once stays subscribed (until `/stop`).
+
+### Commands
+
+| Command   | Effect                                                            |
+|-----------|-------------------------------------------------------------------|
+| `/start`  | Subscribe this chat to the live dump (returns the inline menu).   |
+| `/menu`   | Show the inline menu of common actions as tappable buttons.       |
+| `/stop`   | Unsubscribe this chat.                                            |
+| `/mute`   | Pause dump for this chat (subscription kept).                     |
+| `/unmute` | Resume after `/mute`.                                             |
+| `/status` | Service uptime, peers online, subscriber counts.                  |
+| `/peers`  | Online roster right now.                                          |
+| `/last N` | Show the last N persisted messages globally (max 50).             |
+| `/break A B` | Inject a bilateral `closing=true` frame between peers A and B to break a chat loop. The receiving channel honours the flag by skipping `publish_inbound`, so neither agent wakes on the synthetic frame. |
+| `/help`   | List the commands above.                                          |
+
+The inline menu (`/start`, `/menu`, `/help`) exposes one-tap buttons for
+`peers`, `status`, `last 10`, `last 30`, `mute`, `unmute`, `help`, `stop`.
+Every button is a thin wrapper around the corresponding slash command — the
+typed and tapped paths share the same handler.
+
+### Event format
+
+Each forwarded peer message is rendered as
+
+```
+<from> → <to>  [· 🔚 closing | reply→msg_…]
+> body (truncated at 1500 chars)
+📎 filename.ext (mime, size_bytes)
+<ISO 8601 timestamp>
+```
+
+Presence events appear as `🟢 connected: <agent>` / `🔴 disconnected: <agent>`
+followed by the current online roster.
+
+### Performance / safety
+
+The hub never blocks on Telegram I/O: events are pushed onto a bounded
+asyncio queue (capacity 500) and a separate worker drains them with
+`disable_notification=True` so the operator's phone does not buzz on every
+frame. If Telegram is slow or unreachable, the queue fills and oldest events
+are dropped — peer traffic is unaffected. Failed `sendMessage` for a chat
+that blocked the bot evicts that subscriber automatically.
 
 ## Runbook
 
