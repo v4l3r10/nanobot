@@ -5,11 +5,12 @@ Each nanobot gateway opens **one** persistent connection to the mailbox
 hub on the other end forwards frames between connected peers.
 
 Each remote peer the bot talks to is exposed locally as a distinct chat:
-``chat_id = "peer:<from_agent>"``. So a bot named *bronzo* talking with both
+``chat_id = "<from_agent>"``. So a bot named *bronzo* talking with both
 *grocco* and *naldo* sees two independent chat threads with their own session,
 history, and persona-aware turns. There is no separate "RPC" mode — the bot
 chats with peers exactly as it chats with humans, only the channel is
-different.
+different. (Legacy: pre-2026-05-08 deployments used ``"peer:<from_agent>"``;
+the helpers below still accept that form for backward compatibility.)
 
 File transfer: outbound files attached via :class:`OutboundMessage.media` are
 uploaded to the router's HTTP ``/files/`` endpoint (with the same bearer used
@@ -51,7 +52,14 @@ if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
 
 
-CHAT_ID_PREFIX = "peer:"
+# Pre-2026-05-08 chat_ids carried this self-tag (the channel re-prefixed every
+# id with "peer:" before handing it to the bus, which then layered another
+# "peer:" on top to form the session_key — producing "peer:peer:<agent>"
+# session keys and disk filenames). We dropped the self-tag because the
+# OutboundMessage.channel field already carries that information; chat_id
+# now stores the bare peer agent_id. The constant survives only so legacy
+# stored state (cron jobs, queued OutboundMessages) keeps routing.
+LEGACY_CHAT_ID_PREFIX = "peer:"
 FRAME_VERSION = 1
 # 1 MB cap for an inbound WS frame payload. Body itself is ≤16 KB at the
 # router; the headroom covers attachment metadata and JSON envelope overhead.
@@ -59,14 +67,17 @@ MAX_FRAME_BYTES = 1024 * 1024
 
 
 def _peer_chat_id(agent: str) -> str:
-    return f"{CHAT_ID_PREFIX}{agent}"
+    return agent
 
 
 def _peer_from_chat_id(chat_id: str) -> str | None:
-    if not chat_id.startswith(CHAT_ID_PREFIX):
+    if not chat_id:
         return None
-    rest = chat_id[len(CHAT_ID_PREFIX):]
-    return rest or None
+    # Backward compat: accept the legacy "peer:<agent>" form transparently
+    # so a stored OutboundMessage from before the cleanup still routes.
+    if chat_id.startswith(LEGACY_CHAT_ID_PREFIX):
+        chat_id = chat_id[len(LEGACY_CHAT_ID_PREFIX):]
+    return chat_id or None
 
 
 def _ws_to_http_base(ws_url: str) -> str:
@@ -87,6 +98,26 @@ _SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
 def _safe_filename(name: str) -> str:
     cleaned = _SAFE_FILENAME.sub("_", name).strip("._") or "file"
     return cleaned[:120]
+
+
+# Map mimetypes.guess_type encoding hints (gzip/bzip2/xz/compress) to the
+# correct MIME for the *compressed* payload. Without this, a file like
+# foo.tar.gz reports ('application/x-tar', 'gzip') and we'd ship the
+# uncompressed-format MIME, mislabeling the bytes on the wire.
+_ENCODING_MIME = {
+    "gzip": "application/gzip",
+    "bzip2": "application/x-bzip2",
+    "xz": "application/x-xz",
+    "compress": "application/x-compress",
+    "br": "application/x-brotli",
+}
+
+
+def _guess_mime(filename: str) -> str:
+    base, encoding = mimetypes.guess_type(filename)
+    if encoding and encoding in _ENCODING_MIME:
+        return _ENCODING_MIME[encoding]
+    return base or "application/octet-stream"
 
 
 class PeerConfig(Base):
@@ -350,20 +381,34 @@ class PeerChannel(BaseChannel):
             logger.warning("peer frame bad text type")
             return
 
+        attachments = frame.get("attachments") or []
+        has_attachments = isinstance(attachments, list) and bool(attachments)
+
         # closing=True signals "this is the sender's last word — don't expect
         # a reply". The router has already persisted the row, so the message
         # is visible via peer_thread_show. We deliberately skip publish_inbound
         # here so the agent loop is NOT awakened: this is the system-level
         # break that prevents pleasantry/echo loops without any LLM call.
-        if frame.get("closing") is True:
+        #
+        # Exception: if the closing frame carries attachments, the sender
+        # almost certainly mis-flagged it (closing is intended for pure
+        # conversational closure). Dropping silently would lose payload the
+        # recipient needs to act on, so we log and process normally — better
+        # a spurious wake-up than instructions vanishing into the void.
+        if frame.get("closing") is True and not has_attachments:
             logger.info(
                 "peer closing received from {} (msg_id={}); agent not awoken",
                 from_agent, frame.get("id"),
             )
             return
+        if frame.get("closing") is True and has_attachments:
+            logger.warning(
+                "peer closing frame from {} carries {} attachment(s); "
+                "processing anyway (closing+payload likely a sender bug)",
+                from_agent, len(attachments),
+            )
 
         media_paths: list[str] = []
-        attachments = frame.get("attachments") or []
         if isinstance(attachments, list):
             media_paths = await self._download_attachments(
                 attachments, msg_id=str(frame.get("id", "unknown"))
@@ -414,7 +459,11 @@ class PeerChannel(BaseChannel):
         target_dir = (
             get_workspace_path() / self._cfg.media_subdir / _safe_filename(msg_id)
         )
-        target_dir.mkdir(parents=True, exist_ok=True)
+        # Defer mkdir until we actually have something to write — avoids
+        # leaving empty peer/msg_*/ dirs when the frame carries no attachments
+        # (or all entries are malformed). Empty dirs were a recurring source
+        # of false-negative diagnostics on the receiver side ("dir is here
+        # but the file is not — download must have failed").
         results: list[str] = []
         for att in attachments:
             if not isinstance(att, dict):
@@ -423,6 +472,7 @@ class PeerChannel(BaseChannel):
             if not isinstance(att_id, int):
                 continue
             name = _safe_filename(str(att.get("name", f"att_{att_id}")))
+            target_dir.mkdir(parents=True, exist_ok=True)
             dest = target_dir / name
             try:
                 async with self._http.stream(
@@ -470,7 +520,7 @@ class PeerChannel(BaseChannel):
         peer = _peer_from_chat_id(msg.chat_id)
         if peer is None:
             raise ValueError(
-                f"peer: chat_id {msg.chat_id!r} does not match 'peer:<agent>' format"
+                f"peer: chat_id {msg.chat_id!r} is empty or invalid (expected '<agent>')"
             )
         if peer == self._cfg.agent_id:
             raise ValueError("peer: cannot send to self")
@@ -592,9 +642,18 @@ class PeerChannel(BaseChannel):
         ids: list[int] = []
         for path_str in media:
             path = Path(path_str)
+            # Reject relative paths up-front: the gateway has no business
+            # guessing a base dir, and a "not a file" later is a confusing
+            # symptom of a fixable input error. Be explicit so the agent
+            # sees the real cause and corrects on the next turn instead of
+            # the manager retrying a deterministic failure 3x.
+            if not path.is_absolute():
+                raise RuntimeError(
+                    f"peer upload: media path must be absolute, got {path_str!r}"
+                )
             if not path.is_file():
                 raise RuntimeError(f"peer upload: not a file: {path_str}")
-            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            mime = _guess_mime(path.name)
             try:
                 with path.open("rb") as f:
                     files = {"file": (path.name, f, mime)}

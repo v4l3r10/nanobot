@@ -32,7 +32,9 @@ async def test_peer_say_constructs_outbound_message() -> None:
     assert len(sent) == 1
     msg = sent[0]
     assert msg.channel == "peer"
-    assert msg.chat_id == "peer:grocco"
+    # chat_id is the bare peer agent_id (no "peer:" prefix). Channel field
+    # already disambiguates routing; the prefix was redundant self-tagging.
+    assert msg.chat_id == "grocco"
     assert msg.content == "ciao"
 
 

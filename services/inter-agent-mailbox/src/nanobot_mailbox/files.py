@@ -18,17 +18,28 @@ log = logging.getLogger(__name__)
 
 INLINE_THRESHOLD = 256 * 1024
 MAX_FILE_BYTES = 50 * 1024 * 1024
+
+# Explicit allowlist of MIME types we record verbatim. Anything else is
+# accepted but normalized to ``application/octet-stream`` on the server side
+# so the upload still succeeds (peer file-exchange is between trusted bots
+# authenticated by bearer; the 50 MB cap is the real safety property).
 ALLOWED_MIMES = frozenset({
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/json",
-    "image/png", "image/jpeg", "image/webp", "image/gif",
+    "application/yaml", "application/x-yaml",
+    "application/zip", "application/gzip", "application/x-tar",
+    "application/x-bzip2", "application/x-xz", "application/x-7z-compressed",
+    "image/png", "image/jpeg", "image/webp", "image/gif", "image/svg+xml",
     "text/plain", "text/markdown", "text/x-python", "text/csv",
+    "text/html", "text/x-shellscript", "text/x-c", "text/x-c++",
     "audio/mpeg", "audio/wav", "audio/x-wav", "audio/ogg",
     "video/mp4", "video/webm", "video/quicktime",
     "application/octet-stream",
 })
+
+OCTET_STREAM = "application/octet-stream"
 
 
 def _blob_path_for(data_dir: Path, attachment_id: int) -> Path:
@@ -54,11 +65,21 @@ def make_handlers(db: Database, registry: TokenRegistry, data_dir: Path):
         upload = form.get("file")
         if upload is None or not getattr(upload, "filename", None):
             return JSONResponse({"error": "missing file part"}, status_code=400)
-        mime = (getattr(upload, "content_type", None) or "application/octet-stream").lower()
-        if mime not in ALLOWED_MIMES:
-            return JSONResponse(
-                {"error": f"mime not allowed: {mime}"}, status_code=415
+        client_mime = (
+            getattr(upload, "content_type", None) or OCTET_STREAM
+        ).lower()
+        # Permissive policy: unknown MIME → store as octet-stream rather than
+        # rejecting. The client may guess the wrong type (e.g. .tar.gz →
+        # application/x-tar instead of application/gzip), and this is internal
+        # bearer-authed traffic, so a strict 415 only causes false negatives.
+        if client_mime in ALLOWED_MIMES:
+            mime = client_mime
+        else:
+            log.info(
+                "upload mime normalized to octet-stream",
+                extra={"agent": ctx.agent_id, "client_mime": client_mime},
             )
+            mime = OCTET_STREAM
 
         attachment_id = await db.insert_attachment(
             owner_agent=ctx.agent_id,
