@@ -381,20 +381,34 @@ class PeerChannel(BaseChannel):
             logger.warning("peer frame bad text type")
             return
 
+        attachments = frame.get("attachments") or []
+        has_attachments = isinstance(attachments, list) and bool(attachments)
+
         # closing=True signals "this is the sender's last word — don't expect
         # a reply". The router has already persisted the row, so the message
         # is visible via peer_thread_show. We deliberately skip publish_inbound
         # here so the agent loop is NOT awakened: this is the system-level
         # break that prevents pleasantry/echo loops without any LLM call.
-        if frame.get("closing") is True:
+        #
+        # Exception: if the closing frame carries attachments, the sender
+        # almost certainly mis-flagged it (closing is intended for pure
+        # conversational closure). Dropping silently would lose payload the
+        # recipient needs to act on, so we log and process normally — better
+        # a spurious wake-up than instructions vanishing into the void.
+        if frame.get("closing") is True and not has_attachments:
             logger.info(
                 "peer closing received from {} (msg_id={}); agent not awoken",
                 from_agent, frame.get("id"),
             )
             return
+        if frame.get("closing") is True and has_attachments:
+            logger.warning(
+                "peer closing frame from {} carries {} attachment(s); "
+                "processing anyway (closing+payload likely a sender bug)",
+                from_agent, len(attachments),
+            )
 
         media_paths: list[str] = []
-        attachments = frame.get("attachments") or []
         if isinstance(attachments, list):
             media_paths = await self._download_attachments(
                 attachments, msg_id=str(frame.get("id", "unknown"))
@@ -445,7 +459,11 @@ class PeerChannel(BaseChannel):
         target_dir = (
             get_workspace_path() / self._cfg.media_subdir / _safe_filename(msg_id)
         )
-        target_dir.mkdir(parents=True, exist_ok=True)
+        # Defer mkdir until we actually have something to write — avoids
+        # leaving empty peer/msg_*/ dirs when the frame carries no attachments
+        # (or all entries are malformed). Empty dirs were a recurring source
+        # of false-negative diagnostics on the receiver side ("dir is here
+        # but the file is not — download must have failed").
         results: list[str] = []
         for att in attachments:
             if not isinstance(att, dict):
@@ -454,6 +472,7 @@ class PeerChannel(BaseChannel):
             if not isinstance(att_id, int):
                 continue
             name = _safe_filename(str(att.get("name", f"att_{att_id}")))
+            target_dir.mkdir(parents=True, exist_ok=True)
             dest = target_dir / name
             try:
                 async with self._http.stream(
@@ -623,6 +642,15 @@ class PeerChannel(BaseChannel):
         ids: list[int] = []
         for path_str in media:
             path = Path(path_str)
+            # Reject relative paths up-front: the gateway has no business
+            # guessing a base dir, and a "not a file" later is a confusing
+            # symptom of a fixable input error. Be explicit so the agent
+            # sees the real cause and corrects on the next turn instead of
+            # the manager retrying a deterministic failure 3x.
+            if not path.is_absolute():
+                raise RuntimeError(
+                    f"peer upload: media path must be absolute, got {path_str!r}"
+                )
             if not path.is_file():
                 raise RuntimeError(f"peer upload: not a file: {path_str}")
             mime = _guess_mime(path.name)

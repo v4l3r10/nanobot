@@ -429,3 +429,116 @@ def test_guess_mime_known_type_unchanged() -> None:
 
 def test_guess_mime_unknown_falls_back_to_octet_stream() -> None:
     assert _guess_mime("blob.weirdext") == "application/octet-stream"
+
+
+# --- _upload_media: absolute-path enforcement --------------------------------
+
+@pytest.mark.asyncio
+async def test_upload_media_rejects_relative_path() -> None:
+    """Relative paths are rejected with a clear, parseable error so the agent
+    can correct on its next turn instead of triggering 3x retries on a
+    deterministic failure. Regression: pre-fix, Bronzo passed workspace-
+    relative paths like 'progetti/foo.zip' and got the misleading 'not a
+    file' error after retries had already wasted seconds."""
+    ch = _make_channel()
+    # Stub HTTP client so we never reach the network — the path check fires
+    # before any I/O.
+    ch._http = object()  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="must be absolute"):
+        await ch._upload_media(["progetti/foo.zip"])
+
+
+@pytest.mark.asyncio
+async def test_upload_media_rejects_nonexistent_absolute_path() -> None:
+    """Absolute path that doesn't exist still raises the existing 'not a
+    file' error — the absoluteness check is purely additive."""
+    ch = _make_channel()
+    ch._http = object()  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="not a file"):
+        await ch._upload_media(["/nonexistent/abs/path.zip"])
+
+
+# --- _download_attachments: no empty msg dirs --------------------------------
+
+@pytest.mark.asyncio
+async def test_download_attachments_skips_dir_creation_when_empty(tmp_path, monkeypatch) -> None:
+    """If a frame carries no attachments (or only malformed entries), no
+    peer/msg_*/ dir should be created. Empty dirs misled receivers into
+    thinking a download had failed when in reality there was no payload."""
+    from nanobot.channels import peer as peer_mod
+
+    monkeypatch.setattr(peer_mod, "get_workspace_path", lambda: tmp_path)
+    ch = _make_channel()
+    ch._http = object()  # type: ignore[assignment]
+
+    results = await ch._download_attachments([], msg_id="msg_empty")
+    assert results == []
+    assert not (tmp_path / "peer" / "msg_empty").exists()
+
+    # Malformed entries (missing id, wrong type) are silently skipped and
+    # likewise must not leave a dir behind.
+    results = await ch._download_attachments(
+        [{"name": "x"}, "not-a-dict"], msg_id="msg_malformed"  # type: ignore[list-item]
+    )
+    assert results == []
+    assert not (tmp_path / "peer" / "msg_malformed").exists()
+
+
+# --- _on_frame: closing + attachments must not silently drop payload ---------
+
+@pytest.mark.asyncio
+async def test_inbound_closing_with_attachments_still_processes(tmp_path, monkeypatch) -> None:
+    """A closing frame that carries attachments is almost certainly a sender
+    bug (closing is for pure conversational closure, not file delivery).
+    The receiver MUST process it anyway: dropping silently would lose the
+    payload. We log a warning and forward to the agent loop."""
+    from nanobot.channels import peer as peer_mod
+
+    monkeypatch.setattr(peer_mod, "get_workspace_path", lambda: tmp_path)
+    ch = _make_channel()
+
+    captured: list[InboundMessage] = []
+
+    async def _capture(msg: InboundMessage) -> None:
+        captured.append(msg)
+
+    ch.bus.publish_inbound = _capture  # type: ignore[assignment]
+
+    # Stub _download_attachments so the test doesn't need a live HTTP client.
+    async def _fake_download(attachments, *, msg_id):
+        return ["/fake/local/path.zip"]
+
+    ch._download_attachments = _fake_download  # type: ignore[assignment]
+
+    await ch._on_frame(json.dumps({
+        "v": 1, "type": "msg",
+        "id": "msg_close_with_files", "from": "grocco", "to": "bronzo",
+        "text": "ecco il pacchetto", "thread_id": None,
+        "in_reply_to": None, "ts": "2026-05-10T12:00:00.000Z",
+        "closing": True,
+        "attachments": [{"id": 42, "name": "foo.zip", "mime": "application/zip", "size_bytes": 1}],
+    }))
+    assert len(captured) == 1, "closing+attachments must reach the agent loop"
+    assert captured[0].media == ["/fake/local/path.zip"]
+
+
+@pytest.mark.asyncio
+async def test_inbound_closing_without_attachments_still_silent() -> None:
+    """Sanity: pure closing frames (no attachments) keep the original
+    behavior — agent loop NOT awoken. The new exception is narrow."""
+    ch = _make_channel()
+    captured: list[InboundMessage] = []
+
+    async def _capture(msg: InboundMessage) -> None:
+        captured.append(msg)
+
+    ch.bus.publish_inbound = _capture  # type: ignore[assignment]
+
+    await ch._on_frame(json.dumps({
+        "v": 1, "type": "msg",
+        "id": "msg_pure_close", "from": "grocco", "to": "bronzo",
+        "text": "alla prossima", "thread_id": None,
+        "in_reply_to": None, "ts": "2026-05-10T12:00:00.000Z",
+        "closing": True,
+    }))
+    assert captured == []

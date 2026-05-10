@@ -56,22 +56,27 @@ PEER_CHANNEL_NAME = "peer"
             "Optional message id this peer_say is replying to."
         ),
         media=ArraySchema(
-            StringSchema("File path"),
+            StringSchema("Absolute file path"),
             description=(
-                "Optional list of local file paths to send along with the "
-                "message. Files are uploaded once to the mailbox blob store "
-                "and the recipient downloads them on receipt; both sides see "
-                "them as ordinary media attachments."
+                "Optional list of ABSOLUTE local file paths to send along "
+                "with the message (e.g. '/home/nanobot/.nanobot/workspace/"
+                "progetti/foo.zip'). Relative paths are rejected — the peer "
+                "channel does not assume any working directory. Files are "
+                "uploaded once to the mailbox blob store and the recipient "
+                "downloads them on receipt; both sides see them as ordinary "
+                "media attachments."
             ),
         ),
         closing=BooleanSchema(
             description=(
-                "Set true to mark this as the FINAL message in the exchange. "
-                "The recipient's agent loop is NOT awakened on a closing "
-                "message — this is the system-level mechanism that breaks "
-                "pleasantry loops. Use closing=true INSTEAD of saying "
-                "'alla prossima' / 'goodbye' / sending a wave emoji. "
-                "Default: false."
+                "Set true ONLY for purely conversational closure ('grazie, "
+                "alla prossima', a wave emoji) where you expect no reply and "
+                "the recipient has nothing left to act on. The recipient's "
+                "agent loop is NOT awakened on a closing message — this is "
+                "the system-level mechanism that breaks pleasantry loops. "
+                "Do NOT use closing=true when sending instructions, files, "
+                "or any payload that requires the peer to take action: the "
+                "agent will never see it. Default: false."
             ),
         ),
         required=["to", "text"],
