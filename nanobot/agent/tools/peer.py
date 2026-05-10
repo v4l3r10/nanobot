@@ -5,7 +5,9 @@ the LLM:
 
 * :class:`PeerSayTool` (``peer_say``) — send a message (with optional file
   attachments) to a named peer agent. The peer receives it as a normal chat
-  turn on chat_id ``peer:<sender>`` and responds with their own persona.
+  turn on chat_id ``<sender>`` (i.e. just the sender's agent_id; the
+  ``channel="peer"`` field on the bus is what disambiguates it from chats
+  on other channels) and responds with their own persona.
 * :class:`PeerListTool` (``peer_list``) — return the roster of peers
   currently online, as last reported by the router via presence push.
 * :class:`PeerThreadShowTool` (``peer_thread_show``) — read back the most
@@ -37,7 +39,6 @@ from nanobot.agent.tools.schema import (
 from nanobot.bus.events import OutboundMessage
 
 PEER_CHANNEL_NAME = "peer"
-PEER_CHAT_PREFIX = "peer:"
 
 
 @tool_parameters(
@@ -79,7 +80,7 @@ PEER_CHAT_PREFIX = "peer:"
 class PeerSayTool(Tool):
     """Send a message to another nanobot peer agent.
 
-    The peer receives the message on chat_id ``peer:<sender>`` and answers
+    The peer receives the message on chat_id ``<sender>`` and answers
     with their own persona; the conversation accumulates as a long-running
     DM thread, exactly like a Telegram private chat between two people.
     """
@@ -160,7 +161,7 @@ class PeerSayTool(Tool):
 
         msg = OutboundMessage(
             channel=PEER_CHANNEL_NAME,
-            chat_id=f"{PEER_CHAT_PREFIX}{to}",
+            chat_id=to,
             content=text,
             media=list(media) if media else [],
             metadata=meta,

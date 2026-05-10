@@ -5,11 +5,12 @@ Each nanobot gateway opens **one** persistent connection to the mailbox
 hub on the other end forwards frames between connected peers.
 
 Each remote peer the bot talks to is exposed locally as a distinct chat:
-``chat_id = "peer:<from_agent>"``. So a bot named *bronzo* talking with both
+``chat_id = "<from_agent>"``. So a bot named *bronzo* talking with both
 *grocco* and *naldo* sees two independent chat threads with their own session,
 history, and persona-aware turns. There is no separate "RPC" mode — the bot
 chats with peers exactly as it chats with humans, only the channel is
-different.
+different. (Legacy: pre-2026-05-08 deployments used ``"peer:<from_agent>"``;
+the helpers below still accept that form for backward compatibility.)
 
 File transfer: outbound files attached via :class:`OutboundMessage.media` are
 uploaded to the router's HTTP ``/files/`` endpoint (with the same bearer used
@@ -51,7 +52,14 @@ if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
 
 
-CHAT_ID_PREFIX = "peer:"
+# Pre-2026-05-08 chat_ids carried this self-tag (the channel re-prefixed every
+# id with "peer:" before handing it to the bus, which then layered another
+# "peer:" on top to form the session_key — producing "peer:peer:<agent>"
+# session keys and disk filenames). We dropped the self-tag because the
+# OutboundMessage.channel field already carries that information; chat_id
+# now stores the bare peer agent_id. The constant survives only so legacy
+# stored state (cron jobs, queued OutboundMessages) keeps routing.
+LEGACY_CHAT_ID_PREFIX = "peer:"
 FRAME_VERSION = 1
 # 1 MB cap for an inbound WS frame payload. Body itself is ≤16 KB at the
 # router; the headroom covers attachment metadata and JSON envelope overhead.
@@ -59,14 +67,17 @@ MAX_FRAME_BYTES = 1024 * 1024
 
 
 def _peer_chat_id(agent: str) -> str:
-    return f"{CHAT_ID_PREFIX}{agent}"
+    return agent
 
 
 def _peer_from_chat_id(chat_id: str) -> str | None:
-    if not chat_id.startswith(CHAT_ID_PREFIX):
+    if not chat_id:
         return None
-    rest = chat_id[len(CHAT_ID_PREFIX):]
-    return rest or None
+    # Backward compat: accept the legacy "peer:<agent>" form transparently
+    # so a stored OutboundMessage from before the cleanup still routes.
+    if chat_id.startswith(LEGACY_CHAT_ID_PREFIX):
+        chat_id = chat_id[len(LEGACY_CHAT_ID_PREFIX):]
+    return chat_id or None
 
 
 def _ws_to_http_base(ws_url: str) -> str:
@@ -470,7 +481,7 @@ class PeerChannel(BaseChannel):
         peer = _peer_from_chat_id(msg.chat_id)
         if peer is None:
             raise ValueError(
-                f"peer: chat_id {msg.chat_id!r} does not match 'peer:<agent>' format"
+                f"peer: chat_id {msg.chat_id!r} is empty or invalid (expected '<agent>')"
             )
         if peer == self._cfg.agent_id:
             raise ValueError("peer: cannot send to self")

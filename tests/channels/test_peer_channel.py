@@ -37,12 +37,17 @@ def _make_channel(**overrides) -> PeerChannel:
 
 
 def test_chat_id_mapping_round_trip() -> None:
-    assert _peer_chat_id("grocco") == "peer:grocco"
+    # New format: chat_id is the bare peer agent_id. The channel field on
+    # the bus is what disambiguates this from chats on other channels.
+    assert _peer_chat_id("grocco") == "grocco"
+    assert _peer_from_chat_id("grocco") == "grocco"
+    # Empty chat_id is rejected as malformed (channel must point at *some*
+    # peer, blank id would make routing ambiguous).
+    assert _peer_from_chat_id("") is None
+    # Backward compat: legacy "peer:<agent>" form still resolves so an
+    # OutboundMessage queued before the cleanup keeps routing correctly.
     assert _peer_from_chat_id("peer:grocco") == "grocco"
-    # Empty agent id is rejected as malformed
     assert _peer_from_chat_id("peer:") is None
-    # Telegram chat ids are not peer chats
-    assert _peer_from_chat_id("136150230") is None
 
 
 def test_ws_to_http_base_handles_ws_and_wss() -> None:
@@ -82,7 +87,7 @@ async def test_msg_frame_publishes_inbound_with_peer_chat_id() -> None:
     inbound = captured[0]
     assert inbound.channel == "peer"
     assert inbound.sender_id == "grocco"
-    assert inbound.chat_id == "peer:grocco"
+    assert inbound.chat_id == "grocco"
     assert inbound.content == "ciao Bronzo"
     assert inbound.metadata["peer_message_id"] == "msg_1"
     assert inbound.metadata["peer_thread_id"] == "thr_1"
@@ -111,19 +116,23 @@ async def test_malformed_frames_are_silently_dropped() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_rejects_non_peer_chat_id() -> None:
+async def test_send_rejects_empty_chat_id() -> None:
+    # After the chat_id cleanup, the channel no longer enforces a "peer:"
+    # prefix — chat_id is just the bare agent_id. Format errors that used
+    # to be caught here (e.g. accidentally using a telegram numeric id)
+    # now fail downstream at the router, which has the canonical roster.
+    # The one shape we still reject locally is an empty chat_id, since
+    # that would route to a non-existent peer with no useful error.
     ch = _make_channel()
-    msg = OutboundMessage(
-        channel="peer", chat_id="telegram:123", content="oops",
-    )
-    with pytest.raises(ValueError, match="does not match"):
+    msg = OutboundMessage(channel="peer", chat_id="", content="oops")
+    with pytest.raises(ValueError, match="empty or invalid"):
         await ch.send(msg)
 
 
 @pytest.mark.asyncio
 async def test_send_rejects_self() -> None:
     ch = _make_channel(agent_id="bronzo")
-    msg = OutboundMessage(channel="peer", chat_id="peer:bronzo", content="me")
+    msg = OutboundMessage(channel="peer", chat_id="bronzo", content="me")
     with pytest.raises(ValueError, match="cannot send to self"):
         await ch.send(msg)
 
@@ -132,7 +141,7 @@ async def test_send_rejects_self() -> None:
 async def test_send_raises_when_disconnected() -> None:
     ch = _make_channel()
     # Channel never started → no WS
-    msg = OutboundMessage(channel="peer", chat_id="peer:grocco", content="hi")
+    msg = OutboundMessage(channel="peer", chat_id="grocco", content="hi")
     with pytest.raises(RuntimeError, match="not connected"):
         await ch.send(msg)
 
@@ -166,7 +175,7 @@ async def test_send_serializes_thread_metadata_into_frame() -> None:
 
     ch._ws = _AckingFakeWS(ch)  # type: ignore[assignment]
     msg = OutboundMessage(
-        channel="peer", chat_id="peer:grocco", content="re",
+        channel="peer", chat_id="grocco", content="re",
         metadata={"peer_thread_id": "thr_X", "peer_in_reply_to": "msg_Y"},
     )
     await ch.send(msg)
@@ -202,7 +211,7 @@ async def test_send_raises_on_router_error_frame() -> None:
             )
 
     ch._ws = _NackingFakeWS(ch)  # type: ignore[assignment]
-    msg = OutboundMessage(channel="peer", chat_id="peer:ghost", content="?")
+    msg = OutboundMessage(channel="peer", chat_id="ghost", content="?")
     with pytest.raises(RuntimeError, match="unknown recipient"):
         await ch.send(msg)
 
@@ -220,7 +229,7 @@ async def test_send_swallows_ack_timeout_as_warning() -> None:
             pass  # never acks
 
     ch._ws = _SilentFakeWS()  # type: ignore[assignment]
-    msg = OutboundMessage(channel="peer", chat_id="peer:grocco", content="hi")
+    msg = OutboundMessage(channel="peer", chat_id="grocco", content="hi")
     await ch.send(msg)  # must not raise
     assert ch._pending_acks == {}  # cleaned up on timeout
 
@@ -293,7 +302,7 @@ async def test_send_filters_progress_noise_outbound() -> None:
         {"_streamed": True},
     ):
         msg = OutboundMessage(
-            channel="peer", chat_id="peer:grocco",
+            channel="peer", chat_id="grocco",
             content="bookkeeping noise", metadata=noise_meta,
         )
         await ch.send(msg)
@@ -316,7 +325,7 @@ async def test_send_filters_empty_content() -> None:
 
     for empty in ("", "   ", "\n\t  "):
         await ch.send(OutboundMessage(
-            channel="peer", chat_id="peer:grocco", content=empty,
+            channel="peer", chat_id="grocco", content=empty,
         ))
     assert sent == []
 
@@ -346,7 +355,7 @@ async def test_send_propagates_closing_metadata_into_frame() -> None:
 
     ch._ws = _AckingFakeWS(ch)  # type: ignore[assignment]
     msg = OutboundMessage(
-        channel="peer", chat_id="peer:grocco", content="task done",
+        channel="peer", chat_id="grocco", content="task done",
         metadata={"peer_closing": True},
     )
     await ch.send(msg)
@@ -378,7 +387,7 @@ async def test_send_omits_closing_field_when_not_set() -> None:
             )
 
     ch._ws = _AckingFakeWS(ch)  # type: ignore[assignment]
-    msg = OutboundMessage(channel="peer", chat_id="peer:grocco", content="ciao")
+    msg = OutboundMessage(channel="peer", chat_id="grocco", content="ciao")
     await ch.send(msg)
     frame = json.loads(sent_payloads[0])
     assert "closing" not in frame
