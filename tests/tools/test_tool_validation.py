@@ -200,7 +200,7 @@ async def test_registry_returns_validation_error() -> None:
 
 def test_exec_extract_absolute_paths_keeps_full_windows_path() -> None:
     cmd = r"type C:\user\workspace\txt"
-    paths = ExecTool._extract_absolute_paths(cmd)
+    paths = [p for _, p in ExecTool._extract_absolute_paths(cmd)]
     assert paths == [r"C:\user\workspace\txt"]
 
 
@@ -208,35 +208,51 @@ def test_exec_extract_absolute_paths_captures_windows_drive_root_path() -> None:
     """Windows drive root paths like `E:\\` must be extracted for workspace guarding."""
     # Note: raw strings cannot end with a single backslash.
     cmd = "dir E:\\"
-    paths = ExecTool._extract_absolute_paths(cmd)
+    paths = [p for _, p in ExecTool._extract_absolute_paths(cmd)]
     assert paths == ["E:\\"]
 
 
 def test_exec_extract_absolute_paths_ignores_relative_posix_segments() -> None:
     cmd = ".venv/bin/python script.py"
-    paths = ExecTool._extract_absolute_paths(cmd)
+    paths = [p for _, p in ExecTool._extract_absolute_paths(cmd)]
     assert "/bin/python" not in paths
 
 
 def test_exec_extract_absolute_paths_captures_posix_absolute_paths() -> None:
     cmd = "cat /tmp/data.txt > /tmp/out.txt"
-    paths = ExecTool._extract_absolute_paths(cmd)
+    paths = [p for _, p in ExecTool._extract_absolute_paths(cmd)]
     assert "/tmp/data.txt" in paths
     assert "/tmp/out.txt" in paths
 
 
 def test_exec_extract_absolute_paths_captures_home_paths() -> None:
     cmd = "cat ~/.nanobot/config.json > ~/out.txt"
-    paths = ExecTool._extract_absolute_paths(cmd)
+    paths = [p for _, p in ExecTool._extract_absolute_paths(cmd)]
     assert "~/.nanobot/config.json" in paths
     assert "~/out.txt" in paths
 
 
 def test_exec_extract_absolute_paths_captures_quoted_paths() -> None:
     cmd = 'cat "/tmp/data.txt" "~/.nanobot/config.json"'
-    paths = ExecTool._extract_absolute_paths(cmd)
+    paths = [p for _, p in ExecTool._extract_absolute_paths(cmd)]
     assert "/tmp/data.txt" in paths
     assert "~/.nanobot/config.json" in paths
+
+
+def test_exec_extract_absolute_paths_reports_redirect_prefix() -> None:
+    """Path preceded by `>` (with optional whitespace) gets prefix_char `>`."""
+    cmd = "echo data > /etc/output.txt"
+    paths = ExecTool._extract_absolute_paths(cmd)
+    targets = {p: c for c, p in paths}
+    assert targets["/etc/output.txt"] == ">"
+
+
+def test_exec_extract_absolute_paths_reports_read_prefix() -> None:
+    """Path that is just an argument (no redirect) has whitespace/empty prefix."""
+    cmd = "cat /etc/hosts"
+    paths = ExecTool._extract_absolute_paths(cmd)
+    targets = {p: c for c, p in paths}
+    assert targets["/etc/hosts"] != ">"
 
 
 def test_exec_guard_blocks_home_path_outside_workspace(tmp_path) -> None:
