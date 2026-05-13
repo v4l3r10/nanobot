@@ -407,6 +407,18 @@ def test_redirect_to_arbitrary_outside_path_still_blocks(tmp_path):
         "echo $((10 // 2))",
         'node -e "// noop\nconsole.log(1)"',
         "awk '{ print $1 // $2 }' file.txt",
+        # Regular division `a / b` (Python, JS, awk, shell arithmetic) used
+        # to capture a bare `/` as the filesystem root. Real-world block:
+        # `vec_dim = chunk_size / (n_vecs * 4)` inside a python3 -c blob.
+        'python3 -c "x = a / b"',
+        "python3 -c \"vec_dim = chunk_size / (n_vecs * 4)\"",
+        "awk '{ print $1 / $2 }' file.txt",
+        "echo $((10 / 2))",
+        # `find /` as a standalone command — the bare-root path no longer
+        # gets captured at all. (Recursive scan of the whole filesystem is
+        # legitimate read-only behaviour; deny_patterns still catch
+        # destructive ops like `rm -rf /`.)
+        "find / -name foo",
     ],
 )
 def test_double_slash_is_not_treated_as_absolute_path(tmp_path, command):
