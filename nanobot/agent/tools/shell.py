@@ -504,10 +504,17 @@ class ExecTool(Tool):
         for m in re.finditer(r"[A-Za-z]:\\[^\s\"'|><;]*", command):
             results.append(("", m.group(0)))
 
-        # POSIX absolute and `~`-relative paths. The `(?!/)` lookahead avoids
-        # capturing `//…` (Python integer division, C/JS comments, scheme-less
-        # URL fragments) as the bogus path `/<rest>`.
-        path_re = re.compile(r"(?:^|[\s|>'\"])(/(?!/)[^\s\"'>;|<]*|~[^\s\"'>;|<]*)")
+        # POSIX absolute and `~`-relative paths.
+        #
+        # `/(?!/)` avoids capturing `//…` (Python integer division, C/JS
+        # comments, scheme-less URL fragments) as the bogus path `/<rest>`.
+        #
+        # `[^\s\"'>;|<]+` requires at least one non-separator char after the
+        # leading `/`. A bare `/` (e.g. inside `chunk_size / (n * 4)` regular
+        # Python division) would otherwise be captured as the filesystem-root
+        # path, immediately fail the workspace-boundary check, and abort the
+        # turn on commands that only happened to contain a slash operator.
+        path_re = re.compile(r"(?:^|[\s|>'\"])(/(?!/)[^\s\"'>;|<]+|~[^\s\"'>;|<]*)")
         for m in path_re.finditer(command):
             # Walk left from the match start past any whitespace to find the
             # meaningful prefix char. `echo data > /etc/x` matches the space
