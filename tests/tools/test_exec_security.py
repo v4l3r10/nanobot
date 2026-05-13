@@ -300,10 +300,15 @@ def test_internal_url_uses_rejected_by_policy_prefix():
 
 
 def test_path_outside_workdir_keeps_safety_guard_marker(tmp_path):
+    """Truly out-of-tree paths still produce the hard-abort marker.
+
+    Uses /var/lib/private (not on any read-safe whitelist) because /etc
+    et al. are now read-whitelisted by `_SAFE_READ_PREFIXES_SYSTEM_RO`.
+    """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
-    result = tool._guard_command("cat /etc/passwd", str(workspace))
+    result = tool._guard_command("cat /var/lib/private/secret", str(workspace))
     assert result is not None
     assert "blocked by safety guard" in result.lower()
 
@@ -361,11 +366,18 @@ def test_redirect_to_safe_device_does_not_trigger_workspace_guard(tmp_path, comm
 
 
 def test_real_path_outside_workspace_still_blocks(tmp_path):
-    """Whitelist only covers /dev/* pseudo-files, not arbitrary paths."""
+    """Whitelist doesn't cover arbitrary out-of-tree paths.
+
+    /var/lib is intentionally NOT in `_SAFE_READ_PREFIXES_*` (it holds
+    per-application state — system daemons' databases, secrets, package
+    caches — that we don't want the agent inspecting by default).
+    """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
-    result = tool._guard_command("find /etc -name passwd 2>/dev/null", str(workspace))
+    result = tool._guard_command(
+        "find /var/lib/private -name secret 2>/dev/null", str(workspace)
+    )
     assert result is not None
     assert "blocked by safety guard" in result.lower()
 
@@ -403,3 +415,114 @@ def test_double_slash_is_not_treated_as_absolute_path(tmp_path, command):
     tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
     result = tool._guard_command(command, str(workspace))
     assert result is None or "blocked by safety guard" not in result.lower(), command
+
+
+# --- Read-safe system prefix whitelist -----------------------------------
+#
+# Background: every `cat /proc/self/status`, `ls /tmp`, `cat /etc/resolv.conf`
+# used to hard-abort the agent turn because the path resolves outside the
+# workspace. These are either kernel pseudo-fs (/proc, /sys), user-owned
+# scratch (/tmp, /var/tmp, /run/user, /dev/shm, /dev/fd), or read-only
+# system locations (/etc, /usr, /opt, /var/log, /bin, /sbin, /lib*).
+# The whitelist is read-only for the second tier: write redirects into
+# them still trip the guard.
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Virtual / scratch (read & write both fine)
+        "cat /proc/self/status",
+        "cat /sys/class/net/eth0/address",
+        "ls /tmp",
+        "cat /tmp/scratch.txt",
+        "echo data > /tmp/output.txt",
+        "ls /var/tmp/cache",
+        "ls /run/user/1000/",
+        "ls /dev/shm",
+        "ls /dev/fd/",
+        # System read-only (read paths)
+        "cat /etc/resolv.conf",
+        "grep nanobot /etc/hosts",
+        "find /etc -name passwd",
+        "tail -n 50 /var/log/syslog",
+        "/usr/bin/env python3 -c 'print(1)'",
+        "python3 /usr/local/bin/myscript.py",
+        "ls /opt/some-vendor/bin",
+        "file /bin/bash",
+    ],
+)
+def test_read_safe_system_paths_are_allowed(tmp_path, command):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = tool._guard_command(command, str(workspace))
+    assert result is None or "blocked by safety guard" not in result.lower(), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo evil > /etc/cron.d/x",
+        "echo evil >> /usr/local/bin/whoops.sh",
+        "echo evil > /opt/marker",
+        "echo evil > /var/log/forged.log",
+        "echo evil > /bin/forged",
+    ],
+)
+def test_redirect_into_system_ro_prefix_still_blocks(tmp_path, command):
+    """A read-whitelisted prefix doesn't allow writes via shell redirect."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = tool._guard_command(command, str(workspace))
+    assert result is not None, command
+    # Could be either layer 1 (deny_pattern) or layer 5 (boundary) — both fine.
+
+
+# --- Path traversal quote-aware + resolve-aware --------------------------
+#
+# Old behaviour: `"../" in cmd` substring matched anywhere, including
+# inside string literals and inside in-tree relative paths like
+# `tests/../tests/specific/`. New behaviour ignores `../` inside single
+# or double quoted strings and only blocks when a relative token with
+# `../` actually escapes the workspace once resolved.
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `../` inside quoted strings — not navigation, just data
+        "grep '../' file.txt",
+        'python3 -c "print(\\\"../foo\\\")"',
+        'find . -path "*/tests/../legacy/*"',
+        # in-tree convoluted paths (resolve back inside the workspace)
+        "pytest tests/../tests/specific/",
+        "ls a/b/../b/c",
+        # commands with `..` but no `../`
+        "git log HEAD~5..HEAD",
+        "git diff HEAD~3..HEAD",
+    ],
+)
+def test_path_traversal_allows_legitimate_uses(tmp_path, command):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = tool._guard_command(command, str(workspace))
+    assert result is None or "path traversal" not in result.lower(), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat ../../etc/passwd",
+        "rm -rf ../sibling",
+        "cp ../outside/file .",
+    ],
+)
+def test_path_traversal_blocks_real_escape(tmp_path, command):
+    """Relative paths whose `../` actually escapes the workspace still block."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = tool._guard_command(command, str(workspace))
+    assert result is not None, command
+    assert "blocked by safety guard" in result.lower(), command
