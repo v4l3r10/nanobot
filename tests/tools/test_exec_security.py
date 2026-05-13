@@ -378,3 +378,28 @@ def test_redirect_to_arbitrary_outside_path_still_blocks(tmp_path):
     result = tool._guard_command("echo data >/etc/exfil", str(workspace))
     assert result is not None
     assert "blocked by safety guard" in result.lower()
+
+
+# Double-slash false positives. `a // b` (Python integer division), `// foo`
+# (C/JS line comment), and scheme-less URL fragments all contain ` //` which
+# the absolute-path regex used to capture as the bogus path `/<rest>`. Once
+# resolved via Path.resolve(), the doubled slash collapses to a single one
+# pointing somewhere outside the workspace, and the boundary guard fires on a
+# perfectly innocent inline snippet. Real cases observed: `len(blob) // 4`
+# inside `python3 -c "..."` killed multiple grocco turns.
+@pytest.mark.parametrize(
+    "command",
+    [
+        'python3 -c "x = len(blob) // 4"',
+        'python3 -c "print(10 // 3)"',
+        "echo $((10 // 2))",
+        'node -e "// noop\nconsole.log(1)"',
+        "awk '{ print $1 // $2 }' file.txt",
+    ],
+)
+def test_double_slash_is_not_treated_as_absolute_path(tmp_path, command):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = tool._guard_command(command, str(workspace))
+    assert result is None or "blocked by safety guard" not in result.lower(), command

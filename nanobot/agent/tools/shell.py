@@ -361,6 +361,11 @@ class ExecTool(Tool):
         # Windows: match drive-root paths like `C:\` as well as `C:\path\to\file`
         # NOTE: `*` is required so `C:\` (nothing after the slash) is still extracted.
         win_paths = re.findall(r"[A-Za-z]:\\[^\s\"'|><;]*", command)
-        posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
+        # POSIX: /absolute only. The `(?!/)` lookahead excludes `//…` sequences,
+        # which are not paths but Python integer division (`a // b`), C/JS line
+        # comments (`// foo`), or scheme-less URL fragments. Treating `// 4` as
+        # the absolute path `/4` was a frequent false-positive that blocked
+        # otherwise-safe inline Python and JS snippets.
+        posix_paths = re.findall(r"(?:^|[\s|>'\"])(/(?!/)[^\s\"'>;|<]*)", command)
         home_paths = re.findall(r"(?:^|[\s|>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
         return win_paths + posix_paths + home_paths
