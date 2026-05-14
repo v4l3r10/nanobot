@@ -531,10 +531,19 @@ def test_path_traversal_allows_legitimate_uses(tmp_path, command):
     ],
 )
 def test_path_traversal_blocks_real_escape(tmp_path, command):
-    """Relative paths whose `../` actually escapes the workspace still block."""
+    """Relative paths whose `../` actually escapes the workspace still block.
+
+    The block is a *soft* policy reject (LLM can retry) rather than a
+    hard-abort: the traversal check is a heuristic on shell tokens and
+    many legitimate uses (`ln -sf ../tools/x dst`) look identical to an
+    attempted escape. Reserving hard-abort for absolute-path workspace
+    violations keeps real boundary breaches fatal while letting the LLM
+    self-correct on heuristic hits.
+    """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
     result = tool._guard_command(command, str(workspace))
     assert result is not None, command
-    assert "blocked by safety guard" in result.lower(), command
+    assert "rejected by policy" in result.lower(), command
+    assert "blocked by safety guard" not in result.lower(), command
