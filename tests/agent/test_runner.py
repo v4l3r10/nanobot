@@ -398,7 +398,13 @@ async def test_runner_does_not_abort_on_policy_error():
 @pytest.mark.asyncio
 async def test_runner_aborts_on_safety_guard_workspace_marker():
     """A "blocked by safety guard" string still triggers turn abort
-    (preserves boundary-violation behavior for path traversal / outside workdir)."""
+    (preserves boundary-violation behavior for absolute paths outside workdir).
+
+    Note: path-traversal (`../foo`) used to share this hard-abort path but
+    was downgraded to a soft policy reject — the heuristic produced too
+    many turn-kills on legitimate uses like `ln -sf ../tools/x ws/bar`.
+    Soft rejects are covered by `test_runner_does_not_abort_on_tool_error`.
+    """
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()

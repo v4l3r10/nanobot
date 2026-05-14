@@ -347,9 +347,18 @@ class ExecTool(Tool):
 
         Two error prefixes are used intentionally:
         - "rejected by policy" for soft denials (deny_patterns, allowlist,
-          internal URL): the LLM may retry with a different command.
-        - "blocked by safety guard" for workspace-boundary violations
-          (path traversal, path outside workdir): runner aborts the turn.
+          internal URL, path traversal): the LLM sees the error as a tool
+          result and may retry with a corrected command.
+        - "blocked by safety guard" for absolute-path workspace-boundary
+          violations: runner classifies these as workspace_violation and
+          aborts the turn (final, last-resort safety net).
+
+        Path traversal lives in the soft tier because the check is a
+        regex-level heuristic on a single argument that the LLM can almost
+        always fix (use absolute paths, `cd` first, drop the `..`). It is
+        not a sign of a real escape attempt — `ln -sf ../foo /ws/bar`
+        builds a symlink whose target the kernel resolves relative to the
+        symlink's directory, not cwd.
         """
         cmd = command.strip()
         lower = cmd.lower()
@@ -468,7 +477,10 @@ class ExecTool(Tool):
             # Malformed quoting: fall back to the conservative block. A
             # mismatched quote could let `../` leak through that the
             # stripping pass didn't catch.
-            return "Error: Command blocked by safety guard (path traversal detected)"
+            return (
+                "Error: Command rejected by policy (path traversal detected). "
+                "Try absolute paths inside the workspace or `cd` first."
+            )
 
         for tok in tokens:
             if "../" not in tok and "..\\" not in tok:
@@ -479,9 +491,15 @@ class ExecTool(Tool):
             try:
                 resolved = (cwd_path / tok).resolve()
             except Exception:
-                return "Error: Command blocked by safety guard (path traversal detected)"
+                return (
+                    "Error: Command rejected by policy (path traversal detected). "
+                    "Try absolute paths inside the workspace or `cd` first."
+                )
             if resolved != cwd_path and cwd_path not in resolved.parents:
-                return "Error: Command blocked by safety guard (path traversal detected)"
+                return (
+                    "Error: Command rejected by policy (path traversal detected). "
+                    "Try absolute paths inside the workspace or `cd` first."
+                )
 
         return None
 

@@ -854,14 +854,20 @@ class AgentRunner:
             detail = detail[:120] + "..."
         return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
 
-    # Markers identifying tool results that represent a workspace / safety boundary rejection.
+    # Markers identifying tool results that represent a workspace / safety boundary
+    # rejection (hard-abort turn). Soft-rejects ("rejected by policy") are
+    # intentionally absent — they surface as ordinary tool_error and the LLM
+    # may retry with a corrected command. "path traversal detected" used to
+    # live here but the underlying check is a heuristic on string args (e.g.
+    # `ln -sf ../foo workspace/bar`, where the kernel resolves the target
+    # relative to the symlink dir, not cwd) and the LLM can almost always
+    # rephrase. Keeping it as soft-reject saves the turn.
     _WORKSPACE_BLOCK_MARKERS: tuple[str, ...] = (
         "blocked by safety guard",
         "outside the configured workspace",
         "outside allowed directory",
         "working_dir is outside",
         "working_dir could not be resolved",
-        "path traversal detected",
         "path outside working dir",
     )
 
