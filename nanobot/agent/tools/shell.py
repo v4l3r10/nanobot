@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 import shutil
 import sys
 from contextlib import suppress
@@ -49,6 +50,49 @@ _WORKSPACE_BOUNDARY_NOTE = (
     "resource, tell them you cannot reach it under the current "
     "restrict_to_workspace policy and ask how to proceed."
 )
+
+
+# Path prefixes the workspace-boundary check treats as safe-to-touch even
+# when the resolved path lies outside the agent's workspace root. Two tiers:
+#
+# - "virtual": kernel-managed pseudo-filesystems and user-scoped scratch.
+#   These are either read-only by nature (/proc, /sys) or owned by the
+#   running user and meant for ephemeral I/O (/tmp, /var/tmp, /run/user,
+#   /dev/shm, /dev/fd). Whitelisted for both reads and writes — the OS
+#   permission model already enforces the limits that matter.
+#
+# - "system_ro": canonical system locations that hold configuration and
+#   binaries. Whitelisted for *reads* only. A path under one of these
+#   prefixes is allowed when it appears as an argument or input, but
+#   blocked when it appears as the target of a shell redirect (`> /etc/x`),
+#   so the LLM can still cat/grep/find/exec system files while remaining
+#   prevented from writing into them via the guard.
+_SAFE_READ_PREFIXES_VIRTUAL = (
+    "/proc",
+    "/sys",
+    "/tmp",
+    "/var/tmp",
+    "/run/user",
+    "/dev/shm",
+    "/dev/fd",
+)
+_SAFE_READ_PREFIXES_SYSTEM_RO = (
+    "/etc",
+    "/usr",
+    "/opt",
+    "/var/log",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+)
+
+
+def _path_under(prefix: str, p: Path) -> bool:
+    """True if `p` is exactly `prefix` or sits under it (no string prefix bug)."""
+    s = str(p)
+    return s == prefix or s.startswith(prefix + "/")
 
 
 class ExecToolConfig(Base):
@@ -174,15 +218,27 @@ class ExecTool(Tool):
         self.working_dir = working_dir
         self.sandbox = sandbox
         self.deny_patterns = (deny_patterns or []) + [
-            r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
-            r"\bdel\s+/[fq]\b",              # del /f, del /q
-            r"\brmdir\s+/s\b",               # rmdir /s
-            r"(?:^|[;&|]\s*)format(?!=)\b",   # format (as standalone command only)
-            r"\b(mkfs|diskpart)\b",          # disk operations
-            r"\bdd\s+if=",                   # dd
-            r">\s*/dev/sd",                  # write to disk
-            r"\b(shutdown|reboot|poweroff)\b",  # system power
-            r":\(\)\s*\{.*\};\s*:",          # fork bomb
+            # rm -rf on ANY absolute path, ~ or $HOME. Relative targets
+            # (rm -rf node_modules, ./build, dist) are allowed — the common
+            # dev-cleanup case — while any out-of-cwd deletion is denied.
+            # `../escape` is relative so it slips past here, but the
+            # quote/resolve-aware traversal check below still catches it.
+            r"\brm\s+-[rf]+\s+[\"']?(?:/|~|\$home\b)",
+            # Windows destructive deletes (anchored to command start)
+            r"(?:^|[;&|]\s*)\bdel\s+/[fq]\b",
+            r"(?:^|[;&|]\s*)\brmdir\s+/s\b",
+            # format / mkfs / diskpart (anchored — avoids matching inside
+            # grep/echo; `(?!=)` keeps URL params like `&format=` allowed).
+            r"(?:^|[;&|]\s*)\b(?:sudo\s+)?format(?!=)\b",
+            r"(?:^|[;&|]\s*)\b(?:sudo\s+)?(?:mkfs(?:\.\w+)?|diskpart)\b",
+            # System power (anchored — avoids matching `grep shutdown /var/log/...`)
+            r"(?:^|[;&|]\s*)\b(?:sudo\s+)?(?:shutdown|reboot|poweroff|halt|init\s+[06])\b",
+            # dd writing to a block device (the dangerous direction)
+            r"\bdd\b[^|;&<>]*\bof=\s*/dev/(?:sd|nvme|hd|mmcblk|xvd|loop|vd)",
+            # Redirect to block device
+            r">\s*/dev/(?:sd|nvme|hd|mmcblk|xvd|loop|vd)",
+            # Fork bomb
+            r":\(\)\s*\{.*\};\s*:",
             # Block writes to nanobot internal state files (#2989).
             # history.jsonl / .dream_cursor are managed by append_history();
             # direct writes corrupt the cursor format and crash /dream.
@@ -603,9 +659,16 @@ class ExecTool(Tool):
                     + _WORKSPACE_BOUNDARY_NOTE
                 )
 
+
             cwd_path = Path(cwd).resolve()
 
-            for raw in self._extract_absolute_paths(cmd):
+            traversal_error = self._check_path_traversal(cmd, cwd_path)
+            if traversal_error:
+                return traversal_error
+
+            media_path = get_media_dir().resolve()
+
+            for prefix_char, raw in self._extract_paths_with_prefix(cmd):
                 try:
                     expanded = os.path.expandvars(raw.strip())
                     # Match against the un-resolved path first.  On Linux,
@@ -619,16 +682,33 @@ class ExecTool(Tool):
 
                 if self._is_benign_device_path(str(p)):
                     continue
+                if not p.is_absolute():
+                    continue
+                if cwd_path == p or cwd_path in p.parents:
+                    continue
+                if media_path == p or media_path in p.parents:
+                    continue
 
-                media_path = get_media_dir().resolve()
-                if p.is_absolute() and not (
-                    is_path_within(p, cwd_path)
-                    or is_path_within(p, media_path)
+                # Virtual / scratch prefixes: always permitted. /proc & /sys are
+                # kernel pseudo-fs, /tmp et al. are user-owned scratch.
+                if any(_path_under(prefix, p) for prefix in _SAFE_READ_PREFIXES_VIRTUAL):
+                    continue
+
+                # System read-only prefixes: permitted only when the path is
+                # being read, not when it is the destination of a redirect.
+                # `>` precedes write redirects (the dangerous one); `<` reads.
+                # We block on `>` to keep the guard honest while still letting
+                # `cat /etc/resolv.conf` pass.
+                is_redirect_target = prefix_char == ">"
+                if not is_redirect_target and any(
+                    _path_under(prefix, p) for prefix in _SAFE_READ_PREFIXES_SYSTEM_RO
                 ):
-                    return (
-                        "Error: Command blocked by safety guard (path outside working dir)"
-                        + _WORKSPACE_BOUNDARY_NOTE
-                    )
+                    continue
+
+                return (
+                    "Error: Command blocked by safety guard (path outside working dir)"
+                    + _WORKSPACE_BOUNDARY_NOTE
+                )
 
         return None
 
@@ -638,6 +718,78 @@ class ExecTool(Tool):
         if path in cls._BENIGN_DEVICE_PATHS:
             return True
         return path.startswith("/dev/fd/")
+
+    @staticmethod
+    def _strip_quoted_strings(s: str) -> str:
+        """Replace contents of `'…'` and `"…"` with empty strings.
+
+        Used to ignore `../` (and similar tokens) that live inside string
+        literals — they are not shell tokens the shell will resolve, they are
+        data being passed to the inner program.
+
+        Note: this is intentionally NOT used for absolute-path extraction.
+        `bash -c '…'` and `sh -c "…"` re-enter the shell on the inner
+        contents, so absolute paths inside those quotes must still be
+        checked. The traversal check is OK to relax because `../` in a
+        re-entered shell command would be just as suspicious as in the
+        outer one, and the workspace boundary check still catches the
+        absolute case.
+        """
+        # Single-quoted: literal, no escapes
+        s = re.sub(r"'[^']*'", "''", s)
+        # Double-quoted: allow backslash escapes
+        s = re.sub(r'"(?:\\.|[^"\\])*"', '""', s)
+        return s
+
+    def _check_path_traversal(self, command: str, cwd_path: Path) -> str | None:
+        """Detect `../` traversal that escapes the workspace.
+
+        Substring-matching `"../" in command` was a major false-positive
+        source: it fired on `pytest tests/../tests/specific/` (resolves
+        in-tree), `grep '../' file.txt` (the slash-dot-dot is the search
+        pattern), `git log a..b` (near misses).
+
+        New heuristic:
+        1. If the command contains no `..\\` or `../` at all → pass.
+        2. If `../` only appears inside quoted strings → pass.
+        3. Otherwise shell-tokenize the command; for each token containing
+           `../`, resolve it relative to cwd. If every such token resolves
+           inside the workspace, pass. If any escapes, block.
+        """
+        if "..\\" not in command and "../" not in command:
+            return None
+
+        stripped = self._strip_quoted_strings(command)
+        if "..\\" not in stripped and "../" not in stripped:
+            return None
+
+        block = (
+            "Error: Command blocked by safety guard (path traversal detected)"
+            + _WORKSPACE_BOUNDARY_NOTE
+        )
+
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            # Malformed quoting: fall back to the conservative block. A
+            # mismatched quote could let `../` leak through that the
+            # stripping pass didn't catch.
+            return block
+
+        for tok in tokens:
+            if "../" not in tok and "..\\" not in tok:
+                continue
+            # Absolute & home paths are handled by the absolute-path check.
+            if tok.startswith("/") or tok.startswith("~"):
+                continue
+            try:
+                resolved = (cwd_path / tok).resolve()
+            except Exception:
+                return block
+            if resolved != cwd_path and cwd_path not in resolved.parents:
+                return block
+
+        return None
 
     @staticmethod
     def _extract_absolute_paths(command: str) -> list[str]:
@@ -650,3 +802,46 @@ class ExecTool(Tool):
         posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
         home_paths = re.findall(r"(?:^|[\s>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
         return win_paths + posix_paths + home_paths
+
+    @staticmethod
+    def _extract_paths_with_prefix(command: str) -> list[tuple[str, str]]:
+        """Return [(prefix_char, path), …] for each absolute path in `command`.
+
+        Like `_extract_absolute_paths` but also reports the meaningful
+        (non-whitespace) character immediately preceding each path: one of
+        `>` (redirect-target), `|`, `'`, `"`, or `""` for start-of-string /
+        preceded only by whitespace. The workspace guard uses
+        `prefix_char == ">"` to tell read positions from write redirects so
+        the read-safe prefix whitelist doesn't accidentally allow writes
+        into /etc, /usr, etc.
+
+        It also tightens the POSIX regex over the upstream
+        `_extract_absolute_paths` (kept verbatim for API stability):
+        `/(?!/)` skips `//…` (Python `a // b`, C/JS comments, scheme-less
+        URL fragments) and the `+` after `/` requires at least one
+        non-separator char so a bare `/` (regular `a / b` division) is not
+        captured as the filesystem root and does not abort the turn.
+        """
+        results: list[tuple[str, str]] = []
+
+        # Windows: drive-root paths like `C:\…` and UNC paths `\\server\share`.
+        # Redirect syntax with drive paths is uncommon; default to "" prefix.
+        for m in re.finditer(
+            r"(?:[A-Za-z]:[^\s\"'|><;]*|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",
+            command,
+        ):
+            results.append(("", m.group(0)))
+
+        path_re = re.compile(r"(?:^|[\s|>'\"])(/(?!/)[^\s\"'>;|<]+|~[^\s\"'>;|<]*)")
+        for m in path_re.finditer(command):
+            # Walk left from the match start past any whitespace to find the
+            # meaningful prefix char. `echo data > /etc/x` matches the space
+            # before `/etc/x`, but the redirect-determining char is the `>`
+            # that sits before the space.
+            i = m.start(1) - 1
+            while i >= 0 and command[i].isspace():
+                i -= 1
+            prefix_char = command[i] if i >= 0 else ""
+            results.append((prefix_char, m.group(1)))
+
+        return results
