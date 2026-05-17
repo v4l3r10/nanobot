@@ -14,8 +14,20 @@ RUN apt-get update && \
 
 WORKDIR /app
 
+# v0.2.0 added a custom hatchling build hook (hatch_build.py, the
+# webui-build plugin). hatchling instantiates the hook class during ANY
+# `pip install .` — including the cached deps-only layer below — and
+# raises "Build script does not exist: hatch_build.py" if the file is
+# absent from the build context, before the hook's own skip logic runs.
+# Upstream's Dockerfile never copies webui/ nor the prebuilt
+# nanobot/web/dist/, so the hook is meant to no-op here: make that
+# explicit and deterministic with the hook's first-class bypass instead
+# of relying on the incidental "no webui/ source tree" branch. Bronzo is
+# Telegram-first; the bundled web UI is not a served surface.
+ENV NANOBOT_SKIP_WEBUI_BUILD=1
+
 # Install Python dependencies first (cached layer)
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE hatch_build.py ./
 RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
     uv pip install --system --no-cache . && \
     rm -rf nanobot bridge
