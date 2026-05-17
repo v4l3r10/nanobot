@@ -7,6 +7,7 @@ import dataclasses
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -90,6 +91,17 @@ class StateTraceEntry:
     duration_ms: float
     event: str
     error: str | None = None
+
+
+# Set by _run_agent_loop when a turn hit a workspace/SSRF boundary, read by
+# _assemble_outbound to break peer error-loops. A ContextVar (not a tuple/ctx
+# field) so _run_agent_loop's return signature stays 5-tuple — keeping it
+# stable for the upstream tests that unpack it directly — and so concurrent
+# turns on different asyncio tasks never see each other's value. Mirrors the
+# PeerSayTool._sent_in_turn ContextVar pattern already used in this codebase.
+_PEER_WS_VIOLATION_VAR: ContextVar[bool] = ContextVar(
+    "peer_workspace_violation", default=False,
+)
 
 
 @dataclass
@@ -829,6 +841,16 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
+        # Did this turn hit a workspace/SSRF boundary? Keyed off the runner's
+        # own structured event taxonomy (_classify_violation writes detail
+        # prefixes "workspace_violation: ", "workspace_violation_escalated: ",
+        # "ssrf_violation: ") — not LLM output text. Consumed by
+        # _assemble_outbound to break peer error-loops (v0.2.0 no longer
+        # exposes stop_reason == "workspace_violation").
+        _PEER_WS_VIOLATION_VAR.set(any(
+            (ev.get("detail") or "").startswith(("workspace_violation", "ssrf_violation"))
+            for ev in result.tool_events
+        ))
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 
     async def run(self) -> None:
@@ -1282,6 +1304,27 @@ class AgentLoop:
             if peer_tool is not None and getattr(peer_tool, "_sent_in_turn", False):
                 if not had_injections or stop_reason == "empty_final_response":
                     return None
+
+        # Peer error-loop break. If this turn hit a workspace/SSRF boundary and
+        # the agent did NOT deliberately address the peer via peer_say, the
+        # final_content is an error narrative ("I couldn't do X because it's
+        # blocked"). Forwarding it to the peer carries no closing=true, so it
+        # wakes the receiver's loop into a meta-narrative ping-pong ("what were
+        # you trying to do?" -> retry blocked op -> ...). v0.2.0 de-escalated
+        # violations to soft tool errors, removed stop_reason ==
+        # "workspace_violation", and its repeat-escalation is turn-scoped (inert
+        # across a conversational A<->B loop), so the break must happen here.
+        # Dropping the outbound keeps the failure local and ends the loop; the
+        # error is still fully captured in this agent's own logs/history.
+        if msg.channel == "peer" and _PEER_WS_VIOLATION_VAR.get():
+            peer_tool = self.tools.get("peer_say")
+            if peer_tool is None or not getattr(peer_tool, "_sent_in_turn", False):
+                logger.info(
+                    "Suppressing workspace-violation narrative to peer:{} "
+                    "(local-only failure breaks the error-loop)",
+                    msg.sender_id,
+                )
+                return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
