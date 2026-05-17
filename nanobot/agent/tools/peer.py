@@ -90,6 +90,13 @@ class PeerSayTool(Tool):
     DM thread, exactly like a Telegram private chat between two people.
     """
 
+    # Manually wired in cli.commands with the live PeerChannel's callbacks;
+    # opt out of ToolLoader auto-discovery. Without this the loader calls
+    # cls() with no args -> TypeError (caught, but logged at every startup);
+    # that noise once masked a real signal and triggered a false-alarm
+    # rollback. The tool is still fully registered via the manual glue.
+    _plugin_discoverable = False
+
     def __init__(
         self,
         send_callback: Callable[[OutboundMessage], Awaitable[None]],
@@ -192,6 +199,9 @@ class PeerListTool(Tool):
     connections. This tool returns the most recent snapshot.
     """
 
+    # See PeerSayTool: manually wired, opt out of ToolLoader auto-discovery.
+    _plugin_discoverable = False
+
     def __init__(
         self,
         list_peers_callback: Callable[[], list[str]],
@@ -276,6 +286,9 @@ class PeerThreadShowTool(Tool):
     <peer>?" questions. Returns a chronologically-ordered transcript ready
     to be pasted into an answer to the user.
     """
+
+    # See PeerSayTool: manually wired, opt out of ToolLoader auto-discovery.
+    _plugin_discoverable = False
 
     def __init__(
         self,
