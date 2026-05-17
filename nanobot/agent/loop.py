@@ -1245,6 +1245,18 @@ class AgentLoop:
             if not had_injections or stop_reason == "empty_final_response":
                 return None
 
+        # peer_say suppression: when the agent already addressed the peer via
+        # the structured tool (which knows about closing=true and the
+        # receiver-side wake protocol), the narrative final_content would
+        # arrive at the peer as a SECOND message without closing, defeating
+        # the loop-break and waking the receiver again. Skip it. Scoped to the
+        # peer channel so telegram/etc. are unaffected.
+        if msg.channel == "peer":
+            peer_tool = self.tools.get("peer_say")
+            if peer_tool is not None and getattr(peer_tool, "_sent_in_turn", False):
+                if not had_injections or stop_reason == "empty_final_response":
+                    return None
+
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
@@ -1332,6 +1344,13 @@ class AgentLoop:
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
+        # Reset per-turn flag on PeerSayTool so we can detect whether the
+        # agent already addressed the peer via the structured tool (and thus
+        # suppress the duplicated narrative final_content above).
+        if peer_say_tool := self.tools.get("peer_say"):
+            start_turn = getattr(peer_say_tool, "start_turn", None)
+            if callable(start_turn):
+                start_turn()
 
         _hist_kwargs: dict[str, Any] = {
             "max_messages": self._max_messages,
