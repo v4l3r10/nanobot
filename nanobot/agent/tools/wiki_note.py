@@ -246,19 +246,26 @@ class WikiNoteTool(_FsTool, ContextAware):
             "Manage your long-term wiki memory (durable notes about people, "
             "projects, concepts, decisions). Operations:\n"
             "- read: fetch a page by its path relative to wiki/ "
-            "(e.g. path='people/alice.md'). Returns frontmatter + body.\n"
+            "(e.g. path='people/alice.md'). Returns frontmatter + body. "
+            "Reading a page that had gone cold automatically reheats it "
+            "(marks it hot again) so it stays in active memory.\n"
             "- create: add a new leaf page (args: type, slug, title, "
             "optional body). The type is validated against the wiki schema "
             "(unknown types are refused); pages are filed by type and an "
             "index of each type is kept up to date automatically.\n"
-            "You may only read and create leaf pages. You cannot move pages "
-            "to cold storage, merge pages, or rewrite indexes/MOC files — "
-            "those are automatic and Dream-only."
+            "- append: add text to an existing page (args: path, text). The "
+            "text is appended to the page body and the page's freshness is "
+            "bumped (it is treated as recently touched). The page must "
+            "already exist — use create first for a new page.\n"
+            "Search is not available yet. You may only read, create, and "
+            "append to leaf pages. You cannot move pages to cold storage, "
+            "merge pages, or rewrite indexes/MOC files — those are automatic "
+            "and Dream-only."
         )
 
     async def execute(self, operation: str | None = None, **kw: Any) -> str:
         if operation == "read":
-            return self._do_read(kw.get("path"))
+            return await self._do_read(kw.get("path"))
         if operation == "create":
             return await self._do_create(
                 kw.get("type"),
@@ -266,27 +273,146 @@ class WikiNoteTool(_FsTool, ContextAware):
                 kw.get("title"),
                 kw.get("body") or "",
             )
+        if operation == "append":
+            return await self._do_append(kw.get("path"), kw.get("text"))
         return f"Error: unknown operation {operation!r}"
 
-    def _do_read(self, path: str | None) -> str:
+    async def _do_read(self, path: str | None) -> str:
+        """Read a page; reheat it (cold→hot) iff it is currently cold.
+
+        Refactored async (Task 2.3): the COLD branch must take the per-vault
+        lock and persist the reheated page, so the method is ``async`` and
+        awaited from ``execute``. The HOT branch is a deliberate pure read —
+        NO lock acquisition and NO write — so the common case stays cheap and
+        lock-free (an earlier review flagged read-path side effects; only a
+        cold page pays the write+lock cost). Idempotent: a second read of a
+        now-hot page changes nothing. This never raises to the caller — every
+        failure is returned as a model-readable string (Task 2.1 contract).
+        """
         if not path:
             return "Error: 'path' is required for read"
         vault = self._vault()
         try:
-            vault.read_page(path)
+            page = vault.read_page(path)
         except FileNotFoundError:
             return f"Page not found: {path}"
         except ValueError as e:
             return f"Error: {e}"
-        # Return the raw serialized page text so the model sees frontmatter +
-        # body. read_page already enforced wiki-dir containment (vault.py:86);
-        # we reuse its resolved path rather than self._resolve so the sandbox
-        # check and the vault-traversal guard cannot disagree.
+
+        # read_page already enforced wiki-dir containment (vault.py:86); reuse
+        # its resolved path so the sandbox check and the vault-traversal guard
+        # cannot disagree (no second, divergent resolve).
         target = (vault.wiki_dir / path).resolve()
-        try:
-            return target.read_text(encoding="utf-8")
-        except OSError as e:
-            return f"Error: {e}"
+
+        # HOT (the common case): pure read, no lock, no write. Return the
+        # original bytes verbatim — byte-identical to pre-Task-2.3 behaviour.
+        if page.status != "cold":
+            try:
+                return target.read_text(encoding="utf-8")
+            except OSError as e:
+                return f"Error: {e}"
+
+        # COLD: reheat under the per-vault lock. Re-read + re-parse inside the
+        # lock (the file may have changed/been reheated concurrently); only
+        # flip + persist if it is STILL cold, otherwise just return current
+        # content. Double-check keeps the write idempotent under concurrency.
+        async with self._vault_lock():
+            try:
+                current = target.read_text(encoding="utf-8")
+            except OSError as e:
+                return f"Error: {e}"
+            try:
+                page = parse_page(current)
+            except ValueError as e:
+                return f"Error: {e}"
+            if page.status != "cold":
+                return current
+            page.status = "hot"
+            page.last_touched = datetime.date.today().isoformat()
+            try:
+                atomic_write_text(target, serialize_page(page))
+            except OSError as e:
+                return f"Error: {e}"
+            return serialize_page(page)
+
+    async def _do_append(self, path: str | None, text: str | None) -> str:
+        """Append ``text`` to an existing page's body and bump its freshness.
+
+        Whole operation runs under the per-vault async lock (same critical
+        section as create) so a concurrent Dream-Lint pass / another turn
+        cannot interleave a half-written page. Refuses (writing nothing) for
+        a missing page, a non-page / structural basename (``SCHEMA.md`` /
+        ``_index.md``), any ``.cold`` path component (cold pages reheat via
+        ``read``; Dream owns ``.cold/``), a containment escape, or a
+        malformed page (Lint repairs malformed pages — do not overwrite).
+        Never touches ``_index.md`` (the stub already exists from create —
+        append must not re-scaffold the MOC).
+        """
+        if not path:
+            return "Error: 'path' is required for append"
+        if not text:
+            return "Error: 'text' is required for append"
+
+        vault = self._vault()
+        target = vault.wiki_dir / path
+        resolved = self._resolved_in_vault(target, vault)
+        if resolved is None:
+            return (
+                f"Error: refusing to append {path} "
+                "— resolves outside the vault"
+            )
+
+        # Non-page / structural basename, or any cold-archive path component.
+        # Reference the authoritative vault constants (no hardcoded dup) so
+        # this stays in lockstep with iter_pages' filter / the cold marker.
+        if resolved.name in _NON_PAGE_NAMES:
+            return (
+                f"Error: refusing to append {path} "
+                "— not a content page (structural/index file)"
+            )
+        if _COLD_COMPONENT in resolved.parts:
+            return (
+                f"Error: refusing to append {path} "
+                "— cold pages are reheated via read, not appended"
+            )
+
+        async with self._vault_lock():
+            if not resolved.exists():
+                return (
+                    f"Error: Page not found: {path}. "
+                    "Use operation='create' first."
+                )
+            try:
+                current = resolved.read_text(encoding="utf-8")
+            except OSError as e:
+                return f"Error: {e}"
+            try:
+                page = parse_page(current)
+            except ValueError:
+                return f"Error: cannot append — {path} is malformed"
+
+            # Exactly one separating newline between old body and new text,
+            # and a trailing newline so subsequent appends stay clean.
+            body = page.body
+            if body and not body.endswith("\n"):
+                body += "\n"
+            body += text
+            if not body.endswith("\n"):
+                body += "\n"
+            page.body = body
+
+            today = datetime.date.today().isoformat()
+            page.updated = today
+            page.last_touched = today
+            # created / type / title / status / tags / links_out / pinned
+            # are left UNCHANGED.
+
+            try:
+                atomic_write_text(resolved, serialize_page(page))
+            except OSError as e:
+                return f"Error: {e}"
+
+        return f"Appended to {path}"
 
     async def _do_create(
         self,
