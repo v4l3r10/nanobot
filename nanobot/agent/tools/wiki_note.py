@@ -11,9 +11,12 @@ Task 2.2 hardens ``create`` with the SCHEMA admission gate (unknown-type +
 frontmatter validation, design §3/P7), refuses duplicates, scaffolds the
 per-type ``_index.md`` Map-of-Content, and runs the page-write + index-append
 as one critical section under the per-vault async lock (design H2/Task 0.3).
-``append`` + reheat and ``search`` arrive in Tasks 2.3-2.4; the parameter
-schema here is intentionally the full stable set so it does not churn across
-tasks.
+Task 2.3 adds ``append`` + reheat-on-``read``. Task 2.4 adds ``search``: a
+read-only keyword/tag/recency scan over hot AND cold pages (no embeddings,
+no SQLite — design §4) that deliberately does NOT reheat (only ``read``
+does). This completes Milestone 2's read/write agent pen. The parameter
+schema here is intentionally the full stable set so it does not churn
+across tasks.
 """
 
 from __future__ import annotations
@@ -148,6 +151,41 @@ def _is_reserved_slug(raw: str, safe_slug: str) -> bool:
     return False
 
 
+# Hard cap on search results returned to the model. More than this and a
+# single overflow note is appended (the model should refine its query rather
+# than be flooded). Kept small + deterministic so search stays model-readable.
+_SEARCH_CAP = 20
+
+# Target width of a per-result snippet (title + first body line, single line,
+# internal whitespace collapsed). ~120 chars keeps each result compact.
+_SNIPPET_MAX_LEN = 120
+
+# Collapses any whitespace run (incl. newlines/tabs) to a single space so a
+# multi-line body folds into one readable snippet line.
+_WS_RUN = re.compile(r"\s+")
+
+
+def _search_snippet(page: Page) -> str:
+    """One compact line: page ``title`` + first non-empty body line.
+
+    Internal whitespace/newlines are collapsed to single spaces and the
+    whole thing is trimmed to ``_SNIPPET_MAX_LEN`` chars (single line) so a
+    result list stays model-readable regardless of body shape.
+    """
+    title = _WS_RUN.sub(" ", page.title).strip()
+    first_body = ""
+    for raw_line in page.body.splitlines():
+        line = _WS_RUN.sub(" ", raw_line).strip()
+        if line:
+            first_body = line
+            break
+    snippet = f"{title} — {first_body}" if first_body else title
+    snippet = _WS_RUN.sub(" ", snippet).strip()
+    if len(snippet) > _SNIPPET_MAX_LEN:
+        snippet = snippet[: _SNIPPET_MAX_LEN - 1].rstrip() + "…"
+    return snippet
+
+
 def _terminated_line_set(text: str) -> set[str]:
     """Existing ``_index.md`` lines, each re-terminated with a single ``\\n``.
 
@@ -162,7 +200,8 @@ def _terminated_line_set(text: str) -> set[str]:
 @tool_parameters(
     tool_parameters_schema(
         operation=StringSchema(
-            "What to do: 'read' a page by path, or 'create' a new leaf page."
+            "What to do: 'read' a page by path, 'create' a new leaf page, "
+            "'append' text to a page, or 'search' pages by keyword/tag/recency."
         ),
         path=StringSchema(
             "For read: page path relative to wiki/, e.g. 'people/alice.md'."
@@ -176,7 +215,10 @@ def _terminated_line_set(text: str) -> set[str]:
         title=StringSchema("For create: the human-readable page title."),
         body=StringSchema("For create: the Markdown body of the page."),
         text=StringSchema("Reserved for the append operation (Task 2.3)."),
-        query=StringSchema("Reserved for the search operation (Task 2.4)."),
+        query=StringSchema(
+            "For search: a keyword/phrase, a 'tag:NAME' filter, or empty "
+            "to list the most recently touched pages."
+        ),
         required=["operation"],
     )
 )
@@ -257,10 +299,20 @@ class WikiNoteTool(_FsTool, ContextAware):
             "text is appended to the page body and the page's freshness is "
             "bumped (it is treated as recently touched). The page must "
             "already exist — use create first for a new page.\n"
-            "Search is not available yet. You may only read, create, and "
-            "append to leaf pages. You cannot move pages to cold storage, "
-            "merge pages, or rewrite indexes/MOC files — those are automatic "
-            "and Dream-only."
+            "- search: find pages (arg: query). Searches across BOTH active "
+            "(hot) and archived (cold) pages so older knowledge stays "
+            "discoverable. 'query' may be: a keyword/phrase (case-insensitive "
+            "substring over title, tags, and body, ranked title > tag > "
+            "body); a 'tag:NAME' filter (exact, case-insensitive tag match); "
+            "or empty/omitted to list the most recently touched pages. "
+            "Returns up to 20 result lines, each starting with the page's "
+            "path relative to wiki/ — pass that path to operation='read' to "
+            "open a result. Search is plain keyword/tag/recency (no "
+            "embeddings or semantic search) and is READ-ONLY: unlike read it "
+            "does NOT reheat a cold page — only an explicit read reheats.\n"
+            "You may only read, create, append to, and search leaf pages. "
+            "You cannot move pages to cold storage, merge pages, or rewrite "
+            "indexes/MOC files — those are automatic and Dream-only."
         )
 
     async def execute(self, operation: str | None = None, **kw: Any) -> str:
@@ -275,6 +327,10 @@ class WikiNoteTool(_FsTool, ContextAware):
             )
         if operation == "append":
             return await self._do_append(kw.get("path"), kw.get("text"))
+        if operation == "search":
+            # search is read-only and synchronous (no lock/write/reheat); call
+            # the sync helper directly without await.
+            return self._do_search(kw.get("query"))
         return f"Error: unknown operation {operation!r}"
 
     async def _do_read(self, path: str | None) -> str:
@@ -422,6 +478,104 @@ class WikiNoteTool(_FsTool, ContextAware):
                 return f"Error: {e}"
 
         return f"Appended to {path}"
+
+    def _do_search(self, query: str | None) -> str:
+        """Keyword / tag / recency search over hot AND cold pages.
+
+        Read-only by deliberate design (Task 2.3 boundary): NO lock, NO
+        write, NO reheat — only an explicit ``read`` reheats a cold page.
+        ``search`` is the agent's discovery mechanism for pages not linked
+        from the MOC (design §4): no embeddings, no SQLite — pure
+        keyword/substring + recency over ``Vault.iter_pages`` so cold
+        knowledge stays findable (the agent then ``read``s a hit, which
+        reheats it). Fully deterministic ordering so behaviour is testable
+        and Lint/regeneration stays predictable. Never raises — every path
+        returns a model-readable string.
+
+        Three modes (mutually exclusive):
+
+        * **empty/whitespace/missing query** → the most-recently-touched
+          pages (``last_touched`` desc, relpath asc tiebreak);
+        * **``tag:`` prefix** → exact case-insensitive tag filter (a page
+          matches iff one of its ``tags`` equals the requested tag,
+          case-insensitively), ordered ``last_touched`` desc / relpath asc;
+        * **otherwise** → case-insensitive substring search scored by field
+          presence (title 3, tag 2, body 1; presence per field, NOT
+          occurrence count), score>0 only, sorted score desc /
+          ``last_touched`` desc / relpath asc.
+
+        Capped at :data:`_SEARCH_CAP`; an overflow note is appended when
+        more matched than were shown.
+        """
+        vault = self._vault()
+        # iter_pages already skips SCHEMA.md/_index.md + malformed pages and,
+        # with include_cold=True, walks .cold/ too — search inherits all of
+        # that (no extra filtering needed).
+        pages = list(vault.iter_pages(include_cold=True))
+
+        q = (query or "").strip()
+
+        def _ordered_recent(
+            items: list[tuple[str, Page]],
+        ) -> list[tuple[str, Page]]:
+            # Deterministic: relpath ASC tiebreak, last_touched DESC primary.
+            # Stable sort applied twice (least-significant key first).
+            by_rel = sorted(items, key=lambda it: it[0])
+            return sorted(
+                by_rel, key=lambda it: it[1].last_touched, reverse=True
+            )
+
+        header: str
+        results: list[tuple[str, Page]]
+
+        if not q:
+            results = _ordered_recent(pages)
+            header_kind = "most recently touched"
+        elif q[:4].lower() == "tag:":
+            wanted = q[4:].strip().lower()
+            matched = [
+                (rel, page)
+                for rel, page in pages
+                if any(tag.lower() == wanted for tag in page.tags)
+            ]
+            results = _ordered_recent(matched)
+            header_kind = f"tagged {wanted!r}"
+        else:
+            needle = q.lower()
+            scored: list[tuple[int, str, Page]] = []
+            for rel, page in pages:
+                score = 0
+                if needle in page.title.lower():
+                    score += 3
+                if any(needle in tag.lower() for tag in page.tags):
+                    score += 2
+                if needle in page.body.lower():
+                    score += 1
+                if score > 0:
+                    scored.append((score, rel, page))
+            # Deterministic: score DESC, last_touched DESC, relpath ASC.
+            # Apply stable sorts least-significant key first.
+            scored.sort(key=lambda t: t[1])
+            scored.sort(key=lambda t: t[2].last_touched, reverse=True)
+            scored.sort(key=lambda t: t[0], reverse=True)
+            results = [(rel, page) for _, rel, page in scored]
+            header_kind = f"matching {q!r}"
+
+        if not results:
+            return f"No matching pages for {query!r}."
+
+        total = len(results)
+        shown = results[:_SEARCH_CAP]
+        header = f"Found {len(shown)} page(s) ({header_kind}):"
+        lines = [header]
+        for rel, page in shown:
+            cold = " (cold)" if page.status == "cold" else ""
+            lines.append(f"- {rel}{cold} — {_search_snippet(page)}")
+        if total > _SEARCH_CAP:
+            lines.append(
+                f"… ({total - _SEARCH_CAP} more not shown; refine the query)"
+            )
+        return "\n".join(lines)
 
     async def _do_create(
         self,
