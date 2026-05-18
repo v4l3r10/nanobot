@@ -59,6 +59,10 @@ class DreamConfig(Base):
     # on — set to False to feed MEMORY.md raw if a specific LLM reacts poorly
     # to the `← Nd` suffix or you want deterministic, git-independent prompts.
     annotate_line_ages: bool = True
+    # Master gate for the wiki-tree memory subsystem (Ingest/Lint + MOC context
+    # injection). Default off so a stock install is byte-identical to v0.2.0.
+    wiki_enabled: bool = False
+    lint_cadence_h: int | None = Field(default=None, ge=1)  # None => use interval_h
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""

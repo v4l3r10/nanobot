@@ -983,6 +983,12 @@ def _run_gateway(
     agent.dream.max_batch_size = dream_cfg.max_batch_size
     agent.dream.max_iterations = dream_cfg.max_iterations
     agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
+    # Wiki-tree memory knobs. Dream does not declare these attributes until
+    # Task 4.5; plain attribute assignment is safe (Dream is a normal class)
+    # and pre-wires the values so 4.5 only needs to consume them.
+    agent.dream.wiki_enabled = dream_cfg.wiki_enabled
+    if dream_cfg.lint_cadence_h is not None:
+        agent.dream.lint_cadence_h = dream_cfg.lint_cadence_h
     from nanobot.cron.types import CronJob, CronPayload
     cron.register_system_job(CronJob(
         id="dream",
