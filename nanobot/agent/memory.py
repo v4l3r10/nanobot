@@ -41,6 +41,28 @@ if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
 
 
+# Process-wide guard serializing every ``Dream.run()`` invocation (Task 4.6).
+# The cron tick (`await agent.dream.run()`) and `/dream`'s unguarded
+# `asyncio.create_task(_run_dream())` share one event loop and can otherwise
+# run two `Dream.run()`s concurrently: both pass the cursor guard, process the
+# SAME batch, and double-edit MEMORY.md (and, with the wiki on, double-Ingest).
+# `run()` acquires this as its OUTERMOST lock so a waiting run re-reads the
+# cursor the prior run advanced and correctly no-ops.
+#
+# Deliberately a plain MODULE-GLOBAL `asyncio.Lock` held by a STRONG module
+# reference for the process lifetime — NOT `utils.vault_lock.get_vault_lock`,
+# whose `WeakValueDictionary` can GC + recreate the lock between two
+# non-overlapping `create_task`s, defeating mutual exclusion. On Python 3.11+
+# a module-scope `asyncio.Lock()` has no loop bound at construction (it binds
+# to the running loop lazily), so this is safe to define at import time.
+#
+# Lock ordering: dream-run-lock (this, outermost) -> per-vault lock
+# (`get_vault_lock(slug)`, acquired inside the wiki block of `run()`). The
+# `wiki_note` tool takes only the per-vault lock and NEVER this lock, so there
+# is no lock-ordering inversion and no deadlock cycle.
+_DREAM_RUN_LOCK = asyncio.Lock()
+
+
 # ---------------------------------------------------------------------------
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
@@ -1177,190 +1199,195 @@ class Dream:
 
     async def run(self) -> bool:
         """Process unprocessed history entries. Returns True if work was done."""
-        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+        # Task 4.6: serialize EVERY Dream.run() (cron tick vs /dream's
+        # create_task) on the one shared loop. Outermost lock; the cursor
+        # read below is INSIDE it, so a waiting run sees the prior run's
+        # advance and no-ops instead of double-processing the same batch.
+        async with _DREAM_RUN_LOCK:
+            from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 
-        last_cursor = self.store.get_last_dream_cursor()
-        entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
-        if not entries:
-            return False
+            last_cursor = self.store.get_last_dream_cursor()
+            entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
+            if not entries:
+                return False
 
-        batch = entries[: self.max_batch_size]
-        logger.info(
-            "Dream: processing {} entries (cursor {}→{}), batch={}",
-            len(entries), last_cursor, batch[-1]["cursor"], len(batch),
-        )
-
-        # Build history text for LLM — cap each entry so a legacy oversized
-        # record (e.g. pre-#3412 raw_archive dump) can't blow up the prompt.
-        history_text = "\n".join(
-            f"[{e['timestamp']}] "
-            f"{truncate_text(e['content'], self.history_entry_preview_max_chars)}"
-            for e in batch
-        )
-
-        # Current file contents + per-line age annotations (MEMORY.md only).
-        # Each file is capped in the *prompt preview* only; Phase 2 still sees
-        # the full file via the read_file tool.
-        current_date = self._today()
-        raw_memory = self.store.read_memory() or "(empty)"
-        annotated_memory = (
-            self._annotate_with_ages(raw_memory)
-            if self.annotate_line_ages
-            else raw_memory
-        )
-        current_memory = truncate_text(annotated_memory, self.memory_file_max_chars)
-        current_soul = truncate_text(
-            self.store.read_soul() or "(empty)", self.soul_file_max_chars,
-        )
-        current_user = truncate_text(
-            self.store.read_user() or "(empty)", self.user_file_max_chars,
-        )
-        journal_section = self._build_journal_section()
-
-        file_context = (
-            f"## Current Date\n{current_date}\n\n"
-            + (f"{journal_section}\n\n" if journal_section else "")
-            + f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
-            f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
-            f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
-        )
-
-        # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
-        phase1_prompt = (
-            f"## Conversation History\n{history_text}\n\n{file_context}"
-        )
-
-        try:
-            phase1_response = await self.provider.chat_with_retry(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": render_template(
-                            "agent/dream_phase1.md",
-                            strip=True,
-                            stale_threshold_days=_STALE_THRESHOLD_DAYS,
-                        ),
-                    },
-                    {"role": "user", "content": phase1_prompt},
-                ],
-                tools=None,
-                tool_choice=None,
-            )
-            analysis = phase1_response.content or ""
-            logger.debug("Dream Phase 1 analysis ({} chars): {}", len(analysis), analysis[:500])
-        except Exception:
-            logger.exception("Dream Phase 1 failed")
-            return False
-
-        # Phase 2: Delegate to AgentRunner with read_file / edit_file
-        existing_skills = self._list_existing_skills()
-        skills_section = ""
-        if existing_skills:
-            skills_section = (
-                "\n\n## Existing Skills\n"
-                + "\n".join(f"- {s}" for s in existing_skills)
-            )
-        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}{skills_section}"
-
-        tools = self._tools
-        skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
-        journal_path = f"memory/journal/{current_date}.md"
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": render_template(
-                    "agent/dream_phase2.md",
-                    strip=True,
-                    skill_creator_path=str(skill_creator_path),
-                    journal_path=journal_path,
-                    daily_notes_enabled=self.daily_notes_enabled,
-                ),
-            },
-            {"role": "user", "content": phase2_prompt},
-        ]
-
-        try:
-            result = await self._runner.run(AgentRunSpec(
-                initial_messages=messages,
-                tools=tools,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                max_tool_result_chars=self.max_tool_result_chars,
-                fail_on_tool_error=False,
-            ))
-            logger.debug(
-                "Dream Phase 2 complete: stop_reason={}, tool_events={}",
-                result.stop_reason, len(result.tool_events),
-            )
-            for ev in (result.tool_events or []):
-                logger.info("Dream tool_event: name={}, status={}, detail={}", ev.get("name"), ev.get("status"), ev.get("detail", "")[:200])
-        except Exception:
-            logger.exception("Dream Phase 2 failed")
-            result = None
-
-        # Build changelog from tool events
-        changelog: list[str] = []
-        if result and result.tool_events:
-            for event in result.tool_events:
-                if event["status"] == "ok":
-                    changelog.append(f"{event['name']}: {event['detail']}")
-
-        # Only advance cursor on successful completion to prevent silent loss
-        if result and result.stop_reason == "completed":
-            new_cursor = batch[-1]["cursor"]
-            self.store.set_last_dream_cursor(new_cursor)
+            batch = entries[: self.max_batch_size]
             logger.info(
-                "Dream done: {} change(s), cursor advanced to {}",
-                len(changelog), new_cursor,
-            )
-        else:
-            reason = result.stop_reason if result else "exception"
-            logger.warning(
-                "Dream incomplete ({}): cursor NOT advanced, will retry next cron cycle",
-                reason,
+                "Dream: processing {} entries (cursor {}→{}), batch={}",
+                len(entries), last_cursor, batch[-1]["cursor"], len(batch),
             )
 
-        self.store.compact_history()
+            # Build history text for LLM — cap each entry so a legacy oversized
+            # record (e.g. pre-#3412 raw_archive dump) can't blow up the prompt.
+            history_text = "\n".join(
+                f"[{e['timestamp']}] "
+                f"{truncate_text(e['content'], self.history_entry_preview_max_chars)}"
+                for e in batch
+            )
 
-        # Git auto-commit (only when there are actual changes)
-        if changelog and self.store.git.is_initialized():
-            ts = batch[-1]["timestamp"]
-            summary = f"dream: {ts}, {len(changelog)} change(s)"
-            commit_msg = f"{summary}\n\n{analysis.strip()}"
-            sha = self.store.git.auto_commit(commit_msg)
-            if sha:
-                logger.info("Dream commit: {}", sha)
+            # Current file contents + per-line age annotations (MEMORY.md only).
+            # Each file is capped in the *prompt preview* only; Phase 2 still sees
+            # the full file via the read_file tool.
+            current_date = self._today()
+            raw_memory = self.store.read_memory() or "(empty)"
+            annotated_memory = (
+                self._annotate_with_ages(raw_memory)
+                if self.annotate_line_ages
+                else raw_memory
+            )
+            current_memory = truncate_text(annotated_memory, self.memory_file_max_chars)
+            current_soul = truncate_text(
+                self.store.read_soul() or "(empty)", self.soul_file_max_chars,
+            )
+            current_user = truncate_text(
+                self.store.read_user() or "(empty)", self.user_file_max_chars,
+            )
+            journal_section = self._build_journal_section()
 
-        # --- Wiki-tree memory (Task 4.5) -----------------------------------
-        # STRICTLY ADDITIVE, best-effort, gated. Reached only after the entire
-        # legacy MEMORY.md path above (Phase 1/2, cursor advance,
-        # compact_history, git commit) has run EXACTLY as in v0.2.0, and only
-        # on the success path (we are past the `if not entries: return False`
-        # guard, so there ARE entries / `batch` is non-empty). The whole block
-        # is wrapped so ANY Ingest/Lint/Vault exception is logged and
-        # SWALLOWED: it cannot alter the cursor, the changelog/git commit, the
-        # compacted history, Phase 1/2, or the `return True` below. With
-        # `wiki_enabled` False (default) this is a true no-op -> Dream is
-        # byte-identical to v0.2.0 (TestDreamWikiDisabledGolden enforces this).
-        if self.wiki_enabled:
+            file_context = (
+                f"## Current Date\n{current_date}\n\n"
+                + (f"{journal_section}\n\n" if journal_section else "")
+                + f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
+                f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
+                f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
+            )
+
+            # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
+            phase1_prompt = (
+                f"## Conversation History\n{history_text}\n\n{file_context}"
+            )
+
             try:
-                for slug in self._vaults_for_batch(batch):
-                    vault = Vault(self.store.workspace / "memory" / "users" / slug)
-                    vault.ensure_initialized()
-                    # Same lock key the wiki_note tool takes
-                    # (get_vault_lock(vault_slug(session_key))) so Dream-side
-                    # Ingest/Lint and the agent-side wiki_note tool never
-                    # write one user's vault concurrently (design H2).
-                    async with get_vault_lock(slug):
-                        await run_ingest(
-                            vault, batch, self.provider, self.model,
-                            render_template,
-                        )
-                        run_lint(vault, _date.today())
+                phase1_response = await self.provider.chat_with_retry(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": render_template(
+                                "agent/dream_phase1.md",
+                                strip=True,
+                                stale_threshold_days=_STALE_THRESHOLD_DAYS,
+                            ),
+                        },
+                        {"role": "user", "content": phase1_prompt},
+                    ],
+                    tools=None,
+                    tool_choice=None,
+                )
+                analysis = phase1_response.content or ""
+                logger.debug("Dream Phase 1 analysis ({} chars): {}", len(analysis), analysis[:500])
             except Exception:
-                logger.exception(
-                    "wiki ingest/lint failed; legacy memory path intact"
+                logger.exception("Dream Phase 1 failed")
+                return False
+
+            # Phase 2: Delegate to AgentRunner with read_file / edit_file
+            existing_skills = self._list_existing_skills()
+            skills_section = ""
+            if existing_skills:
+                skills_section = (
+                    "\n\n## Existing Skills\n"
+                    + "\n".join(f"- {s}" for s in existing_skills)
+                )
+            phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}{skills_section}"
+
+            tools = self._tools
+            skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
+            journal_path = f"memory/journal/{current_date}.md"
+            messages: list[dict[str, Any]] = [
+                {
+                    "role": "system",
+                    "content": render_template(
+                        "agent/dream_phase2.md",
+                        strip=True,
+                        skill_creator_path=str(skill_creator_path),
+                        journal_path=journal_path,
+                        daily_notes_enabled=self.daily_notes_enabled,
+                    ),
+                },
+                {"role": "user", "content": phase2_prompt},
+            ]
+
+            try:
+                result = await self._runner.run(AgentRunSpec(
+                    initial_messages=messages,
+                    tools=tools,
+                    model=self.model,
+                    max_iterations=self.max_iterations,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    fail_on_tool_error=False,
+                ))
+                logger.debug(
+                    "Dream Phase 2 complete: stop_reason={}, tool_events={}",
+                    result.stop_reason, len(result.tool_events),
+                )
+                for ev in (result.tool_events or []):
+                    logger.info("Dream tool_event: name={}, status={}, detail={}", ev.get("name"), ev.get("status"), ev.get("detail", "")[:200])
+            except Exception:
+                logger.exception("Dream Phase 2 failed")
+                result = None
+
+            # Build changelog from tool events
+            changelog: list[str] = []
+            if result and result.tool_events:
+                for event in result.tool_events:
+                    if event["status"] == "ok":
+                        changelog.append(f"{event['name']}: {event['detail']}")
+
+            # Only advance cursor on successful completion to prevent silent loss
+            if result and result.stop_reason == "completed":
+                new_cursor = batch[-1]["cursor"]
+                self.store.set_last_dream_cursor(new_cursor)
+                logger.info(
+                    "Dream done: {} change(s), cursor advanced to {}",
+                    len(changelog), new_cursor,
+                )
+            else:
+                reason = result.stop_reason if result else "exception"
+                logger.warning(
+                    "Dream incomplete ({}): cursor NOT advanced, will retry next cron cycle",
+                    reason,
                 )
 
-        return True
+            self.store.compact_history()
+
+            # Git auto-commit (only when there are actual changes)
+            if changelog and self.store.git.is_initialized():
+                ts = batch[-1]["timestamp"]
+                summary = f"dream: {ts}, {len(changelog)} change(s)"
+                commit_msg = f"{summary}\n\n{analysis.strip()}"
+                sha = self.store.git.auto_commit(commit_msg)
+                if sha:
+                    logger.info("Dream commit: {}", sha)
+
+            # --- Wiki-tree memory (Task 4.5) -----------------------------------
+            # STRICTLY ADDITIVE, best-effort, gated. Reached only after the entire
+            # legacy MEMORY.md path above (Phase 1/2, cursor advance,
+            # compact_history, git commit) has run EXACTLY as in v0.2.0, and only
+            # on the success path (we are past the `if not entries: return False`
+            # guard, so there ARE entries / `batch` is non-empty). The whole block
+            # is wrapped so ANY Ingest/Lint/Vault exception is logged and
+            # SWALLOWED: it cannot alter the cursor, the changelog/git commit, the
+            # compacted history, Phase 1/2, or the `return True` below. With
+            # `wiki_enabled` False (default) this is a true no-op -> Dream is
+            # byte-identical to v0.2.0 (TestDreamWikiDisabledGolden enforces this).
+            if self.wiki_enabled:
+                try:
+                    for slug in self._vaults_for_batch(batch):
+                        vault = Vault(self.store.workspace / "memory" / "users" / slug)
+                        vault.ensure_initialized()
+                        # Same lock key the wiki_note tool takes
+                        # (get_vault_lock(vault_slug(session_key))) so Dream-side
+                        # Ingest/Lint and the agent-side wiki_note tool never
+                        # write one user's vault concurrently (design H2).
+                        async with get_vault_lock(slug):
+                            await run_ingest(
+                                vault, batch, self.provider, self.model,
+                                render_template,
+                            )
+                            run_lint(vault, _date.today())
+                except Exception:
+                    logger.exception(
+                        "wiki ingest/lint failed; legacy memory path intact"
+                    )
+
+            return True
