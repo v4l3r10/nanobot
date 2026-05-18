@@ -53,6 +53,40 @@ class GitStore:
         """Check if the git repo has been initialized."""
         return (self._workspace / ".git").is_dir()
 
+    # -- effective tracked set -------------------------------------------------
+
+    # Per-user wiki vaults live under this prefix (see
+    # ``nanobot.agent.wiki.paths.vault_dir``: ``memory/users/<slug>``). They
+    # are NOT in the static ``_tracked_files`` base; instead they are scanned
+    # dynamically so a stock / wiki-disabled workspace (no ``memory/users/``)
+    # commits byte-identically to before — exactly the static base.
+    _VAULTS_REL = ("memory", "users")
+
+    def _scan_vault_files(self) -> list[str]:
+        """Deterministically scan every file under ``memory/users/**``.
+
+        Returns repo-relative POSIX paths, sorted. Empty when the directory
+        is absent (the stock / wiki-disabled case → no behavior change).
+        """
+        root = self._workspace.joinpath(*self._VAULTS_REL)
+        if not root.is_dir():
+            return []
+        found: list[str] = []
+        for p in root.rglob("*"):
+            if p.is_file():
+                rel = p.relative_to(self._workspace)
+                found.append(rel.as_posix())
+        return sorted(found)
+
+    def _effective_tracked_files(self) -> list[str]:
+        """The full tracked set at the moment of commit/revert.
+
+        ``static base + sorted(files under memory/users/**)``. The static
+        base is preserved verbatim and first so anything else reading
+        ``self._tracked_files`` (init touch, gitignore base) is unaffected.
+        """
+        return list(self._tracked_files) + self._scan_vault_files()
+
     # -- init ------------------------------------------------------------------
 
     def init(self) -> bool:
@@ -118,8 +152,15 @@ class GitStore:
 
     # -- daily operations ------------------------------------------------------
 
-    def auto_commit(self, message: str) -> str | None:
+    def auto_commit(
+        self, message: str, extra_paths: list[str] | None = None
+    ) -> str | None:
         """Stage tracked memory files and commit if there are changes.
+
+        ``extra_paths`` lets callers (notably :meth:`revert`) pass paths that
+        no longer exist on disk so their *deletion* is staged — the dynamic
+        ``memory/users/**`` scan only sees files that still exist, so a
+        reverted-away wiki page would otherwise linger in the next tree.
 
         Returns the short commit SHA, or None if nothing to commit.
         """
@@ -129,14 +170,28 @@ class GitStore:
         try:
             from dulwich import porcelain
 
-            # .gitignore excludes everything except tracked files,
-            # so any staged/unstaged change must be in our files.
+            # .gitignore excludes everything except tracked files, so any
+            # staged/unstaged/untracked change must be in our files. New
+            # per-user vault files (Task 5.1) appear as *untracked* until
+            # first committed — count them too, otherwise a freshly created
+            # wiki vault would never be versioned. gitignore guarantees
+            # untracked entries are only allowlisted vault paths (strays are
+            # ignored, not untracked).
             st = porcelain.status(str(self._workspace))
-            if not st.unstaged and not any(st.staged.values()):
+            if (
+                not st.unstaged
+                and not any(st.staged.values())
+                and not st.untracked
+                and not extra_paths
+            ):
                 return None
 
             msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
-            porcelain.add(str(self._workspace), paths=self._tracked_files)
+            add_paths = self._effective_tracked_files()
+            if extra_paths:
+                seen = set(add_paths)
+                add_paths += [p for p in extra_paths if p not in seen]
+            porcelain.add(str(self._workspace), paths=add_paths)
             sha_bytes = porcelain.commit(
                 str(self._workspace),
                 message=msg_bytes,
@@ -204,6 +259,19 @@ class GitStore:
             lines.append(f"!{d}/")
         for f in self._tracked_files:
             lines.append(f"!{f}")
+        # Re-include the per-user wiki vault subtree (Task 5.1). A single
+        # recursive ``!memory/users/**`` rule is sufficient and minimal: it
+        # un-ignores every descendant of ``memory/users/`` under the leading
+        # ``/*`` deny (empirically verified to stage nested dot-paths such as
+        # ``wiki/.cold/...`` and ``.lint.log``). It is purely additive — when
+        # ``memory/users/`` is absent it matches nothing, so the stock /
+        # wiki-disabled workspace's ``.gitignore`` differs only by this one
+        # match-nothing line and commits byte-identically. It is deliberately
+        # NOT a trailing-slash dir rule, so it does not perturb the existing
+        # ``_build_gitignore`` dir-entry contract for root-only tracked sets.
+        vault_glob = f"!{'/'.join(self._VAULTS_REL)}/**"
+        if vault_glob not in lines:
+            lines.append(vault_glob)
         lines.append("!.gitignore")
         return "\n".join(lines) + "\n"
 
@@ -323,8 +391,24 @@ class GitStore:
     def revert(self, commit: str) -> str | None:
         """Revert (undo) the changes introduced by the given commit.
 
-        Restores all tracked memory files to the state at the commit's parent,
-        then creates a new commit recording the revert.
+        Restores tracked memory files (the legacy base **and** the per-user
+        wiki vault subtree, ``memory/users/**``) to the state at the commit's
+        parent, then creates a new commit recording the revert.
+
+        Revert semantics (Task 5.1 — relied on by 5.2's ``/dream-restore``):
+        the working state is made to match the *parent* tree over the union
+        of (a) the effective tracked set and (b) every path in the parent
+        tree. Concretely:
+
+        * a path present in the parent tree is rewritten to its parent-state
+          content (recreating files the reverted commit *deleted*);
+        * a currently-tracked path **absent** from the parent tree is removed
+          (deleting files the reverted commit *added* — e.g. a new wiki
+          page). Empty parent dirs are pruned so the tree mirrors the parent.
+
+        This is correct for "restore the wiki to a prior commit": files that
+        differ in HEAD vs the target are returned to the target content, and
+        files that exist only on one side are added/removed as needed.
 
         Returns the new commit SHA, or None on failure.
         """
@@ -352,23 +436,68 @@ class GitStore:
                 parent_obj = repo[commit_obj.parents[0]]
                 tree = repo[parent_obj.tree]
 
-                restored: list[str] = []
-                for filepath in self._tracked_files:
-                    content = self._read_blob_from_tree(repo, tree, filepath)
-                    if content is not None:
-                        dest = self._workspace / filepath
-                        dest.write_text(content, encoding="utf-8")
-                        restored.append(filepath)
+                parent_paths = set(self._iter_tree_paths(repo, tree))
+                # Union of what we track now and what existed in the parent so
+                # files added by the reverted commit get pruned and files it
+                # deleted get recreated.
+                targets = set(self._effective_tracked_files()) | parent_paths
 
-            if not restored:
+                touched: list[str] = []
+                deleted: list[str] = []
+                for filepath in sorted(targets):
+                    content = self._read_blob_from_tree(repo, tree, filepath)
+                    dest = self._workspace / filepath
+                    if content is not None:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_text(content, encoding="utf-8")
+                        touched.append(filepath)
+                    elif dest.exists():
+                        # Present now but absent in the parent → undo the add.
+                        dest.unlink()
+                        self._prune_empty_dirs(dest.parent)
+                        touched.append(filepath)
+                        deleted.append(filepath)
+
+            if not touched:
                 return None
 
-            # Commit the restored state
+            # Commit the restored state. Deleted paths are passed explicitly
+            # so their removal is staged (the dynamic scan can't see a file
+            # that no longer exists on disk).
             msg = f"revert: undo {commit}"
-            return self.auto_commit(msg)
+            return self.auto_commit(msg, extra_paths=deleted or None)
         except Exception:
             logger.exception("Git revert failed for {}", commit)
             return None
+
+    def _prune_empty_dirs(self, directory: Path) -> None:
+        """Remove now-empty dirs up to (not including) the workspace root."""
+        ws = self._workspace.resolve()
+        current = directory
+        while current.resolve() != ws and ws in current.resolve().parents:
+            try:
+                next(current.iterdir())
+                return  # not empty
+            except StopIteration:
+                parent = current.parent
+                try:
+                    current.rmdir()
+                except OSError:
+                    return
+                current = parent
+            except FileNotFoundError:
+                return
+
+    @staticmethod
+    def _iter_tree_paths(repo, tree, prefix: str = ""):
+        """Yield every blob path (POSIX, repo-relative) under a tree object."""
+        for name, _mode, sha in tree.items():
+            n = name.decode()
+            obj = repo[sha]
+            if obj.type_name == b"tree":
+                yield from GitStore._iter_tree_paths(repo, obj, prefix + n + "/")
+            elif obj.type_name == b"blob":
+                yield prefix + n
 
     @staticmethod
     def _read_blob_from_tree(repo, tree, filepath: str) -> str | None:
