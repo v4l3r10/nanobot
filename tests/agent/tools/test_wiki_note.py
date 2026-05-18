@@ -783,3 +783,68 @@ async def test_append_then_read_roundtrip(tmp_path):
     out = await t.execute(operation="read", path="people/carol.md")
     assert "EXTRA42" in out
     assert "start" in out
+
+
+async def test_append_rejects_whitespace_only_text(tmp_path):
+    """append must reject whitespace-only text (``"   \\n"``) the same way it
+    rejects missing/empty text: appending only blank lines would just inject
+    noise into the body. The page body must be byte-unchanged (M3)."""
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create",
+        type="people",
+        slug="x",
+        title="X",
+        body="keep",
+    )
+    page_file = _wiki_dir(tmp_path) / "people" / "x.md"
+    before = page_file.read_text(encoding="utf-8")
+
+    out = await t.execute(
+        operation="append", path="people/x.md", text="   \n"
+    )
+    assert out.startswith("Error:"), out
+    assert "text" in out.lower()
+    assert "Traceback" not in out
+
+    # Body must be byte-unchanged: no blank line appended.
+    after = page_file.read_text(encoding="utf-8")
+    assert after == before, f"whitespace append mutated the page:\n{after!r}"
+
+
+async def test_read_cold_path_reheats_in_place(tmp_path):
+    """Reading a page whose path is under ``.cold/`` reheats it IN PLACE
+    (``status: cold``→``hot``, ``last_touched``=today) while leaving the file
+    physically under ``.cold/``. The physical relocation out of ``.cold/`` is
+    Lint's job (Task 4.3) — this locks the documented reheat/``.cold/``
+    hand-off contract (design §4)."""
+    t = _tool(tmp_path)
+    cold_dir = _wiki_dir(tmp_path) / ".cold" / "people"
+    cold_dir.mkdir(parents=True, exist_ok=True)
+    cold_file = cold_dir / "old.md"
+    cold_page = Page(
+        type="people",
+        title="Old",
+        status="cold",
+        created="2020-01-01",
+        updated="2020-01-01",
+        last_touched="2020-01-01",
+        body="archived\n",
+    )
+    cold_file.write_text(serialize_page(cold_page), encoding="utf-8")
+
+    out = await t.execute(operation="read", path=".cold/people/old.md")
+    assert "Traceback" not in out
+    assert "status: hot" in out
+
+    # Reheated IN PLACE: the file is still at the .cold/ path, flipped hot.
+    assert cold_file.exists(), "cold-path file must remain at the .cold/ path"
+    on_disk = parse_page(cold_file.read_text(encoding="utf-8"))
+    assert on_disk.status == "hot"
+    assert on_disk.last_touched == _today()
+
+    # No hot-location copy was created (relocation is Lint's job, not read's).
+    hot_copy = _wiki_dir(tmp_path) / "people" / "old.md"
+    assert not hot_copy.exists(), (
+        "read must NOT relocate out of .cold/ (that is Lint/Task 4.3)"
+    )
