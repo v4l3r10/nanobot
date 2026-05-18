@@ -18,7 +18,9 @@ tasks.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+import re
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -28,7 +30,7 @@ from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.filesystem import _FsTool
 from nanobot.agent.tools.path_utils import is_under
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
-from nanobot.agent.wiki.page import Page, serialize_page
+from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.paths import vault_dir, vault_slug
 from nanobot.agent.wiki.vault import Vault
 from nanobot.utils.atomic import atomic_write_text
@@ -37,13 +39,50 @@ from nanobot.utils.vault_lock import get_vault_lock
 
 _FALLBACK_SESSION_KEY = "unified:default"
 
+# An ASCII control char (codepoint < 0x20 — incl. \n \r \t). Its presence in
+# a model-supplied slug is never legitimate: it signals corruption/injection
+# and is exactly what would split an ``_index.md`` stub across two physical
+# lines (the I1 vector). ``_do_create`` rejects any slug containing one
+# outright rather than mangling it into a different page name — that is the
+# "do NOT silently truncate at a newline" contract, extended: a control-char
+# slug must never silently become a *different* (sanitized) filename either.
+_SLUG_CONTROL = re.compile(r"[\x00-\x1f]")
+# A path separator (`/ \\`), an ASCII control char, or any whitespace →
+# folded to a single `-`. Applied to the RAW slug (before safe_filename, so
+# 'a/b c' → 'a-b-c' not 'a_b-c'); safe_filename maps `/ \\` to `_`, which we
+# want to avoid for the separator case.
+_SLUG_UNSAFE = re.compile(r"[/\\\x00-\x1f]|\s")
+_SLUG_DASH_RUN = re.compile(r"-{2,}")
 
-def _as_lines(text: str) -> set[str]:
+
+def _safe_slug(raw: str) -> str:
+    """Sanitize a model-supplied slug to a single filename-safe component.
+
+    Pipeline (deterministic, per the I1 rule):
+
+    1. Fold every path separator (``/ \\``), ASCII control char (codepoint
+       < 0x20, incl. ``\\n \\r \\t``), and whitespace run to ``-``.
+    2. ``safe_filename`` (strips ``[<>:"/\\|?*]`` and trims ends).
+    3. Collapse consecutive ``-`` and strip leading/trailing ``-._``.
+
+    Returns the sanitized slug, or ``""`` if nothing safe remains. Pure and
+    reused by Task 2.3's append so page and append agree on the on-disk
+    filename. The control-char *rejection* decision (and the empty→error
+    decision) live in ``_do_create``, not here.
+    """
+    s = _SLUG_UNSAFE.sub("-", raw)
+    s = safe_filename(s)
+    s = _SLUG_DASH_RUN.sub("-", s)
+    return s.strip("-._")
+
+
+def _terminated_line_set(text: str) -> set[str]:
     """Existing ``_index.md`` lines, each re-terminated with a single ``\\n``.
 
-    Used for the idempotent stub check: comparing whole, newline-terminated
-    lines (not a raw substring) so ``[[people/al]]`` does not falsely match
-    against an existing ``[[people/alice]]`` stub.
+    Returns a *set* (membership-test only) for the idempotent stub check:
+    comparing whole, newline-terminated lines (not a raw substring) so
+    ``[[people/al]]`` does not falsely match an existing ``[[people/alice]]``
+    stub.
     """
     return {f"{line}\n" for line in text.splitlines()}
 
@@ -104,6 +143,26 @@ class WikiNoteTool(_FsTool, ContextAware):
         # master — copying SCHEMA.md into the vault is a later task.
         (root / "wiki").mkdir(parents=True, exist_ok=True)
         return Vault(root)
+
+    def _vault_lock(self) -> asyncio.Lock:
+        """The per-vault async lock for this session's vault.
+
+        Lock-key derivation is centralised here so Task 2.3's append
+        acquires the *identical* lock as create (same critical section).
+        """
+        return get_vault_lock(vault_slug(self._session_key()))
+
+    def _resolved_in_vault(self, path: Path, vault: Vault) -> Path | None:
+        """Resolve ``path`` and return it iff it stays inside ``vault.wiki_dir``.
+
+        The single containment guard, used for BOTH the page path and the
+        ``_index.md`` path (and reused by Task 2.3). Returns ``None`` when
+        the resolved path escapes the vault so the caller can refuse without
+        ever touching the filesystem (no TOCTOU: the checked path is the one
+        handed to ``atomic_write_text``).
+        """
+        resolved = path.resolve()
+        return resolved if is_under(resolved, vault.wiki_dir) else None
 
     @property
     def name(self) -> str:
@@ -180,6 +239,23 @@ class WikiNoteTool(_FsTool, ContextAware):
             allowed = ", ".join(sorted(schema.types))
             return f"Error: unknown type '{type}'. Allowed: {allowed}"
 
+        # (1b) Slug sanitization (review I1). The model controls ``slug``.
+        # A control char (incl. \n \r \t) would (a) defeat the containment
+        # check (it only guards traversal), (b) corrupt ``_index.md`` into a
+        # two-physical-line stub that breaks the whole-line idempotency check
+        # Lint 4.3 / context 6.1 rely on, and (c) diverge cross-platform
+        # (``alice\nbob.md`` is Linux-accepted / Windows-rejected). A
+        # control-char slug is never legitimate input: reject it outright
+        # rather than silently mangling it into a different page name (the
+        # "do NOT silently truncate at a newline" contract). Separators and
+        # whitespace are benign and are folded to ``-`` by _safe_slug.
+        safe_slug = _safe_slug(slug)
+        if _SLUG_CONTROL.search(slug) or not safe_slug:
+            return (
+                f"Error: invalid slug {slug!r} — must contain "
+                "filename-safe characters"
+            )
+
         today = datetime.date.today().isoformat()
         page = Page(
             type=type,
@@ -194,24 +270,27 @@ class WikiNoteTool(_FsTool, ContextAware):
             body=body,
         )
 
-        # (2) Frontmatter admission gate (design §3/P7). The tool always
-        # constructs a complete Page so this normally passes, but it is the
-        # explicit gate the design mandates — keep it, do not skip.
+        # (2) Frontmatter admission gate (design §3/P7). Derive ``fm`` from
+        # the SAME bytes that get written: serialize the page, parse the
+        # frontmatter back, and project its fields. This makes the gate
+        # validate the *real* serialized frontmatter instead of a parallel
+        # hand-built dict that could silently drift from serialize_page.
+        serialized = serialize_page(page)
+        parsed_back = parse_page(serialized)
         fm = {
-            "type": page.type,
-            "title": page.title,
-            "status": page.status,
-            "created": page.created,
-            "updated": page.updated,
-            "last_touched": page.last_touched,
-            "tags": page.tags,
-            "links_out": page.links_out,
+            "type": parsed_back.type,
+            "title": parsed_back.title,
+            "status": parsed_back.status,
+            "created": parsed_back.created,
+            "updated": parsed_back.updated,
+            "last_touched": parsed_back.last_touched,
+            "tags": parsed_back.tags,
+            "links_out": parsed_back.links_out,
         }
         fm_errors = schema.validate_frontmatter(fm)
         if fm_errors:
             return "Error: " + "; ".join(fm_errors)
 
-        safe_slug = safe_filename(slug)
         try:
             target = vault.page_path(type, safe_slug)
         except (KeyError, ValueError) as e:  # pragma: no cover - gated above
@@ -222,11 +301,11 @@ class WikiNoteTool(_FsTool, ContextAware):
         # is whatever the per-vault SCHEMA.md declares with no single-component
         # validation; a folder of '../...' or an absolute path would let
         # atomic_write_text (parent.mkdir(parents=True)) write OUTSIDE the
-        # vault. Resolve the destination and pass the *resolved* path to
-        # atomic_write_text so the checked path and the written path are
-        # identical (no TOCTOU).
-        resolved = target.resolve()
-        if not is_under(resolved, vault.wiki_dir):
+        # vault. _resolved_in_vault resolves the destination and only returns
+        # it when it stays inside the vault, so the checked path and the
+        # written path are identical (no TOCTOU).
+        resolved = self._resolved_in_vault(target, vault)
+        if resolved is None:
             return (
                 f"Error: refusing to write {type}/{slug} "
                 "— resolves outside the vault"
@@ -234,8 +313,8 @@ class WikiNoteTool(_FsTool, ContextAware):
 
         folder = schema.folder(type)
         index_path = vault.wiki_dir / folder / "_index.md"
-        resolved_index = index_path.resolve()
-        if not is_under(resolved_index, vault.wiki_dir):
+        resolved_index = self._resolved_in_vault(index_path, vault)
+        if resolved_index is None:
             return (
                 f"Error: refusing to write the {type} index "
                 "— resolves outside the vault"
@@ -244,7 +323,7 @@ class WikiNoteTool(_FsTool, ContextAware):
         # (5) Page-write + index-append are ONE critical section under the
         # per-vault async lock so a concurrent Dream-Lint pass or another
         # turn cannot interleave a half-written page/index (design H2).
-        async with get_vault_lock(vault_slug(self._session_key())):
+        async with self._vault_lock():
             # (3) Duplicate refusal: never overwrite an existing page; the
             # existing body must survive byte-for-byte. Checked inside the
             # lock so two concurrent creates of the same slug can't race.
@@ -255,7 +334,8 @@ class WikiNoteTool(_FsTool, ContextAware):
                 )
 
             try:
-                atomic_write_text(resolved, serialize_page(page))
+                # Write the exact bytes the frontmatter gate validated.
+                atomic_write_text(resolved, serialized)
             except OSError as e:
                 return f"Error: {e}"
 
@@ -269,13 +349,16 @@ class WikiNoteTool(_FsTool, ContextAware):
                     current = resolved_index.read_text(encoding="utf-8")
                     # Idempotent re-run after a partial failure: if the exact
                     # stub line is already present, leave the index untouched.
-                    if stub not in _as_lines(current):
+                    if stub not in _terminated_line_set(current):
                         new_text = current
                         if new_text and not new_text.endswith("\n"):
                             new_text += "\n"
                         atomic_write_text(resolved_index, new_text + stub)
                 else:
-                    header = f"# {type} index\n\n"
+                    # M3: header uses ``folder`` (not ``type``) so a schema
+                    # where folder != type stays coherent and matches what
+                    # Lint 4.3 regenerates ("- [[{folder}/...]]" stubs).
+                    header = f"# {folder} index\n\n"
                     atomic_write_text(resolved_index, header + stub)
             except OSError as e:
                 # The page is written; surface the index failure honestly so

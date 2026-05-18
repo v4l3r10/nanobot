@@ -279,3 +279,114 @@ async def test_create_acquires_vault_lock(tmp_path):
     out = await task
     assert "alice" in out.lower()
     assert (_wiki_dir(tmp_path) / "people" / "alice.md").exists()
+
+
+# --- Task 2.2 review follow-up: slug sanitization (I1) + M2 gate coverage ---
+
+
+async def test_create_rejects_newline_slug(tmp_path):
+    """A slug containing a newline must be rejected with a friendly error and
+    must NOT corrupt the MOC into a two-physical-line stub (I1).
+
+    Before the fix, ``safe_filename`` left ``\\n`` untouched: the page
+    filename became ``alice\\nbob.md`` and the ``_index.md`` stub became the
+    two physical lines ``- [[people/alice`` / ``bob]]``, breaking the
+    whole-line idempotency check Lint 4.3 / context 6.1 rely on.
+    """
+    t = _tool(tmp_path)
+    out = await t.execute(
+        operation="create",
+        type="people",
+        slug="alice\nbob",
+        title="X",
+        body="b",
+    )
+    assert isinstance(out, str)
+    assert out.startswith("Error:"), out
+    assert "invalid slug" in out.lower()
+    assert "Traceback" not in out
+
+    wiki_dir = _wiki_dir(tmp_path)
+    # No page filename anywhere may contain a newline.
+    for p in _all_md_files(wiki_dir):
+        assert "\n" not in p.name, f"page filename contains newline: {p!r}"
+
+    # The _index.md must either not exist or contain no broken two-physical-
+    # line stub (an opening ``[[people/alice`` with no closing ``]]`` on the
+    # same line).
+    index = wiki_dir / "people" / "_index.md"
+    if index.exists():
+        for line in index.read_text(encoding="utf-8").splitlines():
+            if "[[people/alice" in line:
+                assert "]]" in line, (
+                    f"broken two-line stub in _index.md: {line!r}"
+                )
+
+
+async def test_create_sanitizes_slug_separators(tmp_path):
+    """Path separators / whitespace in a slug collapse to a single safe
+    component and the page + a single well-formed stub are written."""
+    t = _tool(tmp_path)
+    out = await t.execute(
+        operation="create",
+        type="people",
+        slug="a/b c",
+        title="X",
+        body="body",
+    )
+    assert out.startswith("Created page"), out
+    # 'a/b c' -> safe_filename '/' -> '_' giving 'a_b c', then our rule maps
+    # path-sep/whitespace to '-' and collapses: 'a-b-c'.
+    assert "a-b-c.md" in out
+
+    wiki_dir = _wiki_dir(tmp_path)
+    page = wiki_dir / "people" / "a-b-c.md"
+    assert page.is_file(), f"sanitized page not written; files: {_all_md_files(wiki_dir)}"
+
+    index = wiki_dir / "people" / "_index.md"
+    text = index.read_text(encoding="utf-8")
+    stub_lines = [
+        ln for ln in text.splitlines() if "[[people/a-b-c]]" in ln
+    ]
+    assert stub_lines == ["- [[people/a-b-c]]"], (
+        f"expected one well-formed stub line, got: {text!r}"
+    )
+
+
+async def test_frontmatter_gate_rejects_when_schema_requires_extra(tmp_path):
+    """A per-vault SCHEMA.md whose required_frontmatter names a key the tool
+    never sets must make the (now real) frontmatter gate refuse, writing
+    nothing. This makes the M2 gate genuinely covered."""
+    t = _tool(tmp_path)
+    wiki_dir = _wiki_dir(tmp_path)
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+
+    schema_md = (
+        "```yaml\n"
+        "version: 1\n"
+        "types:\n"
+        "  people:\n"
+        '    folder: "people"\n'
+        "    cold_after_days: null\n"
+        "required_frontmatter:\n"
+        "  - type\n"
+        "  - title\n"
+        "  - owner\n"
+        "```\n"
+    )
+    (wiki_dir / "SCHEMA.md").write_text(schema_md, encoding="utf-8")
+
+    out = await t.execute(
+        operation="create",
+        type="people",
+        slug="alice",
+        title="Alice",
+        body="hi",
+    )
+    assert out.startswith("Error:"), out
+    assert "owner" in out
+    assert "Traceback" not in out
+
+    # Nothing may have been written (no page, no index).
+    written = [p for p in _all_md_files(wiki_dir) if p.name != "SCHEMA.md"]
+    assert written == [], f"unexpected files written: {written}"
