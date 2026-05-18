@@ -60,6 +60,22 @@ if TYPE_CHECKING:
 # (`get_vault_lock(slug)`, acquired inside the wiki block of `run()`). The
 # `wiki_note` tool takes only the per-vault lock and NEVER this lock, so there
 # is no lock-ordering inversion and no deadlock cycle.
+#
+# Cross-loop footgun (test isolation only, NOT a prod concern): the FIRST time
+# this module-global lock is *contended* it permanently binds to that event
+# loop; contending it again from a DIFFERENT loop in the same process raises
+# `RuntimeError: <Lock> is bound to a different event loop`. This is only
+# reachable under pytest's per-test event loops (`asyncio_mode=auto`); the
+# production gateway is a single `asyncio.run` per process so import-time
+# construction is always safe. The test suite handles this with an autouse
+# fixture that resets the module global between tests (see
+# tests/agent/test_dream_wiki.py).
+#
+# M1: the lock is intentionally held across the provider LLM calls (Phase 1/2
+# plus the wiki Ingest) so Dream cycles can never overlap; this is bounded by
+# the provider SDK default request timeout, and an explicit outer Dream timeout
+# / provider client-timeout is a documented production prerequisite before
+# enabling `wiki_enabled=true` (tracked in the plan).
 _DREAM_RUN_LOCK = asyncio.Lock()
 
 
