@@ -495,3 +495,14 @@ class TestJournal:
         store.write_journal("2026-05-08", "second")
 
         assert store.read_journal("2026-05-08") == "second"
+
+
+class TestAtomicMemoryWrites:
+    def test_write_memory_leaves_no_tmp_file(self, tmp_path):
+        from nanobot.agent.memory import MemoryStore
+        s = MemoryStore(tmp_path)
+        s.write_memory("# Memory\n- fact")
+        names = sorted(p.name for p in (tmp_path / "memory").iterdir())
+        assert "MEMORY.md" in names
+        assert not any(n.endswith(".tmp") for n in names)
+        assert s.read_memory() == "# Memory\n- fact"
