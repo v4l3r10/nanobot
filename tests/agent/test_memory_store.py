@@ -419,3 +419,14 @@ class TestLegacyHistoryMigration:
         assert entries[0]["timestamp"] == "2026-04-01 10:00"
         assert "Broken" in entries[0]["content"]
         assert "migration." in entries[0]["content"]
+
+
+class TestAtomicMemoryWrites:
+    def test_write_memory_leaves_no_tmp_file(self, tmp_path):
+        from nanobot.agent.memory import MemoryStore
+        s = MemoryStore(tmp_path)
+        s.write_memory("# Memory\n- fact")
+        names = sorted(p.name for p in (tmp_path / "memory").iterdir())
+        assert "MEMORY.md" in names
+        assert not any(n.endswith(".tmp") for n in names)
+        assert s.read_memory() == "# Memory\n- fact"

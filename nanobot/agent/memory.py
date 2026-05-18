@@ -18,6 +18,7 @@ from loguru import logger
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.session.manager import Session
+from nanobot.utils.atomic import atomic_write_text
 from nanobot.utils.gitstore import GitStore
 from nanobot.utils.helpers import (
     ensure_dir,
@@ -206,7 +207,7 @@ class MemoryStore:
         return self.read_file(self.memory_file)
 
     def write_memory(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+        atomic_write_text(self.memory_file, content)
 
     # -- SOUL.md -------------------------------------------------------------
 
@@ -214,7 +215,7 @@ class MemoryStore:
         return self.read_file(self.soul_file)
 
     def write_soul(self, content: str) -> None:
-        self.soul_file.write_text(content, encoding="utf-8")
+        atomic_write_text(self.soul_file, content)
 
     # -- USER.md -------------------------------------------------------------
 
@@ -222,7 +223,7 @@ class MemoryStore:
         return self.read_file(self.user_file)
 
     def write_user(self, content: str) -> None:
-        self.user_file.write_text(content, encoding="utf-8")
+        atomic_write_text(self.user_file, content)
 
     # -- context injection (used by context.py) ------------------------------
 
