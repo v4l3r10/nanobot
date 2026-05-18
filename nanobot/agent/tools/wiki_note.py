@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import re
+import unicodedata
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,7 @@ from nanobot.agent.tools.path_utils import is_under
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.paths import vault_dir, vault_slug
-from nanobot.agent.wiki.vault import Vault
+from nanobot.agent.wiki.vault import _COLD_COMPONENT, _NON_PAGE_NAMES, Vault
 from nanobot.utils.atomic import atomic_write_text
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.vault_lock import get_vault_lock
@@ -54,6 +55,14 @@ _SLUG_CONTROL = re.compile(r"[\x00-\x1f]")
 _SLUG_UNSAFE = re.compile(r"[/\\\x00-\x1f]|\s")
 _SLUG_DASH_RUN = re.compile(r"-{2,}")
 
+# Conservative cross-platform cap on the sanitized slug *component* (R2).
+# A page filename is ``{slug}.md`` plus the atomic-write ``.tmp`` suffix;
+# 80 keeps the basename well under every common limit (NAME_MAX 255, and
+# Windows' practical per-component ceiling) regardless of the vault's
+# absolute path depth, so a long slug is a deterministic *trim* on every
+# OS rather than a Linux-accepted / Windows-``WinError 123`` divergence.
+_SLUG_MAX_LEN = 80
+
 
 def _safe_slug(raw: str) -> str:
     """Sanitize a model-supplied slug to a single filename-safe component.
@@ -64,16 +73,79 @@ def _safe_slug(raw: str) -> str:
        < 0x20, incl. ``\\n \\r \\t``), and whitespace run to ``-``.
     2. ``safe_filename`` (strips ``[<>:"/\\|?*]`` and trims ends).
     3. Collapse consecutive ``-`` and strip leading/trailing ``-._``.
+    4. Clamp to ``_SLUG_MAX_LEN`` chars (truncate, then re-strip trailing
+       ``-._`` so a cut never lands on a dangling separator) — R2: a long
+       slug is benign, so trim it deterministically instead of letting it
+       diverge cross-platform (Linux-accept / Windows ``WinError 123``).
 
-    Returns the sanitized slug, or ``""`` if nothing safe remains. Pure and
-    reused by Task 2.3's append so page and append agree on the on-disk
-    filename. The control-char *rejection* decision (and the empty→error
-    decision) live in ``_do_create``, not here.
+    Returns the sanitized slug, or ``""`` if nothing safe remains (incl.
+    a slug that clamps to empty — the existing empty→error path in
+    ``_do_create`` handles that). Benign Unicode letters/digits (accented
+    latin, CJK) are preserved: this is NOT an ASCII-only fold; the Cc/Cf
+    control/format *rejection* (and the empty→error decision) live in
+    ``_do_create``, not here. Pure and reused by Task 2.3's append so page
+    and append agree on the on-disk filename.
     """
     s = _SLUG_UNSAFE.sub("-", raw)
     s = safe_filename(s)
     s = _SLUG_DASH_RUN.sub("-", s)
-    return s.strip("-._")
+    s = s.strip("-._")
+    if len(s) > _SLUG_MAX_LEN:
+        s = s[:_SLUG_MAX_LEN].rstrip("-._")
+    return s
+
+
+def _has_unicode_control(raw: str) -> bool:
+    """Whether ``raw`` contains a Unicode category ``Cc`` or ``Cf`` codepoint.
+
+    R3: widens the ASCII-control reject (``_SLUG_CONTROL``, ``[\\x00-\\x1f]``)
+    to the full Unicode control (``Cc``) and format (``Cf``) classes so
+    bidi-override / zero-width / BOM chars (U+202E, U+200E/200F, U+2066-2069,
+    U+FEFF, U+0085, U+00A0…) can never survive ``_safe_slug`` into a filename
+    or an ``_index.md`` wikilink. ASCII control is a strict subset of ``Cc``,
+    so this fully subsumes the prior behaviour. Benign Unicode letters/digits
+    (accented latin, CJK) are *not* in ``Cc``/``Cf`` and pass through.
+    """
+    return any(unicodedata.category(ch) in {"Cc", "Cf"} for ch in raw)
+
+
+def _is_reserved_slug(raw: str, safe_slug: str) -> bool:
+    """Whether a slug would yield a non-page / structural / hidden file.
+
+    R1: a page is written at ``<folder>/{safe_slug}.md`` but
+    :meth:`Vault.iter_pages` filters by *basename* against
+    :data:`nanobot.agent.wiki.vault._NON_PAGE_NAMES` regardless of folder,
+    so ``slug="SCHEMA"`` produces a ``SCHEMA.md`` Ingest/Lint/``is_empty``
+    can never see — while a dangling stub is still appended to ``_index.md``
+    (a silently-broken phantom page reachable from normal model operation).
+
+    Two checks, because ``_safe_slug`` strips leading ``-._`` (so a raw
+    ``"_index"`` / ``".cold"`` / ``".hidden"`` has already lost its
+    structural prefix by the time we see ``safe_slug``):
+
+    * the *sanitized* basename ``f"{safe_slug}.md"`` colliding with the
+      authoritative reserved set (catches ``SCHEMA`` → ``SCHEMA.md``); and
+    * the *raw* slug being a structural/hidden/cold name — it starts with
+      ``.`` or ``_`` (hidden / ``_index``-class) or its sanitized form is
+      the cold-archive marker component or any reserved stem.
+
+    The reserved set is *referenced* from the authoritative ``vault``
+    module constants (no hardcoded duplicate) so it stays in lockstep if
+    ``iter_pages``' filter ever changes.
+    """
+    _reserved_stems = {n[:-3] for n in _NON_PAGE_NAMES if n.endswith(".md")}
+    stripped = raw.strip()
+    if f"{safe_slug}.md" in _NON_PAGE_NAMES:
+        return True
+    if safe_slug == _COLD_COMPONENT or safe_slug in _reserved_stems:
+        return True
+    # Hidden / structural raw intent (leading '.' or '_'), and the cold
+    # marker spelled with its leading dot.
+    if stripped.startswith((".", "_")):
+        return True
+    if stripped == _COLD_COMPONENT:
+        return True
+    return False
 
 
 def _terminated_line_set(text: str) -> set[str]:
@@ -249,11 +321,35 @@ class WikiNoteTool(_FsTool, ContextAware):
         # rather than silently mangling it into a different page name (the
         # "do NOT silently truncate at a newline" contract). Separators and
         # whitespace are benign and are folded to ``-`` by _safe_slug.
+        #
+        # R3 widens the control-char reject from ASCII (`_SLUG_CONTROL`,
+        # kept as a fast subset path) to the full Unicode Cc/Cf classes so
+        # bidi-override / zero-width / BOM chars cannot survive into a
+        # filename or MOC wikilink. Benign Unicode letters/digits (accented
+        # latin, CJK) are not Cc/Cf and pass through _safe_slug unchanged.
         safe_slug = _safe_slug(slug)
-        if _SLUG_CONTROL.search(slug) or not safe_slug:
+        if (
+            _SLUG_CONTROL.search(slug)
+            or _has_unicode_control(slug)
+            or not safe_slug
+        ):
             return (
                 f"Error: invalid slug {slug!r} — must contain "
                 "filename-safe characters"
+            )
+
+        # R1: refuse a slug whose resulting basename collides with a
+        # vault-structural / non-page name (``SCHEMA.md``, ``_index.md``),
+        # the cold-archive marker, or a hidden/structural (leading
+        # ``.``/``_``) name. Such a page is permanently invisible to
+        # iter_pages (basename filter, any folder) yet still gets a
+        # dangling ``_index.md`` stub — a silently-broken phantom page.
+        # Rejected here, BEFORE any filesystem touch, so nothing is
+        # written and no stub is appended.
+        if _is_reserved_slug(slug, safe_slug):
+            return (
+                f"Error: reserved/invalid slug {slug!r} — collides with a "
+                "structural or hidden vault filename"
             )
 
         today = datetime.date.today().isoformat()
