@@ -84,6 +84,10 @@ Hardening: **scritture atomiche** (`tmp` + `os.replace`) → fix **H1**; **file-
 - Navigazione **model-driven** via tool `wiki_note.read` seguendo i wikilink (niente embeddings).
 - Operazione `search` (keyword/tag/recency su **hot + cold**) per la discoverability di pagine non linkate dal MOC.
 - **Reheat-on-read:** una lettura aggiorna `last_touched`; se la pagina era `cold` torna `status: hot`; il prossimo Lint la rimuove fisicamente da `.cold/`.
+  - **Hand-off reheat / `.cold/` (contratto pinnato per il Lint, milestone 4.3):**
+    - Leggere una pagina il cui path è sotto `.cold/` la reidrata **in place** (`status: cold`→`hot`, `last_touched`=oggi) lasciandola **fisicamente** in `.cold/`.
+    - È compito del **Lint** (fase del Dream, milestone 4.3) **ricollocare fisicamente fuori** da `.cold/` ogni pagina con `status: hot` che si trova ancora sotto un componente `.cold` (chiave di rilocazione: `status == "hot" and ".cold" in path.parts`).
+    - `append` invece **rifiuta** i path sotto `.cold/` (le pagine fredde si riattivano solo via `read`); questa asimmetria *read-reheats / append-refuses* è voluta.
 
 Questo rimpiazza la raccomandazione **P1** (indice semantico) con navigazione esplicita wikilink + MOC + search keyword — scelta deliberata: niente vector store.
 

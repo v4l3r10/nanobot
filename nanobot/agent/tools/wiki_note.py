@@ -329,11 +329,15 @@ class WikiNoteTool(_FsTool, ContextAware):
                 return current
             page.status = "hot"
             page.last_touched = datetime.date.today().isoformat()
+            # M2: serialize once so the persisted bytes and the returned
+            # bytes are guaranteed identical (no drift if serialization
+            # ever becomes nondeterministic).
+            out = serialize_page(page)
             try:
-                atomic_write_text(target, serialize_page(page))
+                atomic_write_text(target, out)
             except OSError as e:
                 return f"Error: {e}"
-            return serialize_page(page)
+            return out
 
     async def _do_append(self, path: str | None, text: str | None) -> str:
         """Append ``text`` to an existing page's body and bump its freshness.
@@ -350,7 +354,9 @@ class WikiNoteTool(_FsTool, ContextAware):
         """
         if not path:
             return "Error: 'path' is required for append"
-        if not text:
+        # M3: reject missing/empty AND whitespace-only text. Appending
+        # ``"\n"`` / ``"   "`` would only inject blank lines into the body.
+        if text is None or not text.strip():
             return "Error: 'text' is required for append"
 
         vault = self._vault()
@@ -393,6 +399,9 @@ class WikiNoteTool(_FsTool, ContextAware):
 
             # Exactly one separating newline between old body and new text,
             # and a trailing newline so subsequent appends stay clean.
+            # Deliberate: pre-existing trailing blank lines in the body are
+            # NOT collapsed here — body normalization is Lint's job (Task
+            # 4.3); append must not rewrite prior body bytes.
             body = page.body
             if body and not body.endswith("\n"):
                 body += "\n"
