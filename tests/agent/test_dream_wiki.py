@@ -46,6 +46,40 @@ from nanobot.agent.runner import AgentRunResult
 from nanobot.agent.wiki.paths import vault_slug
 from nanobot.utils.vault_lock import get_vault_lock
 
+# --- Cross-loop lock isolation (review follow-up I1) -------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_dream_run_lock():
+    """Neutralize the module-global ``_DREAM_RUN_LOCK`` cross-loop bind footgun.
+
+    ``nanobot.agent.memory._DREAM_RUN_LOCK`` is a deliberate process-wide
+    module-global ``asyncio.Lock`` (reviewer-mandated; see the comment block on
+    it in ``memory.py``). On first *contention* it permanently binds to that
+    event loop. Production is a single ``asyncio.run`` per process so this is a
+    non-issue there — but pytest runs each ``async def`` test on its OWN event
+    loop (``asyncio_mode=auto``). Once a test *contends* the lock
+    (``test_concurrent_run_serialized`` does, via two gathered ``dream.run()``s),
+    the binding leaks: any later cross-loop *contended* ``Dream.run()`` — or an
+    unrelated test that happens to contend it — would raise
+    ``RuntimeError: <Lock> is bound to a different event loop`` and could mask a
+    real regression in this golden gate.
+
+    We swap the module global for a FRESH unbound ``asyncio.Lock()`` in
+    teardown. Replacing the object (vs. poking private ``_loop`` internals) is
+    the cleanest reset and re-establishes the import-time invariant ("no loop
+    bound until first contention") for the next test's loop. The reset runs in
+    TEARDOWN (post-yield), so within any single test the identity invariant
+    still holds: ``test_guard_is_module_global_strong_ref`` observes the SAME
+    object for the whole test (its ``is`` assertions never cross the reset), and
+    ``test_concurrent_run_serialized`` serializes on one stable object for its
+    whole body — the swap only takes effect once the test has finished. This is
+    purely test isolation; no production behavior changes.
+    """
+    yield
+    memory_mod._DREAM_RUN_LOCK = asyncio.Lock()
+
+
 # --- Fixtures copied verbatim from tests/agent/test_dream.py -----------------
 # (module-local there; not exported via conftest.py — see module docstring)
 
@@ -450,3 +484,62 @@ class TestDreamConcurrencyGuard:
         # was NOT consolidated twice.
         mock_provider.chat_with_retry.assert_called_once()
         mock_runner.run.assert_called_once()
+
+    def test_dream_lock_survives_sequential_loops(
+        self, store, mock_provider, mock_runner,
+    ):
+        """A completed ``dream.run()`` in one event loop must not poison a
+        ``dream.run()`` in a SUBSEQUENT, distinct event loop (review I1).
+
+        This is the cross-loop scenario the autouse ``_reset_dream_run_lock``
+        fixture neutralizes: without the reset, a *contended* lock binding
+        leaked from an earlier test would make the second loop here raise
+        ``RuntimeError: <Lock> is bound to a different event loop``. We drive
+        two FULL ``dream.run()`` cycles, each on its own freshly-created loop
+        via ``asyncio.run`` (this test is intentionally a plain ``def`` — NOT
+        an ``async def`` — so it owns loop creation rather than running on
+        pytest's per-test loop), and assert no ``RuntimeError`` escapes.
+        Deterministic: no sleeps, no concurrency, mocks return immediately.
+        """
+        def _one_full_run() -> bool:
+            # Fresh store per loop so each run actually does work (cursor 0→2)
+            # and the assertion below is meaningful, independent of order.
+            s = MemoryStore(store.workspace)
+            s.write_soul("# Soul\n- Helpful")
+            s.write_user("# User\n- Developer")
+            s.write_memory("# Memory\n- Project X active")
+            s.append_history("event 1")
+            s.append_history("event 2")
+
+            provider = MagicMock()
+            provider.chat_with_retry = AsyncMock(
+                return_value=MagicMock(content="New fact"),
+            )
+            d = Dream(store=s, provider=provider, model="m", max_batch_size=5)
+            d._runner = MagicMock()
+            d._runner.run = AsyncMock(return_value=_make_run_result(
+                tool_events=[{"name": "edit_file", "status": "ok",
+                              "detail": "memory/MEMORY.md"}],
+            ))
+            d.wiki_enabled = False
+            return asyncio.run(d.run())
+
+        # Loop #1: completes (and contends nothing — single run). The autouse
+        # fixture would also reset between tests, but the regression we lock is
+        # specifically two runs on two loops WITHIN one test surviving cleanly.
+        first = _one_full_run()
+        # Reset exactly as the autouse teardown does, simulating the next test's
+        # fresh module global, then run again on a brand-new loop.
+        memory_mod._DREAM_RUN_LOCK = asyncio.Lock()
+        # Loop #2: a NEW event loop. Must not raise "bound to a different
+        # event loop"; pytest.fail makes any RuntimeError explicit.
+        try:
+            second = _one_full_run()
+        except RuntimeError as exc:  # pragma: no cover - this is the failure
+            pytest.fail(
+                f"_DREAM_RUN_LOCK leaked an event-loop binding across "
+                f"sequential loops (review I1 regression): {exc!r}"
+            )
+
+        assert first is True
+        assert second is True
