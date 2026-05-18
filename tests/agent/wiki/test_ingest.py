@@ -16,7 +16,15 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-from nanobot.agent.wiki.ingest import IngestReport, run_ingest
+from nanobot.agent.tools import wiki_note as _wn
+from nanobot.agent.wiki.ingest import (
+    _MAX_BODY_CHARS,
+    _MAX_DIRECTIVES,
+    _safe_slug,
+    _slug_ok,
+    IngestReport,
+    run_ingest,
+)
 from nanobot.agent.wiki.lint import run_lint
 from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.vault import Vault
@@ -66,7 +74,7 @@ def _write_page(vault: Vault, type_: str, slug: str, page: Page) -> Path:
 # --------------------------------------------------------------------------- #
 async def test_empty_history_skips_provider(tmp_path):
     vault = _vault(tmp_path)
-    provider = _provider("[PAGE people alice]\nshould never run")
+    provider = _provider("[PAGE people/alice]\nshould never run")
     report = await run_ingest(vault, [], provider, "m", render_template)
 
     provider.chat_with_retry.assert_not_called()
@@ -83,7 +91,7 @@ async def test_empty_history_skips_provider(tmp_path):
 # --------------------------------------------------------------------------- #
 async def test_page_directive_creates_lint_ingestible_page(tmp_path):
     vault = _vault(tmp_path)
-    provider = _provider("[PAGE people alice]\nAlice leads payments.")
+    provider = _provider("[PAGE people/alice]\nAlice leads payments.")
     report = await run_ingest(
         vault, _entries("alice runs the payments team"), provider, "m",
         render_template,
@@ -235,7 +243,7 @@ async def test_garbage_lines_counted_valid_applied(tmp_path):
     out = (
         "here is some prose the model should not have emitted\n"
         "[GARBAGE not a directive]\n"
-        "[PAGE people carol]\nCarol is an engineer.\n"
+        "[PAGE people/carol]\nCarol is an engineer.\n"
         "[PAGE]\n"  # malformed header
         "trailing junk\n"
     )
@@ -253,7 +261,7 @@ async def test_garbage_lines_counted_valid_applied(tmp_path):
 # --------------------------------------------------------------------------- #
 async def test_unknown_type_not_created(tmp_path):
     vault = _vault(tmp_path)
-    provider = _provider("[PAGE aliens x]\nThey exist.")
+    provider = _provider("[PAGE aliens/x]\nThey exist.")
     report = await run_ingest(
         vault, _entries("aliens"), provider, "m", render_template
     )
@@ -267,18 +275,21 @@ async def test_unknown_type_not_created(tmp_path):
 # --------------------------------------------------------------------------- #
 async def test_slug_sanitized_to_safe_component(tmp_path):
     vault = _vault(tmp_path)
-    provider = _provider("[PAGE people Bad Slug!!]\nMessy slug person.")
+    provider = _provider("[PAGE people/Bad Slug!!]\nMessy slug person.")
     report = await run_ingest(
         vault, _entries("messy"), provider, "m", render_template
     )
-    # deterministic outcome: sanitized to 'bad-slug'
-    assert vault.page_path("people", "bad-slug").exists()
-    assert "people/bad-slug.md" in report.created
+    # M1: case/Unicode are now PRESERVED (parity with wiki_note._safe_slug,
+    # which folds whitespace to '-' but does NOT lowercase): 'Bad Slug!!'
+    # -> 'Bad-Slug!!' deterministically (same filename the agent tool would
+    # produce for the same entity, so dual-write cannot diverge).
+    assert vault.page_path("people", "Bad-Slug!!").exists()
+    assert "people/Bad-Slug!!.md" in report.created
 
 
 async def test_reserved_slug_skipped(tmp_path):
     vault = _vault(tmp_path)
-    provider = _provider("[PAGE people SCHEMA]\nReserved.")
+    provider = _provider("[PAGE people/SCHEMA]\nReserved.")
     report = await run_ingest(
         vault, _entries("reserved"), provider, "m", render_template
     )
@@ -288,9 +299,10 @@ async def test_reserved_slug_skipped(tmp_path):
 
 async def test_control_char_slug_skipped(tmp_path):
     vault = _vault(tmp_path)
-    # tab inside the slug header -> token still parses but sanitizes; an
-    # all-control slug sanitizes to empty -> skipped to report.unknown.
-    provider = _provider("[PAGE people \x01\x02]\nControl only.")
+    # M1: a raw slug containing an ASCII/Unicode control char is REJECTED
+    # outright (parity with wiki_note: never silently mangled into a
+    # different page name) -> recorded in report.unknown, no write, no crash.
+    provider = _provider("[PAGE people/\x01\x02]\nControl only.")
     report = await run_ingest(
         vault, _entries("ctrl"), provider, "m", render_template
     )
@@ -303,7 +315,7 @@ async def test_control_char_slug_skipped(tmp_path):
 # --------------------------------------------------------------------------- #
 async def test_single_provider_call_no_tools(tmp_path):
     vault = _vault(tmp_path)
-    provider = _provider("[PAGE people dave]\nDave.")
+    provider = _provider("[PAGE people/dave]\nDave.")
     await run_ingest(vault, _entries("dave"), provider, "m", render_template)
     assert provider.chat_with_retry.await_count == 1
     _, kwargs = provider.chat_with_retry.call_args
@@ -324,9 +336,9 @@ async def test_single_provider_call_no_tools(tmp_path):
 # --------------------------------------------------------------------------- #
 async def test_determinism_identical_bytes(tmp_path):
     out = (
-        "[PAGE people erin]\nErin is the SRE lead.\n"
+        "[PAGE people/erin]\nErin is the SRE lead.\n"
         "[APPEND projects/migration]\nMigration kicked off.\n"
-        "[PAGE concepts slo]\nSLO = service level objective.\n"
+        "[PAGE concepts/slo]\nSLO = service level objective.\n"
     )
     entries = _entries("erin", "migration", "slo")
 
@@ -358,3 +370,231 @@ async def test_provider_error_no_writes(tmp_path):
     )
     assert report.changed is False
     assert list(vault.iter_pages(include_cold=True)) == []
+
+
+# --------------------------------------------------------------------------- #
+# C1 — directive count is bounded under the per-vault Dream lock
+# --------------------------------------------------------------------------- #
+async def test_directive_count_capped(tmp_path):
+    vault = _vault(tmp_path)
+    n = _MAX_DIRECTIVES + 50
+    out = "".join(
+        f"[PAGE people/p{i:05d}]\nPerson number {i}.\n" for i in range(n)
+    )
+    report = await run_ingest(
+        vault, _entries("many"), _provider(out), "m", render_template
+    )
+    pages = [
+        rel for rel, _ in vault.iter_pages(include_cold=True)
+    ]
+    assert len(report.created) == _MAX_DIRECTIVES
+    assert len(pages) == _MAX_DIRECTIVES
+    assert report.dropped == 50
+    # Deterministic: the FIRST _MAX_DIRECTIVES by document order survived;
+    # the surplus tail (p00200..) was dropped.
+    assert vault.page_path("people", "p00000").exists()
+    assert vault.page_path(
+        "people", f"p{_MAX_DIRECTIVES - 1:05d}"
+    ).exists()
+    assert not vault.page_path(
+        "people", f"p{_MAX_DIRECTIVES:05d}"
+    ).exists()
+
+
+# --------------------------------------------------------------------------- #
+# C1 — body size is clamped (deterministic prefix truncation)
+# --------------------------------------------------------------------------- #
+async def test_body_size_clamped(tmp_path):
+    vault = _vault(tmp_path)
+    huge = "X" * (_MAX_BODY_CHARS * 3)
+    out = f"[PAGE people/big]\n{huge}"
+    await run_ingest(
+        vault, _entries("big"), _provider(out), "m", render_template
+    )
+    page = parse_page(vault.page_path("people", "big").read_text("utf-8"))
+    assert len(page.body) <= _MAX_BODY_CHARS
+    # Deterministic prefix truncation: the body is exactly the first
+    # _MAX_BODY_CHARS chars of the directive body.
+    assert page.body == "X" * _MAX_BODY_CHARS
+
+
+# --------------------------------------------------------------------------- #
+# C2 — re-running the SAME output against the SAME vault is idempotent
+# --------------------------------------------------------------------------- #
+async def test_rerun_same_output_is_idempotent(tmp_path):
+    # (a) PAGE-onto-existing fallback path: a 2nd PAGE of the same slug
+    # falls back to APPEND; the C2 guard must skip the duplicate append.
+    vault = _vault(tmp_path, name="page")
+    out = "[PAGE people/alice]\nAlice leads payments."
+    await run_ingest(
+        vault, _entries("a"), _provider(out), "m", render_template
+    )
+    b1 = vault.page_path("people", "alice").read_bytes()
+    r2 = await run_ingest(
+        vault, _entries("a"), _provider(out), "m", render_template
+    )
+    b2 = vault.page_path("people", "alice").read_bytes()
+    r3 = await run_ingest(
+        vault, _entries("a"), _provider(out), "m", render_template
+    )
+    b3 = vault.page_path("people", "alice").read_bytes()
+    assert b1 == b2 == b3  # triple delivery -> stable, no growth
+    assert r2.skipped_duplicate == 1 and r2.appended == []
+    assert r3.skipped_duplicate == 1 and r3.appended == []
+
+    # (b) APPEND-onto-existing: pre-create, then APPEND the same text twice.
+    vault = _vault(tmp_path, name="app")
+    _write_page(
+        vault,
+        "people",
+        "bob",
+        Page(
+            type="people", title="Bob", status="hot",
+            created="2020-01-01", updated="2020-01-01",
+            last_touched="2020-01-01", tags=[], links_out=[],
+            pinned=None, body="Bob is here.\n",
+        ),
+    )
+    aout = "[APPEND people/bob]\nBob now owns billing."
+    await run_ingest(
+        vault, _entries("b"), _provider(aout), "m", render_template
+    )
+    a1 = vault.page_path("people", "bob").read_bytes()
+    ar = await run_ingest(
+        vault, _entries("b"), _provider(aout), "m", render_template
+    )
+    a2 = vault.page_path("people", "bob").read_bytes()
+    assert a1 == a2
+    assert ar.skipped_duplicate == 1 and ar.appended == []
+
+    # (c) CONTRADICTION-onto-existing: same contradiction text twice.
+    # (vault name avoids the Windows reserved device name "con".)
+    vault = _vault(tmp_path, name="contra")
+    _write_page(
+        vault,
+        "people",
+        "carl",
+        Page(
+            type="people", title="Carl", status="hot",
+            created="2020-01-01", updated="2020-01-01",
+            last_touched="2020-01-01", tags=[], links_out=[],
+            pinned=None, body="Carl leads infra.\n",
+        ),
+    )
+    cout = "[CONTRADICTION people/carl]\nCarl actually left infra in May."
+    await run_ingest(
+        vault, _entries("c"), _provider(cout), "m", render_template
+    )
+    c1 = vault.page_path("people", "carl").read_bytes()
+    cr = await run_ingest(
+        vault, _entries("c"), _provider(cout), "m", render_template
+    )
+    c2 = vault.page_path("people", "carl").read_bytes()
+    assert c1 == c2
+    assert cr.skipped_duplicate == 1 and cr.contradictions == []
+
+
+# --------------------------------------------------------------------------- #
+# I1 — an off-contract response must not crash the Dream cycle
+# --------------------------------------------------------------------------- #
+async def test_offcontract_response_no_crash(tmp_path):
+    # (a) provider returns a bare str (no .content attribute at all).
+    vault = _vault(tmp_path, name="bare")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value="just a string")
+    report = await run_ingest(
+        vault, _entries("x"), provider, "m", render_template
+    )
+    assert report.changed is False
+    assert list(vault.iter_pages(include_cold=True)) == []
+
+    # (b) an object with content=None and finish_reason="error".
+    vault = _vault(tmp_path, name="none")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content=None, finish_reason="error")
+    )
+    report = await run_ingest(
+        vault, _entries("x"), provider, "m", render_template
+    )
+    assert report.changed is False
+    assert list(vault.iter_pages(include_cold=True)) == []
+
+    # (c) an object with content=None but finish_reason="stop" (not an
+    # error) — still must not crash and must write nothing.
+    vault = _vault(tmp_path, name="nonestop")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content=None, finish_reason="stop")
+    )
+    report = await run_ingest(
+        vault, _entries("x"), provider, "m", render_template
+    )
+    assert report.changed is False
+    assert list(vault.iter_pages(include_cold=True)) == []
+
+
+# --------------------------------------------------------------------------- #
+# I2 — a derived title is clamped to a single bounded line
+# --------------------------------------------------------------------------- #
+async def test_title_clamped(tmp_path):
+    vault = _vault(tmp_path)
+    first_line = "T" * 5000
+    out = f"[PAGE people/long]\n{first_line}\nrest of body"
+    await run_ingest(
+        vault, _entries("t"), _provider(out), "m", render_template
+    )
+    page = parse_page(vault.page_path("people", "long").read_text("utf-8"))
+    assert len(page.title) <= 120
+    assert "\n" not in page.title
+    assert page.title == "T" * 120
+
+
+# --------------------------------------------------------------------------- #
+# M1 — Ingest's slug+accept/reject policy is pinned to wiki_note's
+# --------------------------------------------------------------------------- #
+def test_slug_policy_parity_with_wiki_note():
+    """Ingest's _safe_slug + accept/reject decision MUST equal wiki_note's
+    _safe_slug + its _do_create reject gate for the SAME inputs.
+
+    This pins the two independent policy copies together so the dual-write
+    duplicate-page bug (Ingest ASCII-folded while wiki_note preserved
+    Unicode/case) can never regress: a future drift fails HERE.
+    """
+    samples = [
+        "Café",
+        "日本語",
+        "A B",
+        "Über",
+        "payment-svc",
+        "SCHEMA",
+        "  spaced  ",
+        "\x01\x02bad\x7f",
+        ".cold",
+        "_index",
+        "Bad Slug!!",
+        "",
+    ]
+
+    def _wn_accepts(raw: str) -> tuple[str, bool]:
+        s = _wn._safe_slug(raw)
+        rejected = bool(
+            _wn._SLUG_CONTROL.search(raw)
+            or _wn._has_unicode_control(raw)
+            or not s
+            or _wn._is_reserved_slug(raw, s)
+        )
+        return s, not rejected
+
+    for raw in samples:
+        ig_slug = _safe_slug(raw)
+        ig_accept = _slug_ok(raw, ig_slug)
+        wn_slug, wn_accept = _wn_accepts(raw)
+        assert ig_slug == wn_slug, (
+            f"slug divergence for {raw!r}: ingest={ig_slug!r} "
+            f"wiki_note={wn_slug!r}"
+        )
+        assert ig_accept == wn_accept, (
+            f"accept/reject divergence for {raw!r}: ingest={ig_accept} "
+            f"wiki_note={wn_accept}"
+        )

@@ -14,23 +14,39 @@ Each directive header MUST start at column 0. Everything on the lines AFTER a
 directive header, up to the next directive header or end of output, is that
 directive's body.
 
-- `[PAGE <type> <slug>]`
+All three reference directives use the SAME header form:
+`[<DIRECTIVE> <type>/<slug>]` — the type and slug are ALWAYS separated by a
+single `/` (slash). Do NOT use a space between type and slug.
+
+- `[PAGE <type>/<slug>]`
   Create a new page of `<type>`. `<slug>` is a short kebab-case identifier
   (lowercase letters, digits, hyphens). The body's first non-empty line is
   used as the page title; the whole body becomes the page content.
+  Example:
+  `[PAGE people/alice]`
+  `Alice leads the payments team.`
 
 - `[APPEND <type>/<slug>]`
   Append the body as new knowledge to an existing page. Prefer this over
   creating a near-duplicate page.
+  Example:
+  `[APPEND people/alice]`
+  `Alice now also owns the billing migration.`
 
 - `[CONTRADICTION <type>/<slug>]`
   The history contradicts what an existing page says. The body text is
   recorded under a contradiction section on that page; the page's existing
   content is never overwritten — a human/Dream reconciles it later.
+  Example:
+  `[CONTRADICTION people/alice]`
+  `History says Alice left payments in May, contradicting the page.`
 
 - `[SKIP]`
-  Emit this ALONE (nothing else) when nothing in the history is durable
-  enough to persist. Do NOT invent pages just to have output.
+  Emit this ALONE (nothing else, no other directives) when nothing in the
+  history is durable enough to persist. Do NOT invent pages just to have
+  output.
+  Example:
+  `[SKIP]`
 
 ## Rules
 
