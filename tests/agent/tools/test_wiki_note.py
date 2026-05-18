@@ -1,11 +1,14 @@
-"""Tests for the wiki_note agent tool (Task 2.1: read/create + session routing)."""
+"""Tests for the wiki_note agent tool (Task 2.1: read/create + session routing;
+Task 2.2: SCHEMA admission gate, _index stub, dup refusal, vault lock)."""
 
+import asyncio
 from types import SimpleNamespace
 
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.wiki_note import WikiNoteTool
-from nanobot.agent.wiki.paths import vault_dir
+from nanobot.agent.wiki.paths import vault_dir, vault_slug
+from nanobot.utils.vault_lock import get_vault_lock
 
 
 def _ctx(tmp_path):
@@ -135,3 +138,144 @@ def test_session_routing_isolates_vaults(tmp_path):
     b = WikiNoteTool.create(_ctx(tmp_path))
     b.set_context(RequestContext(channel="telegram", chat_id="2", session_key="telegram:2"))
     assert a._vault().root != b._vault().root
+
+
+# --- Task 2.2: SCHEMA admission gate, _index stub, dup refusal, vault lock ---
+
+
+def _wiki_dir(tmp_path):
+    return vault_dir(tmp_path, "telegram:1") / "wiki"
+
+
+def _all_md_files(wiki_dir):
+    if not wiki_dir.is_dir():
+        return []
+    return sorted(wiki_dir.rglob("*.md"))
+
+
+async def test_create_unknown_type_rejected(tmp_path):
+    t = _tool(tmp_path)
+    out = await t.execute(operation="create", type="aliens", slug="x", title="X")
+    assert "unknown type" in out.lower()
+    assert "Traceback" not in out
+    # Nothing may have been written anywhere under the vault wiki dir.
+    wiki_dir = _wiki_dir(tmp_path)
+    written = [p for p in _all_md_files(wiki_dir) if p.name != "SCHEMA.md"]
+    assert written == [], f"unexpected files written: {written}"
+
+
+async def test_create_appends_index_stub(tmp_path):
+    t = _tool(tmp_path)
+    out = await t.execute(
+        operation="create", type="people", slug="alice", title="Alice", body="hi"
+    )
+    assert "alice" in out.lower()
+    index = _wiki_dir(tmp_path) / "people" / "_index.md"
+    assert index.is_file(), "people/_index.md should be created"
+    text = index.read_text(encoding="utf-8")
+    assert "# people index" in text
+    assert "[[people/alice]]" in text
+
+
+async def test_create_duplicate_refused_no_overwrite(tmp_path):
+    t = _tool(tmp_path)
+    first = await t.execute(
+        operation="create",
+        type="people",
+        slug="alice",
+        title="Alice",
+        body="ORIGINAL",
+    )
+    assert "alice" in first.lower()
+    second = await t.execute(
+        operation="create",
+        type="people",
+        slug="alice",
+        title="Alice",
+        body="CHANGED",
+    )
+    assert "already exists" in second.lower()
+    page = await t.execute(operation="read", path="people/alice.md")
+    assert "ORIGINAL" in page
+    assert "CHANGED" not in page
+
+
+async def test_create_index_append_only(tmp_path):
+    t = _tool(tmp_path)
+    index = _wiki_dir(tmp_path) / "people" / "_index.md"
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.write_text("# people index\n\n- [[people/bob]]\n", encoding="utf-8")
+    await t.execute(
+        operation="create", type="people", slug="alice", title="Alice", body="hi"
+    )
+    text = index.read_text(encoding="utf-8")
+    assert "[[people/bob]]" in text, "pre-existing bob stub must be preserved"
+    assert "[[people/alice]]" in text, "new alice stub must be appended"
+    # bob must come before alice (not reordered).
+    assert text.index("[[people/bob]]") < text.index("[[people/alice]]")
+
+
+async def test_create_index_stub_idempotent(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create", type="people", slug="alice", title="Alice", body="hi"
+    )
+    # Manually delete the page file but keep _index.md, then recreate.
+    page_file = _wiki_dir(tmp_path) / "people" / "alice.md"
+    page_file.unlink()
+    await t.execute(
+        operation="create", type="people", slug="alice", title="Alice", body="again"
+    )
+    index = _wiki_dir(tmp_path) / "people" / "_index.md"
+    text = index.read_text(encoding="utf-8")
+    assert text.count("[[people/alice]]") == 1, (
+        f"stub line must appear exactly once, got:\n{text}"
+    )
+
+
+async def test_create_concurrent_same_vault_serialized(tmp_path):
+    t = _tool(tmp_path)
+    r1, r2 = await asyncio.gather(
+        t.execute(
+            operation="create", type="people", slug="alice", title="Alice", body="a"
+        ),
+        t.execute(
+            operation="create", type="people", slug="bob", title="Bob", body="b"
+        ),
+    )
+    assert "alice" in r1.lower()
+    assert "bob" in r2.lower()
+    index = _wiki_dir(tmp_path) / "people" / "_index.md"
+    text = index.read_text(encoding="utf-8")
+    # The per-vault lock must prevent a lost append: BOTH stubs present.
+    assert "[[people/alice]]" in text
+    assert "[[people/bob]]" in text
+
+
+async def test_create_acquires_vault_lock(tmp_path):
+    """The create write-path must run inside the per-vault async lock so a
+    concurrent Dream-Lint pass cannot interleave a half-written page/index."""
+    t = _tool(tmp_path)
+    lock = get_vault_lock(vault_slug("telegram:1"))
+    await lock.acquire()
+    try:
+        task = asyncio.ensure_future(
+            t.execute(
+                operation="create",
+                type="people",
+                slug="alice",
+                title="Alice",
+                body="hi",
+            )
+        )
+        # While we hold the lock, create must NOT complete (it is blocked
+        # waiting on the same lock) and must NOT have written the page.
+        await asyncio.sleep(0.05)
+        assert not task.done(), "create completed without acquiring the vault lock"
+        page_file = _wiki_dir(tmp_path) / "people" / "alice.md"
+        assert not page_file.exists(), "page written before acquiring the lock"
+    finally:
+        lock.release()
+    out = await task
+    assert "alice" in out.lower()
+    assert (_wiki_dir(tmp_path) / "people" / "alice.md").exists()
