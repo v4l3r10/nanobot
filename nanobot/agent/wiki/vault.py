@@ -26,6 +26,7 @@ from pathlib import Path
 from nanobot.agent.tools.path_utils import is_under
 from nanobot.agent.wiki.page import Page, parse_page
 from nanobot.agent.wiki.schema import Schema, load_schema
+from nanobot.utils.atomic import atomic_write_text
 from nanobot.utils.prompt_templates import _TEMPLATES_ROOT
 
 __all__ = ["Vault"]
@@ -53,6 +54,31 @@ class Vault:
     def __init__(self, vault_root: Path) -> None:
         self.root: Path = Path(vault_root)
         self.wiki_dir: Path = self.root / "wiki"
+
+    def ensure_initialized(self) -> None:
+        """Idempotently materialize the vault's ``wiki/`` tree.
+
+        Creates ``wiki_dir`` (``parents=True, exist_ok=True``) and, only if
+        ``wiki/SCHEMA.md`` does NOT already exist, copies the bundled master
+        SCHEMA into it. The bundled source is :data:`_BUNDLED_SCHEMA` -- the
+        SAME templates-root-derived path :attr:`schema` resolves to (no
+        hardcoded ``__file__`` arithmetic), so the two stay in lockstep.
+
+        Idempotent: a second call writes nothing (an existing per-vault
+        ``SCHEMA.md`` -- bundled-copied or hand-authored -- is never
+        overwritten, so the cached :attr:`schema` and existing read-only
+        behaviour are unaffected).
+
+        NOTE: Task 7.1 extends this with legacy MEMORY.md/USER.md migration;
+        4.5 deliberately does NO legacy migration here.
+        """
+        self.wiki_dir.mkdir(parents=True, exist_ok=True)
+        schema_path = self.wiki_dir / "SCHEMA.md"
+        if not schema_path.exists():
+            atomic_write_text(
+                schema_path,
+                _BUNDLED_SCHEMA.read_text(encoding="utf-8"),
+            )
 
     @cached_property
     def schema(self) -> Schema:
