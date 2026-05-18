@@ -63,7 +63,7 @@ def serialize_page(page: Page) -> str:
     omitted when ``None``. The body is appended verbatim after the closing
     fence and exactly one blank line.
     """
-    fm: dict[str, object] = {
+    values: dict[str, object] = {
         "type": page.type,
         "title": page.title,
         "status": page.status,
@@ -72,9 +72,17 @@ def serialize_page(page: Page) -> str:
         "last_touched": page.last_touched,
         "tags": list(page.tags),
         "links_out": list(page.links_out),
+        "pinned": page.pinned,
     }
-    if page.pinned is not None:
-        fm["pinned"] = page.pinned
+    # _KEY_ORDER is the single source of truth for which keys are emitted and
+    # in what order; building fm by iterating it keeps the two from drifting.
+    fm: dict[str, object] = {}
+    for key in _KEY_ORDER:
+        value = values[key]
+        # pinned is the sole optional field: omitted entirely when None.
+        if key == "pinned" and value is None:
+            continue
+        fm[key] = value
 
     # sort_keys=False preserves insertion order, which we built per _KEY_ORDER.
     fm_text = yaml.safe_dump(
@@ -101,15 +109,7 @@ def parse_page(text: str) -> Page:
     rest = text[len("---\n"):]
     end = rest.find("\n---\n")
     if end == -1:
-        # Handle a frontmatter-only document ending in "\n---\n" with no body.
-        if rest.endswith("\n---\n"):
-            end = len(rest) - len("\n---\n")
-        elif rest == "---\n" or rest.endswith("---\n"):
-            end = len(rest) - len("---\n") - 1
-        else:
-            raise ValueError(
-                "frontmatter block malformed: missing closing '---' fence"
-            )
+        raise ValueError("frontmatter block malformed: missing closing '---' fence")
 
     fm_text = rest[:end]
     after = rest[end + len("\n---\n"):]
