@@ -333,3 +333,120 @@ class TestDreamWikiEnabled:
         assert result is True
         assert store.get_last_dream_cursor() == 1
         assert alice.is_file()
+
+
+# --- Concurrency guard (Task 4.6) ------------------------------------------
+
+
+class TestDreamConcurrencyGuard:
+    """A cron tick racing ``/dream`` can call ``Dream.run()`` twice on one loop.
+
+    Both calls would pass the cursor guard, process the SAME batch, and
+    double-edit MEMORY.md (and, with the wiki on, double-Ingest). Task 4.6
+    serializes ``Dream.run()`` via a module-global strong-ref ``asyncio.Lock``
+    so the two invocations run one-after-another; the second then re-reads the
+    cursor the first advanced and correctly no-ops.
+    """
+
+    async def test_guard_is_module_global_strong_ref(
+        self, store, mock_provider, mock_runner,
+    ):
+        """The guard is a module-global ``asyncio.Lock`` on
+        ``nanobot.agent.memory`` — a process singleton (SAME object across
+        ``Dream`` instances, not per-instance) and distinct from any
+        ``get_vault_lock`` entry (which lives in a weak registry that could be
+        GC'd between non-overlapping ``create_task``s)."""
+        assert isinstance(memory_mod._DREAM_RUN_LOCK, asyncio.Lock)
+
+        d1 = Dream(store=store, provider=mock_provider, model="m", max_batch_size=5)
+        d2 = Dream(store=store, provider=mock_provider, model="m", max_batch_size=5)
+        # Process-singleton: not stored per-instance, same object for all.
+        assert memory_mod._DREAM_RUN_LOCK is memory_mod._DREAM_RUN_LOCK
+        # Not derived from the weak per-vault registry.
+        assert memory_mod._DREAM_RUN_LOCK is not get_vault_lock("unified_default")
+        assert memory_mod._DREAM_RUN_LOCK is not get_vault_lock(
+            vault_slug("unified:default")
+        )
+        # Sanity: the lock is reachable as a strong module attribute (held for
+        # the process lifetime), unlike WeakValueDictionary entries.
+        held = memory_mod._DREAM_RUN_LOCK
+        assert held is memory_mod._DREAM_RUN_LOCK
+        # d1/d2 are otherwise normal Dream objects sharing the one global lock.
+        assert d1 is not d2
+
+    async def test_single_run_unaffected(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """One ``dream.run()`` with the lock uncontended is byte-identical to
+        the v0.2.0 baseline: same truthy result, cursor advance, Phase 1/2
+        delegation, history compaction. (Golden-equivalent.)"""
+        dream.wiki_enabled = False
+        store.append_history("event 1")
+        store.append_history("event 2")
+        assert store.get_last_dream_cursor() == 0
+
+        mock_provider.chat_with_retry.return_value = MagicMock(content="New fact")
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+
+        assert result is True
+        assert store.get_last_dream_cursor() == 2
+        mock_provider.chat_with_retry.assert_called_once()
+        mock_runner.run.assert_called_once()
+
+    async def test_concurrent_run_serialized(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """Two concurrent ``dream.run()`` invocations must NOT overlap and must
+        NOT double-process the same batch.
+
+        Instrument ``provider.chat_with_retry`` to record enter/exit order with
+        a sleep so any overlap is observable. With the guard:
+          * run A's instrumented section fully completes before run B's begins
+            (no interleave), AND
+          * run B re-reads the cursor A advanced, finds no unprocessed entries,
+            and no-ops — so Phase 1 (provider) + Phase 2 (runner) run exactly
+            ONCE and the cursor advances exactly once to ``batch[-1]``.
+        """
+        dream.wiki_enabled = False
+        store.append_history("event 1")
+        store.append_history("event 2")
+        assert store.get_last_dream_cursor() == 0
+
+        events: list[str] = []
+
+        async def _instrumented_phase1(*args, **kwargs):
+            events.append("enter")
+            # Long enough that an unguarded second run would interleave here.
+            await asyncio.sleep(0.02)
+            events.append("exit")
+            return MagicMock(content="New fact")
+
+        mock_provider.chat_with_retry.side_effect = _instrumented_phase1
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        results = await asyncio.gather(dream.run(), dream.run())
+
+        # No overlap: a strictly non-interleaved enter/exit sequence. Because
+        # the second run re-reads the advanced cursor and no-ops (no provider
+        # call), exactly ONE enter/exit pair is recorded.
+        assert events == ["enter", "exit"], (
+            f"runs overlapped or double-processed: {events!r}"
+        )
+
+        # Exactly one run did work; the other saw the advanced cursor and
+        # no-op'd (re-read INSIDE the lock => sees A's advance).
+        assert sorted(results) == [False, True]
+
+        # Cursor advanced exactly once to batch[-1] (not double-advanced).
+        assert store.get_last_dream_cursor() == 2
+
+        # Phase 1 (provider) + Phase 2 (runner) invoked once total — the batch
+        # was NOT consolidated twice.
+        mock_provider.chat_with_retry.assert_called_once()
+        mock_runner.run.assert_called_once()
