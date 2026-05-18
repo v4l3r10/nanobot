@@ -270,6 +270,151 @@ class TestMoveTargetCollision:
         assert rep2.changed is False
 
 
+class TestDedupNeverDropsLoserBody:
+    """Review follow-up to 4.3 -- the header-substring idempotence guard in
+    ``_dedup`` could SKIP appending the loser body while still unlinking the
+    loser, silently and permanently losing memory.
+
+    Trigger: the keeper's body already contains the literal substring
+    ``## merged from {loser.relpath}`` -- which happens naturally for ANY
+    page that was itself the product of a merge in a PRIOR Dream cycle (Lint
+    stamps exactly that marker), or whenever a fresh colliding loser reuses a
+    relpath that recurs in a prior ``## merged from`` marker (slugs/relpaths
+    like ``.cold/people/sam.md`` recur). The guard then no-ops the append but
+    the loser is deleted unconditionally -> its content exists nowhere.
+
+    Invariant under test: a loser file is NEVER unlinked unless its body has
+    been incorporated into the keeper this run.
+    """
+
+    def test_dedup_never_drops_loser_body_when_marker_present(self, tmp_path):
+        v = _vault(tmp_path)
+        # Keeper: hot page at the HOT location whose body ALREADY contains the
+        # literal prior-cycle marker line `## merged from .cold/people/sam.md`
+        # (exactly what a previous Dream merge would have stamped). Newer
+        # `updated` so it wins the keeper election.
+        keeper_body = (
+            "KEEPER_OWN_TEXT\n\n"
+            "## merged from .cold/people/sam.md\n\n"
+            "OLD_CYCLE_ABSORBED_TEXT\n"
+        )
+        _write(
+            v,
+            "people/sam.md",
+            _page(
+                title="SamKeeper",
+                status="hot",
+                updated="2026-05-10",
+                last_touched="2026-05-18",
+                body=keeper_body,
+            ),
+        )
+        # Loser: a DIFFERENT current page physically at .cold/people/sam.md,
+        # status:hot (a deferred reheat collision) so it enters the SAME
+        # (people, sam) dedup group. Its relpath matches the literal marker
+        # string already in the keeper body -> the old substring guard would
+        # skip its append. Older `updated` so it loses. Unique body.
+        _write(
+            v,
+            ".cold/people/sam.md",
+            _page(
+                title="SamLoser",
+                status="hot",
+                updated="2026-05-01",
+                last_touched="2026-05-05",
+                body="UNIQUE_LOSER_CONTENT_DO_NOT_LOSE\n",
+            ),
+        )
+
+        rep = run_lint(v, TODAY)
+
+        # The loser's unique content MUST survive somewhere on disk -- the
+        # keeper is the only place it can be (the loser file was deleted).
+        survivors: list[str] = []
+        for p in sorted(v.wiki_dir.rglob("*.md")):
+            if p.name in {"SCHEMA.md", "_index.md"}:
+                continue
+            try:
+                survivors.append(parse_page(p.read_text(encoding="utf-8")).body)
+            except ValueError:
+                pass
+        joined = "\n".join(survivors)
+        assert "UNIQUE_LOSER_CONTENT_DO_NOT_LOSE" in joined, (
+            "loser body was silently destroyed despite a pre-existing "
+            f"'## merged from' marker; survivors={survivors!r}"
+        )
+        # The keeper's own + prior-cycle content is also still there.
+        assert "KEEPER_OWN_TEXT" in joined
+        assert "OLD_CYCLE_ABSORBED_TEXT" in joined
+        # The merge is truthfully reported (it really happened this run).
+        assert (".cold/people/sam.md", "people/sam.md") in rep.merged or (
+            "people/sam.md",
+            ".cold/people/sam.md",
+        ) in rep.merged
+        assert rep.changed is True
+
+        # Idempotence: a second run is a total byte-level no-op (the loser
+        # file no longer exists, so the group is a singleton and _dedup
+        # appends/writes nothing).
+        snap1 = _snapshot(v)
+        rep2 = run_lint(v, TODAY)
+        snap2 = _snapshot(v)
+        assert snap1 == snap2
+        assert rep2.changed is False
+
+    def test_dedup_common_path_no_marker_still_merges_and_idempotent(
+        self, tmp_path
+    ):
+        """Control: keeper body has NO `## merged from` marker at all -- the
+        common (first-ever-merge) path. Loser body must still be preserved
+        and the result must still be idempotent (proves the fix does not
+        change behaviour on the path the guard never affected)."""
+        v = _vault(tmp_path)
+        _write(
+            v,
+            "people/sam.md",
+            _page(
+                title="SamKeeper",
+                status="hot",
+                updated="2026-05-10",
+                last_touched="2026-05-18",
+                body="PLAIN_KEEPER_BODY_NO_MARKER\n",
+            ),
+        )
+        _write(
+            v,
+            ".cold/people/sam.md",
+            _page(
+                title="SamLoser",
+                status="hot",
+                updated="2026-05-01",
+                last_touched="2026-05-05",
+                body="UNIQUE_LOSER_CONTENT_DO_NOT_LOSE\n",
+            ),
+        )
+
+        rep = run_lint(v, TODAY)
+
+        survivors: list[str] = []
+        for p in sorted(v.wiki_dir.rglob("*.md")):
+            if p.name in {"SCHEMA.md", "_index.md"}:
+                continue
+            try:
+                survivors.append(parse_page(p.read_text(encoding="utf-8")).body)
+            except ValueError:
+                pass
+        joined = "\n".join(survivors)
+        assert "UNIQUE_LOSER_CONTENT_DO_NOT_LOSE" in joined, survivors
+        assert "PLAIN_KEEPER_BODY_NO_MARKER" in joined
+        assert rep.changed is True
+
+        snap1 = _snapshot(v)
+        rep2 = run_lint(v, TODAY)
+        snap2 = _snapshot(v)
+        assert snap1 == snap2
+        assert rep2.changed is False
+
+
 class TestBrokenLinks:
     def test_broken_link_escaping_vault_is_reported_not_followed(self, tmp_path):
         v = _vault(tmp_path)
