@@ -8,6 +8,7 @@ import os
 import re
 import weakref
 from contextlib import suppress
+from datetime import date as _date
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
@@ -17,6 +18,10 @@ from loguru import logger
 
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.wiki.ingest import run_ingest
+from nanobot.agent.wiki.lint import run_lint
+from nanobot.agent.wiki.paths import vault_slug
+from nanobot.agent.wiki.vault import Vault
 from nanobot.session.manager import Session
 from nanobot.utils.atomic import atomic_write_text
 from nanobot.utils.gitstore import GitStore
@@ -29,6 +34,7 @@ from nanobot.utils.helpers import (
     truncate_text,
 )
 from nanobot.utils.prompt_templates import render_template
+from nanobot.utils.vault_lock import get_vault_lock
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
@@ -809,6 +815,8 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
+        wiki_enabled: bool = False,
+        lint_cadence_h: int | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -816,6 +824,16 @@ class Dream:
         self.max_batch_size = max_batch_size
         self.max_iterations = max_iterations
         self.max_tool_result_chars = max_tool_result_chars
+        # Wiki-tree memory gate (Task 4.5). Real instance attributes (NOT
+        # @property / __slots__) so cli/commands.py's pre-wiring
+        # ``agent.dream.wiki_enabled = ...`` (Task 3.1) keeps working and the
+        # golden test can set ``dream.wiki_enabled = False``. Default False:
+        # with the gate off Dream is byte-identical to v0.2.0.
+        self.wiki_enabled: bool = wiki_enabled
+        # NOTE: decoupled lint cadence (lint_cadence_h) is a future
+        # refinement; Lint is idempotent so running it each Dream cycle is
+        # safe. Stored here for the cli pre-wiring; not consulted in 4.5.
+        self.lint_cadence_h: int | None = lint_cadence_h
         # Kill switch for the git-blame-based per-line age annotation in Phase 1.
         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
@@ -932,6 +950,20 @@ class Dream:
         if had_trailing:
             result += "\n"
         return result
+
+    def _vaults_for_batch(self, batch: list[dict[str, Any]]) -> list[str]:
+        """Vault slugs the wiki Ingest+Lint pass should run for this batch.
+
+        For now: the single back-compat unified vault. ``vault_slug(
+        "unified:default")`` is computed (not hardcoded) so it stays in
+        lockstep with the slug the ``wiki_note`` tool / lock use; it equals
+        the literal ``"unified_default"``.
+
+        TODO(Task 7.2): per-user routing -- group ``batch`` by entry
+        ``session_key`` via ``vault_slug`` and return one slug per distinct
+        user instead of the single unified slug.
+        """
+        return [vault_slug("unified:default")]
 
     async def run(self) -> bool:
         """Process unprocessed history entries. Returns True if work was done."""
@@ -1084,5 +1116,36 @@ class Dream:
             sha = self.store.git.auto_commit(commit_msg)
             if sha:
                 logger.info("Dream commit: {}", sha)
+
+        # --- Wiki-tree memory (Task 4.5) -----------------------------------
+        # STRICTLY ADDITIVE, best-effort, gated. Reached only after the entire
+        # legacy MEMORY.md path above (Phase 1/2, cursor advance,
+        # compact_history, git commit) has run EXACTLY as in v0.2.0, and only
+        # on the success path (we are past the `if not entries: return False`
+        # guard, so there ARE entries / `batch` is non-empty). The whole block
+        # is wrapped so ANY Ingest/Lint/Vault exception is logged and
+        # SWALLOWED: it cannot alter the cursor, the changelog/git commit, the
+        # compacted history, Phase 1/2, or the `return True` below. With
+        # `wiki_enabled` False (default) this is a true no-op -> Dream is
+        # byte-identical to v0.2.0 (TestDreamWikiDisabledGolden enforces this).
+        if self.wiki_enabled:
+            try:
+                for slug in self._vaults_for_batch(batch):
+                    vault = Vault(self.store.workspace / "memory" / "users" / slug)
+                    vault.ensure_initialized()
+                    # Same lock key the wiki_note tool takes
+                    # (get_vault_lock(vault_slug(session_key))) so Dream-side
+                    # Ingest/Lint and the agent-side wiki_note tool never
+                    # write one user's vault concurrently (design H2).
+                    async with get_vault_lock(slug):
+                        await run_ingest(
+                            vault, batch, self.provider, self.model,
+                            render_template,
+                        )
+                        run_lint(vault, _date.today())
+            except Exception:
+                logger.exception(
+                    "wiki ingest/lint failed; legacy memory path intact"
+                )
 
         return True

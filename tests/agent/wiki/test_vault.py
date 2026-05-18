@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from nanobot.agent.wiki.page import Page, serialize_page
+from nanobot.agent.wiki.schema import load_schema
 from nanobot.agent.wiki.vault import Vault
 
 
@@ -84,3 +85,61 @@ def test_is_empty(tmp_path):
     assert empty.is_empty() is True
     v = _make_vault(tmp_path)
     assert v.is_empty() is False
+
+
+# --- ensure_initialized (Task 4.5 B) ---------------------------------------
+
+
+def test_ensure_initialized_creates_wiki_and_copies_schema(tmp_path):
+    """A fresh vault: ensure_initialized creates wiki/ and copies the bundled
+    SCHEMA.md verbatim (byte-equal, parseable via load_schema)."""
+    v = Vault(tmp_path / "memory" / "users" / "fresh")
+    assert not v.wiki_dir.exists()
+
+    v.ensure_initialized()
+
+    assert v.wiki_dir.is_dir()
+    schema_file = v.wiki_dir / "SCHEMA.md"
+    assert schema_file.is_file()
+    written = schema_file.read_text(encoding="utf-8")
+    # Byte-equal to the bundled master.
+    assert written == _bundled_schema_text()
+    # Parseable: a real Schema can be loaded from the copied file.
+    schema = load_schema(written)
+    assert schema.folder("people") == "people"
+    assert schema.cold_after_days("people") == 180
+
+
+def test_ensure_initialized_is_idempotent(tmp_path):
+    """A second ensure_initialized makes ZERO changes (byte-stable SCHEMA.md)."""
+    v = Vault(tmp_path / "memory" / "users" / "fresh")
+    v.ensure_initialized()
+    schema_file = v.wiki_dir / "SCHEMA.md"
+    first = schema_file.read_bytes()
+    mtime = schema_file.stat().st_mtime_ns
+
+    v.ensure_initialized()
+
+    assert schema_file.read_bytes() == first
+    # The file was not rewritten (idempotent: a second call writes nothing).
+    assert schema_file.stat().st_mtime_ns == mtime
+
+
+def test_ensure_initialized_does_not_overwrite_existing_schema(tmp_path):
+    """An existing per-vault SCHEMA.md is preserved verbatim (never clobbered
+    by the bundled master)."""
+    v = _make_vault(tmp_path, with_schema=False, with_pages=False, with_cold=False)
+    v.wiki_dir.mkdir(parents=True, exist_ok=True)
+    custom = (
+        "# Custom Wiki Schema\n```yaml\n"
+        "types:\n  people: { folder: people, cold_after_days: 7 }\n"
+        "required_frontmatter: [type, title, status, created, updated, last_touched]\n"
+        "moc_max_lines: 42\n```\n"
+    )
+    (v.wiki_dir / "SCHEMA.md").write_text(custom, encoding="utf-8")
+
+    v.ensure_initialized()
+
+    assert (v.wiki_dir / "SCHEMA.md").read_text(encoding="utf-8") == custom
+    # The custom schema is what resolves (cached property reads per-vault first).
+    assert Vault(v.root).schema.cold_after_days("people") == 7

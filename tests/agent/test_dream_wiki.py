@@ -33,12 +33,18 @@ passing Dream tests rather than a strawman. Keep this block in sync with
 ``test_dream.py`` if its fixtures ever change.
 """
 
+import asyncio
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from loguru import logger
 
+import nanobot.agent.memory as memory_mod
 from nanobot.agent.memory import Dream, MemoryStore
 from nanobot.agent.runner import AgentRunResult
+from nanobot.agent.wiki.paths import vault_slug
+from nanobot.utils.vault_lock import get_vault_lock
 
 # --- Fixtures copied verbatim from tests/agent/test_dream.py -----------------
 # (module-local there; not exported via conftest.py — see module docstring)
@@ -175,3 +181,155 @@ class TestDreamWikiDisabledGolden:
         mock_provider.chat_with_retry.assert_not_called()
         mock_runner.run.assert_not_called()
         _assert_no_wiki_artifacts(store.workspace)
+
+
+# --- Wiki ENABLED (Task 4.5 C) ---------------------------------------------
+
+# Canned Ingest line-protocol output: one PAGE directive that creates
+# people/alice.md in the unified vault.
+_INGEST_OUTPUT = "[PAGE people/alice]\nAlice is a backend engineer who prefers dark mode.\n"
+
+
+class TestDreamWikiEnabled:
+    """With ``dream.wiki_enabled = True`` Ingest+Lint run per vault under the
+    per-vault lock, AFTER the legacy MEMORY.md path, exception-isolated."""
+
+    async def test_wiki_enabled_runs_ingest_and_lint_on_unified_vault(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """Enabled: the unified vault is created (SCHEMA.md copied by
+        ensure_initialized) and Ingest writes people/alice.md; the legacy
+        path (Phase 1/2, cursor advance, compact) is unchanged."""
+        dream.wiki_enabled = True
+
+        store.append_history("event 1")
+        store.append_history("event 2")
+        assert store.get_last_dream_cursor() == 0
+
+        # Phase 1 (legacy) gets the first call; Ingest gets the second. Each
+        # needs its own canned content — Phase 1 wants a plain analysis
+        # string, Ingest wants the line protocol.
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+
+        assert result is True
+
+        # Legacy behavior intact, exactly as the disabled golden case.
+        assert store.get_last_dream_cursor() == 2
+        mock_runner.run.assert_called_once()
+
+        # Unified vault created + SCHEMA.md copied by ensure_initialized.
+        vault_root = store.workspace / "memory" / "users" / "unified_default"
+        schema_md = vault_root / "wiki" / "SCHEMA.md"
+        assert schema_md.is_file()
+
+        # Ingest wrote the page; Lint left it parseable.
+        alice = vault_root / "wiki" / "people" / "alice.md"
+        assert alice.is_file()
+        from nanobot.agent.wiki.vault import Vault
+        page = Vault(vault_root).read_page("people/alice.md")
+        assert page.type == "people"
+        assert "dark mode" in page.body
+
+    async def test_wiki_failure_does_not_break_legacy(
+        self, dream, mock_provider, mock_runner, store, monkeypatch,
+    ):
+        """A wiki exception is logged and SWALLOWED — the legacy path
+        (result, cursor advance, compact) is byte-identical to success."""
+        dream.wiki_enabled = True
+
+        store.append_history("event 1")
+        store.append_history("event 2")
+
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="New fact", finish_reason="stop",
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        compact_spy = MagicMock(side_effect=store.compact_history)
+        monkeypatch.setattr(store, "compact_history", compact_spy)
+
+        def _boom(*a, **k):
+            raise RuntimeError("wiki exploded")
+
+        monkeypatch.setattr(memory_mod, "run_ingest", AsyncMock(side_effect=_boom))
+
+        # nanobot logs via loguru, not stdlib logging — add a sink to capture.
+        captured: list[str] = []
+        sink_id = logger.add(lambda m: captured.append(str(m)), level="ERROR")
+        try:
+            result = await dream.run()
+        finally:
+            logger.remove(sink_id)
+
+        # Legacy path entirely intact despite the wiki blowing up.
+        assert result is True
+        assert store.get_last_dream_cursor() == 2
+        compact_spy.assert_called_once()
+        # The failure was logged via loguru, not propagated.
+        assert any("wiki ingest/lint failed" in m for m in captured)
+
+    async def test_wiki_noop_when_no_history(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """No unprocessed history → no-op result, provider NOT called, and the
+        wiki block must NOT run (no memory/users/ created)."""
+        dream.wiki_enabled = True
+
+        result = await dream.run()
+
+        assert result is False
+        mock_provider.chat_with_retry.assert_not_called()
+        mock_runner.run.assert_not_called()
+        _assert_no_wiki_artifacts(store.workspace)
+
+    async def test_lock_serializes_with_wiki_note(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """The wiki block must acquire ``get_vault_lock(vault_slug(
+        "unified:default"))`` — the SAME lock the wiki_note tool takes — so
+        the two serialize. Holding it externally blocks the wiki write until
+        released; the legacy path completes regardless."""
+        slug = vault_slug("unified:default")
+        assert slug == "unified_default"
+        lock = get_vault_lock(slug)
+
+        dream.wiki_enabled = True
+        store.append_history("event 1")
+
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        alice = store.workspace / "memory" / "users" / "unified_default" / "wiki" / "people" / "alice.md"
+
+        await lock.acquire()
+        try:
+            task = asyncio.ensure_future(dream.run())
+            # Give the run a chance to reach (and block on) the vault lock.
+            await asyncio.sleep(0.05)
+            assert not task.done() or not alice.exists(), (
+                "wiki write completed while the vault lock was held externally "
+                "— the block did not serialize on get_vault_lock(slug)"
+            )
+            assert not alice.exists()
+        finally:
+            lock.release()
+
+        result = await asyncio.wait_for(task, timeout=5)
+        assert result is True
+        assert store.get_last_dream_cursor() == 1
+        assert alice.is_file()
