@@ -363,9 +363,27 @@ def _dedup(
     relpath ascending (the relpath that sorts first wins). Losers processed
     in deterministic order (relpath ascending). For each loser the keeper's
     body gains ``\\n\\n## merged from {loser_relpath}\\n\\n{loser.body}``
-    (skipped if that exact header is already present -- idempotence). The
-    keeper's ``updated``/``last_touched`` become the max (ISO string) of
+    **unconditionally** -- the loser file is then deleted, so the
+    load-bearing invariant *a loser file is NEVER unlinked unless its body
+    has been incorporated into the keeper this run* holds without exception.
+    The keeper's ``updated``/``last_touched`` become the max (ISO string) of
     keeper and loser; ``created`` is preserved. Every loser file is deleted.
+
+    There is deliberately NO content-based "is the marker already present?"
+    skip. A substring guard (the prior implementation's) is both unsound and
+    unnecessary: unsound because the keeper body legitimately carries a
+    ``## merged from {relpath}`` line for ANY page produced by a merge in a
+    prior Dream cycle (or whenever a fresh colliding loser reuses a recurring
+    relpath/slug), so the guard would no-op the append while the loser is
+    still deleted -- silent, permanent data loss; unnecessary because
+    idempotence across runs is guaranteed structurally by *loser deletion*,
+    not by the body text: ``_dedup`` runs exactly ONCE per :func:`run_lint`,
+    each group member has a distinct relpath, every loser is processed
+    exactly once and then unlinked, so on the next run the loser file no
+    longer exists, the ``(type, slug.lower())`` group is a singleton, and
+    nothing is appended or written (run #2 == run #1, zero changes). The
+    ``## merged from`` line is now purely an informational provenance marker,
+    never a control signal.
 
     A surviving keeper belongs at its **hot** location: if it was a deferred
     collision (physically under ``.cold/``) it is written to
@@ -406,19 +424,25 @@ def _dedup(
         updated = keeper.page.updated
         last_touched = keeper.page.last_touched
         for loser in losers:
+            # UNCONDITIONAL append-then-delete. No content/substring skip:
+            # the only thing that makes a loser's deletion safe is that its
+            # body was incorporated THIS run, and idempotence across runs is
+            # provided by the deletion below (next run the loser file is gone
+            # -> singleton group -> nothing appended). Single clean
+            # separation: exactly one blank line between the keeper body and
+            # the merged section. rstrip the keeper body so repeated/varied
+            # trailing newlines never produce a different result.
             header = f"## merged from {loser.relpath}"
-            if header not in body:
-                # Single clean separation: exactly one blank line between
-                # the keeper body and the merged section. rstrip the keeper
-                # body so repeated/varied trailing newlines never produce a
-                # different result (idempotence is also guarded by the
-                # header-presence check above).
-                prefix = body.rstrip("\n")
-                lead = f"{prefix}\n\n" if prefix else ""
-                body = f"{lead}{header}\n\n{loser.page.body}"
+            prefix = body.rstrip("\n")
+            lead = f"{prefix}\n\n" if prefix else ""
+            body = f"{lead}{header}\n\n{loser.page.body}"
             updated = max(updated, loser.page.updated)
             last_touched = max(last_touched, loser.page.last_touched)
             report.merged.append((keeper.relpath, loser.relpath))
+            # write-new (the keeper, below) is conceptually "done" for this
+            # loser only once its body is in ``body``; delete the loser AFTER
+            # the append so a crash can never lose the loser's content
+            # (recoverable duplicate, never a lost page -- M3 ordering).
             loser.path.unlink(missing_ok=True)
             # The loser's relpath is now free on disk -- reflect that in the
             # authoritative map so a keeper-relocate onto it is not a clobber.
