@@ -22,6 +22,7 @@ from typing import Any
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.filesystem import _FsTool
+from nanobot.agent.tools.path_utils import is_under
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 from nanobot.agent.wiki.page import Page, serialize_page
 from nanobot.agent.wiki.paths import vault_dir
@@ -173,8 +174,21 @@ class WikiNoteTool(_FsTool, ContextAware):
         except (KeyError, ValueError) as e:
             # Unknown type surfaces here; Task 2.2 adds a friendlier message.
             return f"Error: {e}"
+        # Enforce vault containment symmetrically with read_page's is_under
+        # guard. Schema.folder(type) is whatever the (per-vault, Task 2.2)
+        # SCHEMA.md declares with no single-component validation; a folder
+        # of '../...' or an absolute path would let atomic_write_text
+        # (parent.mkdir(parents=True)) write OUTSIDE the vault. Resolve the
+        # destination and pass the *resolved* path to atomic_write_text so
+        # the checked path and the written path are identical (no TOCTOU).
+        resolved = target.resolve()
+        if not is_under(resolved, vault.wiki_dir):
+            return (
+                f"Error: refusing to write {type}/{slug} "
+                "— resolves outside the vault"
+            )
         try:
-            atomic_write_text(target, serialize_page(page))
+            atomic_write_text(resolved, serialize_page(page))
         except OSError as e:
             return f"Error: {e}"
         return f"Created page {type}/{safe_slug}.md"

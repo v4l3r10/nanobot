@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.wiki_note import WikiNoteTool
+from nanobot.agent.wiki.paths import vault_dir
 
 
 def _ctx(tmp_path):
@@ -74,6 +75,57 @@ def test_tool_is_auto_discoverable():
     assert t.name == "wiki_note"
     assert "core" in WikiNoteTool._scopes
     assert WikiNoteTool._plugin_discoverable
+
+
+async def test_create_refuses_schema_folder_traversal(tmp_path):
+    """A malicious per-vault SCHEMA.md whose type folder escapes the vault
+    must be refused by create, and must NOT write any file outside the vault.
+
+    This exercises the latent sandbox hole that goes live in Task 2.2 once
+    SCHEMA.md is resolved per-vault: ``Schema.folder(type)`` returns whatever
+    string the SCHEMA declares, and create previously fed it straight to
+    ``atomic_write_text`` (which does ``parent.mkdir(parents=True)``) with no
+    containment check — unlike read, which is guarded by ``is_under``.
+    """
+    t = _tool(tmp_path)
+    # The tool routes session_key="telegram:1" to this vault dir.
+    vault_root = vault_dir(tmp_path, "telegram:1")
+    wiki_dir = vault_root / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+
+    # Malicious per-vault SCHEMA.md: the 'evil' type's folder climbs out of
+    # the vault entirely, targeting a sibling of tmp_path.
+    schema_md = (
+        "```yaml\n"
+        "version: 1\n"
+        "types:\n"
+        "  evil:\n"
+        '    folder: "../../../../../escape"\n'
+        "    cold_after_days: null\n"
+        "```\n"
+    )
+    (wiki_dir / "SCHEMA.md").write_text(schema_md, encoding="utf-8")
+
+    out = await t.execute(
+        operation="create",
+        type="evil",
+        slug="x",
+        title="X",
+        body="pwn",
+    )
+
+    # (a) The tool must refuse with a clean model-readable error string.
+    assert isinstance(out, str)
+    assert out.lower().startswith("error:") or "refus" in out.lower()
+    assert "Traceback" not in out
+
+    # (b) Nothing may have been written outside the vault. Walk every
+    # ancestor of the vault up to the filesystem root and assert no rogue
+    # 'escape' directory (or x.md inside one) was created anywhere.
+    for ancestor in [tmp_path, *tmp_path.parents]:
+        rogue = ancestor / "escape"
+        assert not rogue.exists(), f"escaped write created {rogue}"
+        assert not (ancestor / "escape" / "x.md").exists()
 
 
 def test_session_routing_isolates_vaults(tmp_path):
