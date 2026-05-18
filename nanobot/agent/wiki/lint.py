@@ -21,6 +21,28 @@ git):
   relpath ascending. Two independently-built identical vaults lint to
   byte-identical trees.
 
+A third, equally load-bearing invariant governs every page MOVE (C1 review):
+
+* **No-clobber move invariant** -- no ``run_lint`` execution may
+  :func:`atomic_write_text` to a destination relpath currently occupied by a
+  *different surviving* (parseable, non-malformed) entry. A single
+  authoritative "occupied" map (relpath -> owning entry) is threaded through
+  every move phase and kept in lock-step with on-disk reality (the source
+  relpath is removed and the destination relpath added as each move
+  completes). When a computed destination is already held by another live
+  entry the move is **deferred** -- the page is left where it is *this run*
+  and (because the colliding pages necessarily share ``(type,
+  slug.lower())``) :func:`_dedup` then MERGES them: keeper = max ``updated``,
+  loser body appended under ``## merged from {relpath}``, loser deleted. No
+  page is ever overwritten or silently lost; worst case two colliding pages
+  are merged, best case one is relocated without collision. A post-dedup
+  stale->cold sweep then settles any merged-but-stale keeper so the whole
+  run reaches a fixpoint (run #2 == run #1, zero changes).
+
+Crash-safety ordering contract (M3) -- every move is **write-new (atomic)
+THEN unlink-old; never reorder**. A crash mid-move must leave a recoverable
+duplicate, never a lost page. Task 4.4/4.5 integrators MUST NOT reorder this.
+
 Phase order (each a small private function for testability):
 
 1. ``_scan`` -- walk ``wiki_dir`` ourselves so we see ``.cold/`` and
@@ -50,6 +72,7 @@ import datetime as dt
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from nanobot.agent.tools.path_utils import is_under
 from nanobot.agent.wiki.decay import should_cool
 from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.vault import _COLD_COMPONENT, _NON_PAGE_NAMES, Vault
@@ -113,6 +136,37 @@ class _Entry:
 def _slug_of(relpath: str) -> str:
     """Page slug = basename without ``.md`` (POSIX relpath in)."""
     return relpath.rsplit("/", 1)[-1][: -len(".md")]
+
+
+# Max rendered length of a sanitized inline string (title in the MOC).
+_SAFE_INLINE_MAX = 120
+
+
+def _safe_inline(text: str) -> str:
+    """Sanitize untrusted free text for SINGLE-LINE rendering into the MOC.
+
+    The MOC (root ``MEMORY.md``) is injected verbatim into the system prompt
+    (Task 6.1) and Ingest (Task 4.4) feeds Lint untrusted, model-/user-shaped
+    titles. Rendering a raw ``page.title`` into a
+    ``- [[{folder}/{slug}]] — {title}`` line is a prompt-injection vector: a
+    newline forges extra MOC lines, and ``]]`` / ``[[`` forge spurious
+    wikilinks. This helper makes any free text safe to interpolate inline:
+
+    * collapse every run of ASCII/Unicode whitespace (incl. newlines, tabs,
+      CR) to a single space, so the result is exactly one physical line;
+    * neutralize wikilink delimiters by inserting a space inside them
+      (``]]`` -> ``] ]``, ``[[`` -> ``[ [``) so no forged ``[[..]]`` can
+      survive while the visible text is preserved;
+    * trim leading/trailing space and cap length at ``_SAFE_INLINE_MAX``
+      (deterministic hard bound; over-long titles are an abuse signal).
+
+    Deterministic and idempotent: ``_safe_inline(_safe_inline(x)) ==
+    _safe_inline(x)`` for all inputs (the substitutions never reintroduce a
+    delimiter or whitespace run).
+    """
+    collapsed = " ".join(text.split())
+    neutralized = collapsed.replace("]]", "] ]").replace("[[", "[ [")
+    return neutralized[:_SAFE_INLINE_MAX].strip()
 
 
 def _write_if_changed(path: Path, content: str) -> bool:
@@ -188,22 +242,62 @@ def _cold_relpath(vault: Vault, page: Page, slug: str) -> str:
     return f"{_COLD_COMPONENT}/{vault.schema.folder(page.type)}/{slug}.md"
 
 
+class _Occupied:
+    """Authoritative map of every live entry's current relpath -> entry.
+
+    The single source of truth for the **no-clobber move invariant** (C1):
+    every move phase consults it before computing/committing a destination
+    and mutates it as moves happen so it always mirrors on-disk reality for
+    surviving (parseable, non-malformed) entries. A destination relpath is
+    "free for ``entry``" iff it is unoccupied OR occupied by ``entry``
+    itself; if a *different* live entry holds it the move must be deferred,
+    never performed (no ``atomic_write_text`` may ever overwrite it).
+    """
+
+    def __init__(self, entries: list[_Entry]) -> None:
+        self._by_rel: dict[str, _Entry] = {e.relpath: e for e in entries}
+
+    def holder(self, relpath: str) -> _Entry | None:
+        return self._by_rel.get(relpath)
+
+    def free_for(self, relpath: str, entry: _Entry) -> bool:
+        """True iff ``entry`` may write to ``relpath`` without clobbering."""
+        held = self._by_rel.get(relpath)
+        return held is None or held is entry
+
+    def move(self, src_rel: str, dst_rel: str, entry: _Entry) -> None:
+        """Record that ``entry`` moved ``src_rel`` -> ``dst_rel`` on disk."""
+        if self._by_rel.get(src_rel) is entry:
+            del self._by_rel[src_rel]
+        self._by_rel[dst_rel] = entry
+
+    def drop(self, relpath: str, entry: _Entry) -> None:
+        """Record that ``entry``'s file at ``relpath`` was deleted."""
+        if self._by_rel.get(relpath) is entry:
+            del self._by_rel[relpath]
+
+
 # --------------------------------------------------------------------------- #
 # Phase 2 -- reheat-relocate
 # --------------------------------------------------------------------------- #
 def _reheat_relocate(
-    vault: Vault, entries: list[_Entry], report: LintReport
+    vault: Vault, entries: list[_Entry], report: LintReport, occ: _Occupied
 ) -> list[_Entry]:
     """Move every ``status == "hot"`` page still under ``.cold`` out to hot.
 
     Relocation key exactly: ``status == "hot" and _COLD_COMPONENT in
     path.parts`` (design §4, pinned in Task 2.3). If the hot-location target
-    already exists as another parseable entry, do NOT lose data: leave the
-    cold copy in place and let :func:`_dedup` resolve the collision (both
-    survive into the dedup grouping). Page content is written unchanged.
+    is already held by another live entry (``occ`` -- the authoritative
+    no-clobber map), do NOT lose data: leave the cold copy in place (still
+    ``status: hot``) and let :func:`_dedup` resolve the collision -- both
+    survive into the same ``(type, slug.lower())`` dedup group and are
+    merged, never overwritten. Page content is written unchanged.
+
+    Crash-safety ordering contract (M3): write-new (atomic) THEN unlink-old;
+    NEVER reorder -- a crash mid-move must leave a recoverable duplicate,
+    never a lost page. Task 4.4/4.5 integrators must not reorder this.
     """
     out: list[_Entry] = []
-    by_rel = {e.relpath: e for e in entries}
     # Deterministic processing order.
     for entry in sorted(entries, key=lambda e: e.relpath):
         if not (entry.in_cold and entry.page.status == "hot"):
@@ -216,15 +310,18 @@ def _reheat_relocate(
             # Unknown type: cannot compute a hot home; leave it where it is.
             out.append(entry)
             continue
-        if target_rel in by_rel and by_rel[target_rel] is not entry:
+        if not occ.free_for(target_rel, entry):
             # Collision: keep both, defer to dedup. The cold copy survives in
-            # place (still status hot) so dedup groups it with the hot one.
+            # place (still status hot) so dedup groups it with the hot one
+            # and MERGES them -- no surviving page is ever overwritten.
             out.append(entry)
             continue
         target = vault.wiki_dir / target_rel
         # Content is unchanged (it was reheated in place by wiki_note).
+        # write-new THEN unlink-old (crash-safe ordering -- never reorder).
         atomic_write_text(target, serialize_page(entry.page))
         entry.path.unlink(missing_ok=True)
+        occ.move(entry.relpath, target_rel, entry)
         report.reheated.append(f"{entry.relpath} -> {target_rel}")
         out.append(
             _Entry(
@@ -248,16 +345,19 @@ def _reheat_relocate(
 # Phase 4 -- dedup / merge
 # --------------------------------------------------------------------------- #
 def _dedup(
-    vault: Vault, entries: list[_Entry], report: LintReport
+    vault: Vault, entries: list[_Entry], report: LintReport, occ: _Occupied
 ) -> list[_Entry]:
     """Merge logically-hot pages sharing ``(type, slug.lower())``.
 
     A page is *logically hot* iff ``page.status == "hot"`` -- this includes a
     deferred reheat collision (a ``status: hot`` page still physically under
     ``.cold/`` because :func:`_reheat_relocate` could not relocate it without
-    clobbering an existing hot page). Such collisions MUST be resolved here
-    (design §4 / pinned contract: reheat collisions are deferred to dedup).
-    Genuinely cold pages (``status == "cold"``) are never touched.
+    clobbering an existing hot page) AND a deferred stale->cold collision (a
+    stale page :func:`_stale_to_cold_impl` left ``status: hot`` because its
+    ``.cold/`` destination was held by another live entry). Such collisions
+    MUST be resolved here (design §4 / pinned contract: move collisions are
+    deferred to dedup). Genuinely cold pages (``status == "cold"``) are never
+    touched.
 
     keeper = max by ``page.updated`` (ISO string compare); tie-break = POSIX
     relpath ascending (the relpath that sorts first wins). Losers processed
@@ -266,10 +366,18 @@ def _dedup(
     (skipped if that exact header is already present -- idempotence). The
     keeper's ``updated``/``last_touched`` become the max (ISO string) of
     keeper and loser; ``created`` is preserved. Every loser file is deleted.
-    A surviving keeper always ends up at its **hot** location: if the keeper
-    was a deferred collision (physically under ``.cold/``) it is written to
-    ``wiki/{folder}/{slug}.md`` and the cold file removed. Single-member
-    groups are returned untouched (no spurious write).
+
+    A surviving keeper belongs at its **hot** location: if it was a deferred
+    collision (physically under ``.cold/``) it is written to
+    ``wiki/{folder}/{slug}.md`` and the cold file removed -- BUT only if that
+    hot relpath is free in ``occ`` (the no-clobber move invariant, C1). If a
+    *different* surviving entry still holds the hot relpath the relocate is
+    deferred (keeper stays under ``.cold/`` this run, still ``status: hot``)
+    so a subsequent run / the next dedup pass reconciles it; no surviving
+    page is ever overwritten. Single-member groups are returned untouched.
+
+    Crash-safety ordering contract (M3): write-new (atomic) THEN unlink-old
+    on the keeper-relocate; NEVER reorder.
     """
     logically_hot = [e for e in entries if e.page.status == "hot"]
     genuinely_cold = [e for e in entries if e.page.status != "hot"]
@@ -312,22 +420,32 @@ def _dedup(
             last_touched = max(last_touched, loser.page.last_touched)
             report.merged.append((keeper.relpath, loser.relpath))
             loser.path.unlink(missing_ok=True)
+            # The loser's relpath is now free on disk -- reflect that in the
+            # authoritative map so a keeper-relocate onto it is not a clobber.
+            occ.drop(loser.relpath, loser)
 
         keeper.page.body = body
         keeper.page.updated = updated
         keeper.page.last_touched = last_touched
 
-        # The merged keeper always belongs at its hot location. If it was a
-        # deferred reheat collision (still under .cold/), relocate it out.
+        # The merged keeper belongs at its hot location. If it was a deferred
+        # collision (still under .cold/), relocate it out -- but NEVER onto a
+        # relpath a different surviving entry still holds (no-clobber, C1).
         slug = _slug_of(keeper.relpath)
         try:
             hot_rel = _hot_relpath(vault, keeper.page, slug)
         except KeyError:  # unknown type: keep it where it is
             hot_rel = keeper.relpath
         hot_path = vault.wiki_dir / hot_rel
-        if keeper.in_cold and hot_rel != keeper.relpath:
+        if (
+            keeper.in_cold
+            and hot_rel != keeper.relpath
+            and occ.free_for(hot_rel, keeper)
+        ):
+            # write-new THEN unlink-old (crash-safe ordering -- never reorder).
             atomic_write_text(hot_path, serialize_page(keeper.page))
             keeper.path.unlink(missing_ok=True)
+            occ.move(keeper.relpath, hot_rel, keeper)
             report.reheated.append(f"{keeper.relpath} -> {hot_rel}")
             report.reheated.sort()
             survivors.append(
@@ -339,6 +457,9 @@ def _dedup(
                 )
             )
         else:
+            # Either already at its hot home, or the hot relpath is still
+            # held by a different surviving entry -> defer the relocate
+            # (keeper stays put this run, content still rewritten in place).
             _write_if_changed(keeper.path, serialize_page(keeper.page))
             survivors.append(keeper)
 
@@ -360,14 +481,33 @@ def _broken_links(
     ``wiki/{ref}.md`` OR ``wiki/.cold/{ref}.md`` exists (a link to a
     now-cold page is NOT broken). Nothing is modified or deleted -- broken
     links are recorded only (design §5).
+
+    Path-containment guard (I2): a ``links_out`` ref like
+    ``"../../../etc/hosts"`` resolves OUTSIDE the vault. Without a guard,
+    ``(wiki_dir / f"{ref}.md").exists()`` could return True for an unrelated
+    out-of-vault file and the escaping ref would be falsely treated as "not
+    broken" (and is inconsistent with :meth:`Vault.read_page`, which already
+    rejects out-of-vault refs via the same ``is_under`` helper imported from
+    ``nanobot.agent.tools.path_utils`` -- the exact import ``vault.py``
+    uses). A candidate is only accepted as satisfying the link if it BOTH
+    exists AND resolves under ``wiki_dir``; a ref that escapes the vault is
+    therefore recorded as BROKEN.
     """
     hot_entries = [e for e in entries if not e.in_cold]
+    wiki_root = vault.wiki_dir.resolve()
+
+    def _contained_and_exists(candidate: Path) -> bool:
+        resolved = candidate.resolve()
+        return is_under(resolved, wiki_root) and resolved.exists()
+
     broken: list[tuple[str, str]] = []
     for entry in sorted(hot_entries, key=lambda e: e.relpath):
         for ref in entry.page.links_out:
             hot_target = vault.wiki_dir / f"{ref}.md"
             cold_target = vault.wiki_dir / _COLD_COMPONENT / f"{ref}.md"
-            if hot_target.exists() or cold_target.exists():
+            if _contained_and_exists(hot_target) or _contained_and_exists(
+                cold_target
+            ):
                 continue
             broken.append((entry.relpath, ref))
     report.broken_links = sorted(broken)
@@ -463,10 +603,19 @@ def _moc_content(vault: Vault, entries: list[_Entry]) -> str:
     ``## Recent`` (hot pages by ``last_touched`` DESC then relpath ASC, each
     ``- [[{folder}/{slug}]] — {title}``).
 
+    The page ``title`` is untrusted free text (Ingest, Task 4.4, feeds Lint
+    model-/user-shaped titles and this MOC is injected verbatim into the
+    system prompt in Task 6.1). It is passed through :func:`_safe_inline`
+    so a title containing a newline cannot forge an extra MOC line and one
+    containing ``]]`` / ``[[`` cannot forge a spurious wikilink (I1).
+
     The total file must not exceed ``schema.moc_max_lines`` lines: oldest
     ``## Recent`` entries are dropped until it fits. ``moc_max_lines`` is a
     SOFT target -- if ``# Memory`` + ``## Map`` alone already exceed it, Map
-    is still emitted in full (correctness over the soft cap).
+    is still emitted in full (correctness over the soft cap). The
+    ``## Recent`` header is omitted ENTIRELY when it would have zero entries
+    -- whether because there are no hot pages or truncation dropped them all
+    -- so an empty section is never emitted (M2). Deterministic regardless.
     """
     hot = [e for e in entries if not e.in_cold]
     folders = sorted(
@@ -483,13 +632,18 @@ def _moc_content(vault: Vault, entries: list[_Entry]) -> str:
     for e in recent_sorted:
         folder = e.relpath.split("/", 1)[0]
         slug = _slug_of(e.relpath)
-        recent_lines.append(f"- [[{folder}/{slug}]] — {e.page.title}\n")
+        # _safe_inline neutralizes newline / wikilink prompt-injection (I1).
+        title = _safe_inline(e.page.title)
+        recent_lines.append(f"- [[{folder}/{slug}]] — {title}\n")
 
     cap = vault.schema.moc_max_lines
 
     def assemble(n_recent: int) -> str:
-        parts = [head] + map_lines + ["## Recent\n"] + recent_lines[:n_recent]
-        return "".join(parts)
+        # M2: emit the Recent header only when it has >=1 entry.
+        recent = (
+            ["## Recent\n", *recent_lines[:n_recent]] if n_recent > 0 else []
+        )
+        return "".join([head, *map_lines, *recent])
 
     n = len(recent_lines)
     content = assemble(n)
@@ -501,13 +655,33 @@ def _moc_content(vault: Vault, entries: list[_Entry]) -> str:
 
 
 class _DescStr(str):
-    """A string that sorts in DESCENDING order (for stable multi-key sort)."""
+    """A string whose ordering is REVERSED so it sorts DESCENDING.
+
+    Used purely as a composite sort key (newest ``last_touched`` first).
+    The ordering is now TOTAL and self-consistent (M1): all four ordering
+    dunders are reversed in lock-step so ``sorted``/``min``/``max`` and any
+    ``>``/``>=`` comparison all agree. ``__eq__``/``__hash__`` are
+    deliberately left as plain ``str`` semantics: equal strings are equal
+    (a stable sort then falls back to the secondary relpath key), and
+    reversing only the strict/loose orderings keeps the relation total
+    (exactly one of ``<``, ``==``, ``>`` holds for any two values).
+
+    ``functools.total_ordering`` cannot help here: it only fills in dunders
+    a class is *missing*, but ``str`` already defines all of them, so each
+    reversed operator must be written explicitly.
+    """
 
     def __lt__(self, other):  # type: ignore[override]
         return str.__gt__(self, other)
 
     def __le__(self, other):  # type: ignore[override]
         return str.__ge__(self, other)
+
+    def __gt__(self, other):  # type: ignore[override]
+        return str.__lt__(self, other)
+
+    def __ge__(self, other):  # type: ignore[override]
+        return str.__le__(self, other)
 
 
 def _desc_key(value: str) -> _DescStr:
@@ -581,9 +755,21 @@ def run_lint(vault: Vault, today: dt.date) -> LintReport:
     report = LintReport()
 
     entries = _scan(vault, report)
-    entries = _reheat_relocate(vault, entries, report)
-    entries = _stale_to_cold_impl(vault, entries, report, today)
-    entries = _dedup(vault, entries, report)
+    # One authoritative no-clobber map, seeded from the post-scan on-disk
+    # truth and kept in lock-step through every move phase (C1 invariant:
+    # no phase may atomic_write_text onto a relpath a different surviving
+    # entry holds; colliding pages are merged or deferred, never overwritten).
+    occ = _Occupied(entries)
+    entries = _reheat_relocate(vault, entries, report, occ)
+    entries = _stale_to_cold_impl(vault, entries, report, today, occ)
+    entries = _dedup(vault, entries, report, occ)
+    # Post-dedup stale sweep: a stale page whose .cold/ destination was
+    # held by another live entry was DEFERRED above (left status: hot) so
+    # dedup could MERGE the collision instead of clobbering it. The merged
+    # keeper may now itself be stale with a (now-freed) destination -- cool
+    # it here so the whole run reaches a fixpoint (run #2 == run #1). The
+    # sweep is itself idempotent: on a settled tree nothing is stale-and-hot.
+    entries = _stale_to_cold_impl(vault, entries, report, today, occ)
     _broken_links(vault, entries, report)
     _regenerate_indexes(vault, entries, report)
     _regenerate_moc(vault, entries, report)
@@ -596,14 +782,38 @@ def _stale_to_cold_impl(
     entries: list[_Entry],
     report: LintReport,
     today: dt.date,
+    occ: _Occupied,
 ) -> list[_Entry]:
     """Move hot-located stale pages into ``.cold/`` (status flipped cold).
 
     Considers only hot-located pages (``not in_cold``); runs after reheat so
     a freshly reheated page (last_touched == today) is never re-cooled.
+
+    No-clobber move invariant (C1): the ``.cold/`` destination relpath is
+    NEVER written if a *different* surviving entry already holds it (``occ``
+    -- the authoritative map). The classic data-loss case is a stale hot
+    page X at ``people/sam.md`` whose cold home ``.cold/people/sam.md`` is
+    already physically occupied by a deferred-reheat page Y (``status: hot``,
+    same ``(type, slug.lower())``). Naively cooling X here would
+    ``atomic_write_text`` over Y's file and then unlink X's old path --
+    silently destroying Y. Instead the cool is **DEFERRED**: X is left
+    exactly where it is *with ``status`` unchanged (still ``hot``)* so X and
+    Y remain in the same logical-hot dedup group and :func:`_dedup` MERGES
+    them (keeper = max ``updated``; loser body appended under ``## merged
+    from {relpath}``; loser deleted) -- no page is ever overwritten or lost.
+    The post-dedup invocation of this function then cools the merged keeper
+    (its destination is now free), so the whole run reaches a fixpoint and
+    run #2 makes zero changes (idempotent + deterministic).
+
+    Crash-safety ordering contract (M3): write-new (atomic) THEN unlink-old;
+    NEVER reorder -- a crash mid-cool must leave a recoverable duplicate.
+
+    ``report.cooled`` is ACCUMULATED (this function is invoked twice per
+    run -- pre- and post-dedup); it is re-sorted in place each call so the
+    report stays deterministically ordered regardless of invocation count.
     """
     out: list[_Entry] = []
-    cooled: list[str] = []
+    cooled: list[str] = list(report.cooled)
     for entry in sorted(entries, key=lambda e: e.relpath):
         if entry.in_cold or not should_cool(entry.page, vault.schema, today):
             out.append(entry)
@@ -614,10 +824,19 @@ def _stale_to_cold_impl(
         except KeyError:  # pragma: no cover - should_cool gates unknown types
             out.append(entry)
             continue
+        if not occ.free_for(target_rel, entry):
+            # Collision: the cold destination is held by a different
+            # surviving entry. DEFER -- leave the page in place, status
+            # UNCHANGED (still hot) so dedup merges the collision rather
+            # than this phase clobbering a surviving page. No mutation.
+            out.append(entry)
+            continue
         entry.page.status = "cold"
         target = vault.wiki_dir / target_rel
+        # write-new THEN unlink-old (crash-safe ordering -- never reorder).
         atomic_write_text(target, serialize_page(entry.page))
         entry.path.unlink(missing_ok=True)
+        occ.move(entry.relpath, target_rel, entry)
         cooled.append(entry.relpath)
         out.append(
             _Entry(
@@ -627,6 +846,6 @@ def _stale_to_cold_impl(
                 in_cold=True,
             )
         )
-    report.cooled = sorted(cooled)
+    report.cooled = sorted(set(cooled))
     out.sort(key=lambda e: e.relpath)
     return out

@@ -212,7 +212,93 @@ class TestDedup:
         assert (".cold/projects/svc.md", "projects/svc.md") in rep.merged
 
 
+class TestMoveTargetCollision:
+    """C1 regression: a move phase must NEVER overwrite a destination relpath
+    held by another surviving entry. The classic data-loss scenario is a
+    stale hot page X at ``people/sam.md`` whose cold destination
+    ``.cold/people/sam.md`` is already physically occupied by a deferred
+    reheat page Y. Naively cooling X ``atomic_write_text``\\s onto Y's file
+    and unlinks X's old path -> Y is silently destroyed forever.
+    """
+
+    def test_stale_cool_does_not_clobber_deferred_reheat_page(self, tmp_path):
+        v = _vault(tmp_path)
+        # X: hot + stale (will cool) at the HOT location.
+        _write(
+            v,
+            "people/sam.md",
+            _page(title="Xsam", status="hot", last_touched="2024-01-01",
+                  body="XSTALE\n"),
+        )
+        # Y: a reheated page (status hot) still physically under .cold,
+        # awaiting relocation -- its hot target people/sam.md is occupied
+        # by X so _reheat_relocate defers it. Fresh so it never cools.
+        _write(
+            v,
+            ".cold/people/sam.md",
+            _page(title="Ysam", status="hot", last_touched="2026-05-18",
+                  body="YCOLD\n"),
+        )
+
+        rep = run_lint(v, TODAY)
+
+        # Gather every body that survives anywhere under the vault.
+        survivors: list[str] = []
+        for p in sorted(v.wiki_dir.rglob("*.md")):
+            if p.name in {"SCHEMA.md", "_index.md"}:
+                continue
+            try:
+                survivors.append(parse_page(p.read_text(encoding="utf-8")).body)
+            except ValueError:
+                pass
+        joined = "\n".join(survivors)
+        # NEITHER body may be lost: both must be present on disk (merged
+        # into one page, or both at distinct valid locations).
+        assert "XSTALE" in joined, (
+            f"X's body was silently destroyed; survivors={survivors!r}"
+        )
+        assert "YCOLD" in joined, (
+            f"Y's body was silently destroyed; survivors={survivors!r}"
+        )
+        assert isinstance(rep, LintReport)
+
+        # Idempotence: a second run is a total byte-level no-op.
+        snap1 = _snapshot(v)
+        rep2 = run_lint(v, TODAY)
+        snap2 = _snapshot(v)
+        assert snap1 == snap2
+        assert rep2.changed is False
+
+
 class TestBrokenLinks:
+    def test_broken_link_escaping_vault_is_reported_not_followed(self, tmp_path):
+        v = _vault(tmp_path)
+        # A links_out ref that escapes the vault via .. traversal AND whose
+        # resolved target actually EXISTS on disk (outside the vault). With
+        # no containment guard, vault.wiki_dir / f"{ref}.md" .exists() would
+        # be True and the escaping ref falsely treated as "not broken".
+        outside = tmp_path / "outside.md"
+        outside.write_text("secret\n", encoding="utf-8")
+        # people/alice.md -> need to climb out of wiki/people/ to tmp_path:
+        #   wiki/people/<ref>.md ; ../../../../outside reaches tmp_path/outside
+        ref = "../../../../outside"
+        page = _page(title="Alice", links_out=[ref])
+        before = serialize_page(page)
+        _write(v, "people/alice.md", page)
+        # Sanity: the escaping candidate really does resolve onto a real file.
+        assert (v.wiki_dir / f"{ref}.md").exists()
+
+        rep = run_lint(v, TODAY)
+
+        assert ("people/alice.md", ref) in rep.broken_links
+        # Nothing about the page was modified by the broken-link phase.
+        got = parse_page(
+            (v.wiki_dir / "people" / "alice.md").read_text(encoding="utf-8")
+        )
+        assert serialize_page(got) == before
+        # The out-of-vault file is never touched.
+        assert outside.read_text(encoding="utf-8") == "secret\n"
+
     def test_broken_link_recorded_not_modified(self, tmp_path):
         v = _vault(tmp_path)
         page = _page(title="Alice", links_out=["projects/ghost"])
@@ -313,6 +399,41 @@ class TestMocRegeneration:
         recent = moc.split("## Recent\n", 1)[1]
         assert recent.index("projects/svc") < recent.index("people/alice")
         assert rep.moc_regenerated is True
+
+    def test_moc_title_is_sanitized_against_injection(self, tmp_path):
+        v = _vault(tmp_path)
+        _write(
+            v,
+            "people/alice.md",
+            _page(title="Bad]] [[x\nINJECTED", last_touched="2026-05-18"),
+        )
+        run_lint(v, TODAY)
+        moc = (v.root / "MEMORY.md").read_text(encoding="utf-8")
+        recent = moc.split("## Recent\n", 1)[1]
+        recent_lines = [ln for ln in recent.splitlines() if ln.strip()]
+        # Exactly ONE physical Recent line for this page (no forged newline).
+        assert len(recent_lines) == 1, recent_lines
+        line = recent_lines[0]
+        assert line.startswith("- [[people/alice]] — ")
+        # The forged wikilink/newline must not survive into the rendered MOC.
+        assert "INJECTED" in line  # text preserved, just inlined
+        assert "\n" not in line
+        # No spurious wikilink brackets beyond the single intended [[..]] ref.
+        title_part = line.split("—", 1)[1]
+        assert "[[" not in title_part
+        assert "]]" not in title_part
+
+    def test_moc_omits_recent_header_when_no_hot_pages(self, tmp_path):
+        v = _vault(tmp_path)
+        # Only a genuinely-cold page exists -> zero hot pages -> no Recent.
+        _write(
+            v,
+            ".cold/projects/old.md",
+            _page(type="projects", title="Old", status="cold"),
+        )
+        run_lint(v, TODAY)
+        moc = (v.root / "MEMORY.md").read_text(encoding="utf-8")
+        assert "## Recent" not in moc
 
     def test_moc_respects_max_lines_truncation(self, tmp_path):
         # Tiny moc_max_lines via a custom per-vault SCHEMA so truncation fires.
