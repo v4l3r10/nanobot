@@ -848,3 +848,199 @@ async def test_read_cold_path_reheats_in_place(tmp_path):
     assert not hot_copy.exists(), (
         "read must NOT relocate out of .cold/ (that is Lint/Task 4.3)"
     )
+
+
+# --- Task 2.4: search operation (keyword/tag/recency over hot + cold) ---
+
+
+def _seed_page(tmp_path, relpath, page):
+    """Write ``serialize_page(page)`` to ``wiki/<relpath>`` for telegram:1."""
+    target = _wiki_dir(tmp_path) / relpath
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(serialize_page(page), encoding="utf-8")
+    return target
+
+
+def _page(**kw):
+    """A Page with sane defaults; override per test."""
+    base = dict(
+        type="people",
+        title="T",
+        status="hot",
+        created="2026-01-01",
+        updated="2026-01-01",
+        last_touched="2026-01-01",
+        tags=[],
+        links_out=[],
+        pinned=None,
+        body="",
+    )
+    base.update(kw)
+    return Page(**base)
+
+
+async def test_search_keyword_matches_hot_and_cold(tmp_path):
+    t = _tool(tmp_path)
+    _seed_page(
+        tmp_path,
+        "people/alice.md",
+        _page(type="people", title="Alice", body="handles the payment flow"),
+    )
+    _seed_page(
+        tmp_path,
+        "projects/pay.md",
+        _page(type="projects", title="Payment Service", body="misc"),
+    )
+    _seed_page(
+        tmp_path,
+        ".cold/concepts/legacy.md",
+        _page(
+            type="concepts",
+            title="Legacy",
+            status="cold",
+            body="legacy payment code",
+        ),
+    )
+
+    out = await t.execute(operation="search", query="payment")
+    assert "Traceback" not in out
+    assert "people/alice.md" in out
+    assert "projects/pay.md" in out
+    assert ".cold/concepts/legacy.md" in out
+    # The cold one is marked (cold); the hot ones are not.
+    for line in out.splitlines():
+        if ".cold/concepts/legacy.md" in line:
+            assert "(cold)" in line
+        if "people/alice.md" in line or "projects/pay.md" in line:
+            assert "(cold)" not in line
+
+
+async def test_search_ranks_title_over_body(tmp_path):
+    t = _tool(tmp_path)
+    _seed_page(
+        tmp_path,
+        "concepts/a.md",
+        _page(type="concepts", title="Widget design", body="nothing here"),
+    )
+    _seed_page(
+        tmp_path,
+        "concepts/b.md",
+        _page(type="concepts", title="Other", body="this mentions widget once"),
+    )
+    out = await t.execute(operation="search", query="widget")
+    assert "concepts/a.md" in out
+    assert "concepts/b.md" in out
+    # Title-weighted A must rank before body-only B.
+    assert out.index("concepts/a.md") < out.index("concepts/b.md")
+
+
+async def test_search_tag_filter(tmp_path):
+    t = _tool(tmp_path)
+    _seed_page(
+        tmp_path,
+        "people/x.md",
+        _page(type="people", title="X", tags=["eng", "team"]),
+    )
+    _seed_page(
+        tmp_path,
+        "people/y.md",
+        _page(type="people", title="Y", tags=["ops"]),
+    )
+    _seed_page(
+        tmp_path,
+        "people/z.md",
+        _page(type="people", title="Z", tags=["ENG"]),
+    )
+    out = await t.execute(operation="search", query="tag:eng")
+    assert "people/x.md" in out
+    assert "people/y.md" not in out
+    # Case-insensitive: a page tagged "ENG" is matched by tag:eng.
+    assert "people/z.md" in out
+
+
+async def test_search_empty_query_returns_recent(tmp_path):
+    t = _tool(tmp_path)
+    _seed_page(
+        tmp_path,
+        "people/old.md",
+        _page(type="people", title="Old", last_touched="2026-01-01"),
+    )
+    _seed_page(
+        tmp_path,
+        "people/mid.md",
+        _page(type="people", title="Mid", last_touched="2026-03-01"),
+    )
+    _seed_page(
+        tmp_path,
+        "people/new.md",
+        _page(type="people", title="New", last_touched="2026-05-01"),
+    )
+    for q in ("", None):
+        out = (
+            await t.execute(operation="search", query=q)
+            if q is not None
+            else await t.execute(operation="search")
+        )
+        assert "people/new.md" in out
+        assert "people/mid.md" in out
+        assert "people/old.md" in out
+        # Most-recent first.
+        assert out.index("people/new.md") < out.index("people/mid.md")
+        assert out.index("people/mid.md") < out.index("people/old.md")
+
+
+async def test_search_caps_at_20(tmp_path):
+    t = _tool(tmp_path)
+    for i in range(25):
+        _seed_page(
+            tmp_path,
+            f"concepts/p{i:02d}.md",
+            _page(type="concepts", title=f"P{i}", body="has a z in it"),
+        )
+    out = await t.execute(operation="search", query="z")
+    assert "Traceback" not in out
+    page_lines = [ln for ln in out.splitlines() if ln.startswith("- ")]
+    assert len(page_lines) == 20, f"expected 20 page lines, got {len(page_lines)}"
+    assert "more not shown" in out
+
+
+async def test_search_no_match_message(tmp_path):
+    t = _tool(tmp_path)
+    _seed_page(
+        tmp_path,
+        "people/alice.md",
+        _page(type="people", title="Alice", body="payments"),
+    )
+    out = await t.execute(operation="search", query="zzqqnomatchxx")
+    assert isinstance(out, str)
+    assert out.strip() != ""
+    assert "No matching pages" in out
+    assert "Traceback" not in out
+
+
+async def test_search_does_not_reheat(tmp_path):
+    t = _tool(tmp_path)
+    cold_file = _seed_page(
+        tmp_path,
+        ".cold/concepts/frozen.md",
+        _page(
+            type="concepts",
+            title="Frozen",
+            status="cold",
+            last_touched="2020-01-01",
+            body="cold knowledge about widgets",
+        ),
+    )
+    mtime_before = cold_file.stat().st_mtime_ns
+    bytes_before = cold_file.read_bytes()
+
+    out = await t.execute(operation="search", query="widgets")
+    assert ".cold/concepts/frozen.md" in out
+
+    # Search must NEVER reheat: file byte-identical, mtime untouched, still cold.
+    assert cold_file.read_bytes() == bytes_before
+    assert cold_file.stat().st_mtime_ns == mtime_before, (
+        "search rewrote the cold page (must never reheat — only read does)"
+    )
+    on_disk = parse_page(cold_file.read_text(encoding="utf-8"))
+    assert on_disk.status == "cold"
