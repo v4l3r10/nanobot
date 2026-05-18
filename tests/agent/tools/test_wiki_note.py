@@ -390,3 +390,186 @@ async def test_frontmatter_gate_rejects_when_schema_requires_extra(tmp_path):
     # Nothing may have been written (no page, no index).
     written = [p for p in _all_md_files(wiki_dir) if p.name != "SCHEMA.md"]
     assert written == [], f"unexpected files written: {written}"
+
+
+# --- Task 2.2 re-review: reserved/hidden slug, length clamp, Unicode Cc/Cf ---
+
+
+async def test_create_rejects_reserved_slug(tmp_path):
+    """A slug whose resulting basename collides with a vault-structural,
+    non-page name (``SCHEMA.md``, ``_index.md``) must be refused outright
+    (R1). Otherwise the page is permanently invisible to Ingest/Lint
+    (``Vault._NON_PAGE_NAMES`` matches by basename regardless of folder) yet
+    a dangling ``[[people/SCHEMA]]`` stub gets added to ``_index.md`` — a
+    silently-broken phantom page. Nothing may be written and the index must
+    contain NO dangling stub for the rejected slug.
+    """
+    t = _tool(tmp_path)
+    for bad in ("SCHEMA", "_index"):
+        out = await t.execute(
+            operation="create",
+            type="people",
+            slug=bad,
+            title="X",
+            body="b",
+        )
+        assert isinstance(out, str)
+        assert out.startswith("Error:"), out
+        assert "reserved" in out.lower() or "invalid" in out.lower()
+        assert "Traceback" not in out
+
+    wiki_dir = _wiki_dir(tmp_path)
+    # No colliding page file may exist (people/SCHEMA.md, people/_index.md
+    # as a *page* — the only _index.md allowed is the MOC itself).
+    assert not (wiki_dir / "people" / "SCHEMA.md").exists()
+    # The MOC must not exist at all (nothing legitimate was created), or if
+    # it somehow does it must carry no dangling stub for a rejected slug.
+    index = wiki_dir / "people" / "_index.md"
+    if index.exists():
+        text = index.read_text(encoding="utf-8")
+        assert "[[people/SCHEMA]]" not in text
+        assert "[[people/_index]]" not in text
+
+
+async def test_create_rejects_dotcold_and_hidden_slug(tmp_path):
+    """A slug equal to the cold-marker component (``.cold``) or any slug
+    whose sanitized name starts with ``.`` (hidden/structural) must be
+    refused; nothing may be written (R1)."""
+    t = _tool(tmp_path)
+    for bad in (".cold", ".hidden"):
+        out = await t.execute(
+            operation="create",
+            type="people",
+            slug=bad,
+            title="X",
+            body="b",
+        )
+        assert isinstance(out, str)
+        assert out.startswith("Error:"), out
+        assert "reserved" in out.lower() or "invalid" in out.lower()
+        assert "Traceback" not in out
+
+    wiki_dir = _wiki_dir(tmp_path)
+    written = [p for p in _all_md_files(wiki_dir) if p.name != "SCHEMA.md"]
+    assert written == [], f"unexpected files written: {written}"
+
+
+async def test_create_clamps_long_slug(tmp_path):
+    """A ~300-char slug must be deterministically clamped to a single
+    safe component <= the cap (no raw OSError/WinError, cross-platform
+    identical), with exactly one well-formed _index stub. Running twice
+    yields the same name (deterministic)."""
+    t = _tool(tmp_path)
+    long_slug = "a" * 300
+    out = await t.execute(
+        operation="create",
+        type="people",
+        slug=long_slug,
+        title="X",
+        body="body",
+    )
+    assert out.startswith("Created page"), out
+    assert "Traceback" not in out
+    assert "WinError" not in out
+
+    wiki_dir = _wiki_dir(tmp_path)
+    people = wiki_dir / "people"
+    pages = [p for p in people.glob("*.md") if p.name != "_index.md"]
+    assert len(pages) == 1, f"expected one page, got: {pages}"
+    name = pages[0].name
+    stem = name[:-3]  # strip .md
+    assert "/" not in stem and "\\" not in stem, "must be single component"
+    assert len(stem) <= 80, f"slug stem not clamped: {len(stem)} chars"
+    assert set(stem) == {"a"}, f"unexpected clamp content: {stem!r}"
+
+    index = people / "_index.md"
+    text = index.read_text(encoding="utf-8")
+    stub_lines = [ln for ln in text.splitlines() if "[[people/" in ln]
+    assert stub_lines == [f"- [[people/{stem}]]"], (
+        f"expected one well-formed stub, got: {text!r}"
+    )
+
+    # Deterministic: a second tool/session with the same long slug must
+    # produce the identical clamped name.
+    t2 = WikiNoteTool.create(_ctx(tmp_path))
+    t2.set_context(
+        RequestContext(channel="telegram", chat_id="9", session_key="telegram:9")
+    )
+    out2 = await t2.execute(
+        operation="create",
+        type="people",
+        slug=long_slug,
+        title="X",
+        body="body",
+    )
+    assert out2.startswith("Created page"), out2
+    assert stem in out2, f"non-deterministic clamp: {out!r} vs {out2!r}"
+
+
+async def test_create_rejects_unicode_bidi_slug(tmp_path):
+    """A slug containing a Unicode bidi-override / format char (U+202E)
+    must be refused (R3): it survives into filenames + MOC wikilinks.
+    Nothing may be written."""
+    t = _tool(tmp_path)
+    out = await t.execute(
+        operation="create",
+        type="people",
+        slug="‮evil",
+        title="X",
+        body="b",
+    )
+    assert isinstance(out, str)
+    assert out.startswith("Error:"), out
+    assert "invalid slug" in out.lower()
+    assert "Traceback" not in out
+
+    wiki_dir = _wiki_dir(tmp_path)
+    written = [p for p in _all_md_files(wiki_dir) if p.name != "SCHEMA.md"]
+    assert written == [], f"unexpected files written: {written}"
+
+
+async def test_create_allows_accented_slug(tmp_path):
+    """Benign Unicode letters (accented latin, CJK) must still pass through
+    _safe_slug and create successfully — _safe_slug must NOT ASCII-only the
+    slug, only reject Cc/Cf control/format chars (R3)."""
+    t = _tool(tmp_path)
+    out = await t.execute(
+        operation="create",
+        type="people",
+        slug="café-notes",
+        title="X",
+        body="body",
+    )
+    assert out.startswith("Created page"), out
+    assert "Traceback" not in out
+
+    wiki_dir = _wiki_dir(tmp_path)
+    people = wiki_dir / "people"
+    pages = [p for p in people.glob("*.md") if p.name != "_index.md"]
+    assert len(pages) == 1, f"expected one page, got: {pages}"
+    stem = pages[0].name[:-3]
+    assert "caf" in stem and stem.endswith("notes")
+    assert "/" not in stem and "\\" not in stem
+
+    index = people / "_index.md"
+    text = index.read_text(encoding="utf-8")
+    stub_lines = [ln for ln in text.splitlines() if "[[people/" in ln]
+    assert stub_lines == [f"- [[people/{stem}]]"], (
+        f"expected one well-formed stub, got: {text!r}"
+    )
+
+
+async def test_create_allows_legitimate_design_slugs(tmp_path):
+    """Sanity: ordinary design slugs (payment-svc, 2026-some-decision,
+    auth-model) must still create cleanly through the hardened seam."""
+    t = _tool(tmp_path)
+    for slug in ("payment-svc", "2026-some-decision", "auth-model"):
+        out = await t.execute(
+            operation="create",
+            type="concepts",
+            slug=slug,
+            title="X",
+            body="b",
+        )
+        assert out.startswith("Created page"), (slug, out)
+        assert f"{slug}.md" in out, (slug, out)
