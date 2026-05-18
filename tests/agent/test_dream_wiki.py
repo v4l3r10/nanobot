@@ -34,7 +34,6 @@ passing Dream tests rather than a strawman. Keep this block in sync with
 """
 
 import asyncio
-
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
