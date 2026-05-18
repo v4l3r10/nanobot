@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.wiki_note import WikiNoteTool
+from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.paths import vault_dir, vault_slug
 from nanobot.utils.vault_lock import get_vault_lock
 
@@ -573,3 +574,212 @@ async def test_create_allows_legitimate_design_slugs(tmp_path):
         )
         assert out.startswith("Created page"), (slug, out)
         assert f"{slug}.md" in out, (slug, out)
+
+
+# --- Task 2.3: append operation + reheat-on-read ---
+
+
+import datetime  # noqa: E402
+
+
+def _today():
+    return datetime.date.today().isoformat()
+
+
+async def test_append_adds_text_bumps_freshness(tmp_path):
+    """append grows the body (one separator newline) and bumps updated +
+    last_touched to today, leaving every other frontmatter field byte-equal."""
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create",
+        type="people",
+        slug="alice",
+        title="Alice",
+        body="placeholder",
+    )
+    page_file = _wiki_dir(tmp_path) / "people" / "alice.md"
+    # Overwrite on disk with controlled, stale frontmatter.
+    stale = Page(
+        type="people",
+        title="Alice",
+        status="hot",
+        created="2020-01-01",
+        updated="2020-01-01",
+        last_touched="2020-01-01",
+        tags=["x"],
+        links_out=["people/bob"],
+        pinned=True,
+        body="OLD.\n",
+    )
+    page_file.write_text(serialize_page(stale), encoding="utf-8")
+
+    out = await t.execute(
+        operation="append", path="people/alice.md", text="NEW LINE"
+    )
+    assert "Traceback" not in out
+    assert not out.startswith("Error:"), out
+
+    page = parse_page(page_file.read_text(encoding="utf-8"))
+    assert "OLD." in page.body
+    assert "NEW LINE" in page.body
+    assert page.updated == _today()
+    assert page.last_touched == _today()
+    # Everything else byte-identical.
+    assert page.created == "2020-01-01"
+    assert page.title == "Alice"
+    assert page.type == "people"
+    assert page.status == "hot"
+    assert page.tags == ["x"]
+    assert page.links_out == ["people/bob"]
+    assert page.pinned is True
+
+
+async def test_append_missing_page_errors(tmp_path):
+    t = _tool(tmp_path)
+    out = await t.execute(
+        operation="append", path="people/ghost.md", text="x"
+    )
+    assert out.startswith("Error:"), out
+    assert "not found" in out.lower()
+    assert "Traceback" not in out
+    wiki_dir = _wiki_dir(tmp_path)
+    written = [p for p in _all_md_files(wiki_dir) if p.name != "SCHEMA.md"]
+    assert written == [], f"unexpected files written: {written}"
+
+
+async def test_append_refuses_reserved_path(tmp_path):
+    t = _tool(tmp_path)
+    # Create a real page so the people/ folder + _index.md exist.
+    await t.execute(
+        operation="create",
+        type="people",
+        slug="alice",
+        title="Alice",
+        body="hi",
+    )
+    people = _wiki_dir(tmp_path) / "people"
+    index = people / "_index.md"
+    schema_md = people.parent / "SCHEMA.md"
+    schema_md.write_text("# fake schema\n", encoding="utf-8")
+
+    before_index = index.read_text(encoding="utf-8")
+    before_schema = schema_md.read_text(encoding="utf-8")
+
+    out1 = await t.execute(
+        operation="append", path="people/_index.md", text="x"
+    )
+    assert out1.startswith("Error:"), out1
+    assert "Traceback" not in out1
+    assert index.read_text(encoding="utf-8") == before_index
+
+    out2 = await t.execute(
+        operation="append", path="SCHEMA.md", text="x"
+    )
+    assert out2.startswith("Error:"), out2
+    assert "Traceback" not in out2
+    assert schema_md.read_text(encoding="utf-8") == before_schema
+
+
+async def test_append_refuses_cold_path(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create",
+        type="people",
+        slug="old",
+        title="Old",
+        body="archived",
+    )
+    src = _wiki_dir(tmp_path) / "people" / "old.md"
+    cold_dir = _wiki_dir(tmp_path) / ".cold" / "people"
+    cold_dir.mkdir(parents=True, exist_ok=True)
+    cold_page = Page(
+        type="people",
+        title="Old",
+        status="cold",
+        created="2020-01-01",
+        updated="2020-01-01",
+        last_touched="2020-01-01",
+        body="archived\n",
+    )
+    cold_file = cold_dir / "old.md"
+    cold_file.write_text(serialize_page(cold_page), encoding="utf-8")
+    src.unlink()
+
+    before = cold_file.read_text(encoding="utf-8")
+    out = await t.execute(
+        operation="append", path=".cold/people/old.md", text="x"
+    )
+    assert out.startswith("Error:"), out
+    assert "Traceback" not in out
+    assert cold_file.read_text(encoding="utf-8") == before
+
+
+async def test_read_reheats_cold_page(tmp_path):
+    t = _tool(tmp_path)
+    people = _wiki_dir(tmp_path) / "people"
+    people.mkdir(parents=True, exist_ok=True)
+    frozen = people / "frozen.md"
+    cold_page = Page(
+        type="people",
+        title="Frozen",
+        status="cold",
+        created="2020-01-01",
+        updated="2020-01-01",
+        last_touched="2020-01-01",
+        body="thawing\n",
+    )
+    frozen.write_text(serialize_page(cold_page), encoding="utf-8")
+
+    out = await t.execute(operation="read", path="people/frozen.md")
+    assert "status: hot" in out
+    assert "Traceback" not in out
+    on_disk = parse_page(frozen.read_text(encoding="utf-8"))
+    assert on_disk.status == "hot"
+    assert on_disk.last_touched == _today()
+
+    # Second read of a now-hot page must NOT rewrite the file.
+    mtime_after_reheat = frozen.stat().st_mtime_ns
+    bytes_after_reheat = frozen.read_text(encoding="utf-8")
+    out2 = await t.execute(operation="read", path="people/frozen.md")
+    assert "status: hot" in out2
+    assert frozen.stat().st_mtime_ns == mtime_after_reheat, (
+        "hot read rewrote the file"
+    )
+    assert frozen.read_text(encoding="utf-8") == bytes_after_reheat
+    assert out2 == bytes_after_reheat
+
+
+async def test_read_hot_page_does_not_rewrite(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create",
+        type="people",
+        slug="bob",
+        title="Bob",
+        body="payments",
+    )
+    page_file = _wiki_dir(tmp_path) / "people" / "bob.md"
+    mtime_before = page_file.stat().st_mtime_ns
+    out = await t.execute(operation="read", path="people/bob.md")
+    assert "payments" in out
+    assert page_file.stat().st_mtime_ns == mtime_before, (
+        "hot read performed a write"
+    )
+
+
+async def test_append_then_read_roundtrip(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create",
+        type="people",
+        slug="carol",
+        title="Carol",
+        body="start",
+    )
+    appended = await t.execute(
+        operation="append", path="people/carol.md", text="EXTRA42"
+    )
+    assert not appended.startswith("Error:"), appended
+    out = await t.execute(operation="read", path="people/carol.md")
+    assert "EXTRA42" in out
+    assert "start" in out
