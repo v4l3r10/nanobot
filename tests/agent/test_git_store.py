@@ -232,3 +232,204 @@ class TestMemoryStoreGitProperty:
         from nanobot.agent.memory import MemoryStore
         store = MemoryStore(tmp_path)
         assert store.git is store._git
+
+
+# ---------------------------------------------------------------------------
+# Task 5.1 — versioning the per-user wiki vaults under memory/users/**
+# ---------------------------------------------------------------------------
+
+# The full static base MemoryStore uses (includes the dream cursor); the
+# 5.1 vault expansion is layered on top of this in GitStore.
+LEGACY_FOUR = ["SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor"]
+
+
+def _commit_tree_paths(workspace: Path) -> set[str]:
+    """Return the set of repo-relative POSIX paths in the HEAD commit tree."""
+    from dulwich.repo import Repo
+
+    paths: set[str] = set()
+    with Repo(str(workspace)) as repo:
+        head = repo.refs[b"HEAD"]
+        commit = repo[head]
+        tree = repo[commit.tree]
+
+        def _walk(t, prefix=""):
+            for name, _mode, sha in t.items():
+                n = name.decode()
+                obj = repo[sha]
+                if obj.type_name == b"tree":
+                    _walk(obj, prefix + n + "/")
+                else:
+                    paths.add(prefix + n)
+
+        _walk(tree)
+    return paths
+
+
+@pytest.fixture
+def vault_git(tmp_path):
+    """A GitStore using the same static base as MemoryStore (legacy 4)."""
+    return GitStore(tmp_path, tracked_files=list(LEGACY_FOUR))
+
+
+class TestVaultVersioning:
+    def test_no_vault_tracks_exactly_legacy_four(self, vault_git, tmp_path):
+        """GOLDEN regression for 5.1: no memory/users/ → byte-identical to before.
+
+        The commit tree must contain exactly the legacy-4 files (plus the
+        .gitignore the init writes) and zero memory/users entries. The
+        effective-tracked set must equal exactly the static base.
+        """
+        vault_git.init()
+        # init() touches all 4 legacy files, so all are committed at init.
+        (tmp_path / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        sha = vault_git.auto_commit("update")
+        assert sha is not None
+
+        tree = _commit_tree_paths(tmp_path)
+        assert tree == {".gitignore", *LEGACY_FOUR}
+        assert not any(p.startswith("memory/users") for p in tree)
+
+        # No vault dir → effective set is exactly the static base.
+        assert vault_git._effective_tracked_files() == list(LEGACY_FOUR)
+
+        # .gitignore only gains a single additive allow-rule that matches
+        # nothing here (no memory/users/ dir exists in a stock workspace).
+        gi = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+        assert "!memory/users/**\n" in gi
+        # No trailing-slash vault dir rule — keeps the legacy dir-entry
+        # contract intact for root-only tracked sets.
+        assert "!memory/users/\n" not in gi
+
+    def test_vault_files_are_committed(self, vault_git, tmp_path):
+        """Vault files (incl. dot dirs/files, nested) must be staged."""
+        vault_git.init()
+        base = tmp_path / "memory" / "users" / "unified_default"
+        (base / "wiki" / "people").mkdir(parents=True, exist_ok=True)
+        (base / "wiki" / ".cold" / "concepts").mkdir(parents=True, exist_ok=True)
+        (base / "MEMORY.md").write_text("vault mem", encoding="utf-8")
+        (base / "wiki" / "SCHEMA.md").write_text("schema", encoding="utf-8")
+        (base / "wiki" / "people" / "alice.md").write_text("alice", encoding="utf-8")
+        (base / "wiki" / "people" / "_index.md").write_text("idx", encoding="utf-8")
+        (base / "wiki" / ".cold" / "concepts" / "old.md").write_text("old", encoding="utf-8")
+        (base / ".lint.log").write_text("lint", encoding="utf-8")
+
+        sha = vault_git.auto_commit("ingest vault")
+        assert sha is not None
+
+        tree = _commit_tree_paths(tmp_path)
+        pfx = "memory/users/unified_default/"
+        for rel in [
+            "MEMORY.md",
+            "wiki/SCHEMA.md",
+            "wiki/people/alice.md",
+            "wiki/people/_index.md",
+            "wiki/.cold/concepts/old.md",
+            ".lint.log",
+        ]:
+            assert pfx + rel in tree, f"{pfx + rel} missing from commit tree"
+
+    def test_revert_restores_vault(self, vault_git, tmp_path):
+        """revert() must restore the vault tree (5.2 /dream-restore relies on this).
+
+        Documented revert semantics: revert(C) restores every path that
+        exists in C's PARENT tree to its parent-state content, AND deletes
+        any currently-tracked file that is absent from the parent tree
+        (i.e. files the reverted commit *added* are removed). This makes
+        "restore the wiki to a prior commit" correct for files present in
+        one tree but not the other.
+        """
+        base = tmp_path / "memory" / "users" / "unified_default" / "wiki" / "people"
+        base.mkdir(parents=True, exist_ok=True)
+        alice = base / "alice.md"
+        bob = base / "bob.md"
+
+        vault_git.init()
+        alice.write_text("A", encoding="utf-8")
+        vault_git.auto_commit("state A")  # alice=A, no bob
+
+        alice.write_text("B", encoding="utf-8")
+        bob.write_text("bob exists", encoding="utf-8")
+        sha_b = vault_git.auto_commit("state B")  # alice=B, bob added
+        assert sha_b is not None
+
+        # Revert state B → undo it → back to state A (alice=A, bob gone)
+        new_sha = vault_git.revert(sha_b)
+        assert new_sha is not None
+        assert alice.read_text(encoding="utf-8") == "A"
+        assert not bob.exists(), "bob.md added in B must be removed by reverting B"
+
+        tree = _commit_tree_paths(tmp_path)
+        pfx = "memory/users/unified_default/wiki/people/"
+        assert pfx + "alice.md" in tree
+        assert pfx + "bob.md" not in tree
+
+    def test_revert_restores_legacy_alongside_vault(self, vault_git, tmp_path):
+        """Reverting also rolls back the legacy 4, not just the vault."""
+        vault_git.init()
+        vault = tmp_path / "memory" / "users" / "unified_default" / "wiki"
+        vault.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "SOUL.md").write_text("soul A", encoding="utf-8")
+        (vault / "SCHEMA.md").write_text("schema A", encoding="utf-8")
+        vault_git.auto_commit("state A")
+
+        (tmp_path / "SOUL.md").write_text("soul B", encoding="utf-8")
+        (vault / "SCHEMA.md").write_text("schema B", encoding="utf-8")
+        sha_b = vault_git.auto_commit("state B")
+        assert sha_b is not None
+
+        assert vault_git.revert(sha_b) is not None
+        assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == "soul A"
+        assert (vault / "SCHEMA.md").read_text(encoding="utf-8") == "schema A"
+
+    def test_multiuser_vaults_all_tracked(self, vault_git, tmp_path):
+        """Multiple vault slugs are all tracked, no cross-omission."""
+        vault_git.init()
+        for slug in ("telegram_1", "telegram_2"):
+            d = tmp_path / "memory" / "users" / slug / "wiki" / "people"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "page.md").write_text(f"page for {slug}", encoding="utf-8")
+
+        sha = vault_git.auto_commit("two vaults")
+        assert sha is not None
+
+        tree = _commit_tree_paths(tmp_path)
+        assert "memory/users/telegram_1/wiki/people/page.md" in tree
+        assert "memory/users/telegram_2/wiki/people/page.md" in tree
+
+    def test_gitignore_allows_vault_excludes_other(self, vault_git, tmp_path):
+        """The /* deny still blocks non-allowlisted paths (no over-widening)."""
+        vault_git.init()
+        base = tmp_path / "memory" / "users" / "unified_default" / "wiki"
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "SCHEMA.md").write_text("schema", encoding="utf-8")
+
+        # Stray files OUTSIDE the tracked set.
+        (tmp_path / "sessions").mkdir(exist_ok=True)
+        (tmp_path / "sessions" / "foo.jsonl").write_text("stray", encoding="utf-8")
+        (tmp_path / "scratch.txt").write_text("stray", encoding="utf-8")
+
+        sha = vault_git.auto_commit("vault + strays present")
+        assert sha is not None
+
+        tree = _commit_tree_paths(tmp_path)
+        assert "memory/users/unified_default/wiki/SCHEMA.md" in tree
+        assert "sessions/foo.jsonl" not in tree
+        assert "scratch.txt" not in tree
+
+    def test_effective_tracked_files_is_sorted_and_deterministic(self, vault_git, tmp_path):
+        """The scan must be deterministic (sorted), base first."""
+        d = tmp_path / "memory" / "users"
+        (d / "z_slug" / "wiki").mkdir(parents=True, exist_ok=True)
+        (d / "a_slug" / "wiki").mkdir(parents=True, exist_ok=True)
+        (d / "z_slug" / "wiki" / "p.md").write_text("z", encoding="utf-8")
+        (d / "a_slug" / "MEMORY.md").write_text("a", encoding="utf-8")
+
+        eff1 = vault_git._effective_tracked_files()
+        eff2 = vault_git._effective_tracked_files()
+        assert eff1 == eff2
+        assert eff1[: len(LEGACY_FOUR)] == list(LEGACY_FOUR)
+        vault_part = eff1[len(LEGACY_FOUR):]
+        assert vault_part == sorted(vault_part)
+        assert "memory/users/a_slug/MEMORY.md" in vault_part
+        assert "memory/users/z_slug/wiki/p.md" in vault_part

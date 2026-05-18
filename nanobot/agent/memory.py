@@ -108,6 +108,11 @@ class MemoryStore:
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
+        # Static tracked base. GitStore dynamically also versions every file
+        # under ``memory/users/**`` (the per-user wiki vaults; Task 5.1) on
+        # top of this base at commit/revert time, so /dream-restore can roll
+        # the wiki back. When no vault exists this expands to exactly these
+        # four files — a stock workspace commits byte-identically to before.
         self._git = GitStore(
             workspace,
             tracked_files=[
