@@ -1166,7 +1166,12 @@ class Dream:
 
         TODO(Task 7.2): per-user routing -- group ``batch`` by entry
         ``session_key`` via ``vault_slug`` and return one slug per distinct
-        user instead of the single unified slug.
+        user instead of the single unified slug. This is a TWO-SITE change:
+        7.2 must ALSO rewrite the call site in ``Dream.run()`` so each vault
+        receives ONLY its own ``session_key`` slice of ``batch`` -- today the
+        WHOLE ``batch`` is passed to ``run_ingest`` for the single unified
+        vault, which would cross-bleed every user's entries once this returns
+        more than one slug.
         """
         return [vault_slug("unified:default")]
 
