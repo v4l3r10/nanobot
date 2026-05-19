@@ -686,6 +686,14 @@ class Consolidator:
         # Include archived summary in estimation so the budget accounts for it.
         meta = session.metadata.get("_last_summary")
         summary = meta.get("text") if isinstance(meta, dict) else (meta if isinstance(meta, str) else None)
+        # I1: pass the effective session key so the probe builds the SAME
+        # prompt the real turn will. The real turn path (AgentLoop.
+        # _build_initial_messages) resolves `effective_key = session.key or
+        # _effective_session_key(msg)`; since SessionManager.get_or_create
+        # always stores a non-empty key, the `or` fallback is never taken in
+        # practice and `session.key` IS that effective key. When wiki is off
+        # ContextBuilder ignores session_key entirely, so the probe still
+        # builds the byte-identical wiki-off prompt (regression-safe).
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
@@ -694,6 +702,7 @@ class Consolidator:
             sender_id=None,
             session_summary=summary,
             session_metadata=session.metadata,
+            session_key=session.key,
         )
         return estimate_prompt_tokens_chain(
             self.provider,

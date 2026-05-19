@@ -4,11 +4,18 @@ import pytest
 
 import nanobot.agent.memory as memory_module
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.wiki.paths import vault_dir
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
 
 
-def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -> AgentLoop:
+def _make_loop(
+    tmp_path,
+    *,
+    estimated_tokens: int,
+    context_window_tokens: int,
+    wiki_enabled: bool = False,
+) -> AgentLoop:
     from nanobot.providers.base import GenerationSettings
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
@@ -24,6 +31,7 @@ def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -
         workspace=tmp_path,
         model="test-model",
         context_window_tokens=context_window_tokens,
+        wiki_enabled=wiki_enabled,
     )
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop.consolidator._SAFETY_BUFFER = 0
@@ -251,3 +259,113 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
     assert "consolidate" in order
     assert "llm" in order
     assert order.index("consolidate") < order.index("llm")
+
+
+# ---------------------------------------------------------------------------
+# I1 — the Consolidator token probe must build the SAME prompt the real turn
+# uses. When wiki is enabled the real turn injects the per-user vault MOC +
+# the smaller history tail; the probe must too, else auto-consolidation is
+# estimated against the wrong (wiki-off) prompt.
+# ---------------------------------------------------------------------------
+
+VAULT_MOC = "# MOC\n\n## Recent\n- [[note-alpha]] VAULT-ONLY-PROBE-FACT\n"
+GLOBAL_MEMORY = "GLOBAL-MEMORY-PROBE-FACT: the sky is teal."
+
+
+def _probe_system_prompt(loop) -> str:
+    """The system prompt the probe actually built (captured from the
+    provider token-counter call args)."""
+    args, _ = loop.provider.estimate_prompt_tokens.call_args
+    probe_messages = args[0]
+    assert probe_messages[0]["role"] == "system"
+    return probe_messages[0]["content"]
+
+
+def _seed_global_memory(tmp_path) -> None:
+    mem_dir = tmp_path / "memory"
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    (mem_dir / "MEMORY.md").write_text(GLOBAL_MEMORY, encoding="utf-8")
+
+
+def _write_vault_moc(tmp_path, session_key: str, content: str) -> None:
+    vdir = vault_dir(tmp_path, session_key)
+    vdir.mkdir(parents=True, exist_ok=True)
+    (vdir / "MEMORY.md").write_text(content, encoding="utf-8")
+
+
+class TestConsolidatorProbeMatchesRealPrompt:
+    def test_probe_uses_vault_moc_when_wiki_enabled(self, tmp_path) -> None:
+        """wiki_enabled=True ⇒ probe builds the prompt from the VAULT MOC,
+        NOT the global MEMORY.md (matches the real turn path)."""
+        loop = _make_loop(
+            tmp_path,
+            estimated_tokens=123,
+            context_window_tokens=200,
+            wiki_enabled=True,
+        )
+        session = loop.sessions.get_or_create("cli:test")
+        _seed_global_memory(tmp_path)
+        _write_vault_moc(tmp_path, session.key, VAULT_MOC)
+
+        tokens, _src = loop.consolidator.estimate_session_prompt_tokens(session)
+
+        prompt = _probe_system_prompt(loop)
+        assert "VAULT-ONLY-PROBE-FACT" in prompt
+        assert "GLOBAL-MEMORY-PROBE-FACT" not in prompt
+        assert tokens == 123
+
+    def test_probe_estimate_differs_from_wiki_off(self, tmp_path) -> None:
+        """The vault MOC vs global MEMORY.md differ in size ⇒ the wiki-on
+        probe and a wiki-off probe build different prompts (the probe is no
+        longer estimating the wrong prompt)."""
+        big_moc = "# MOC\n\n" + ("X" * 5000)
+
+        on = _make_loop(
+            tmp_path / "on",
+            estimated_tokens=1,
+            context_window_tokens=200,
+            wiki_enabled=True,
+        )
+        son = on.sessions.get_or_create("cli:test")
+        _seed_global_memory(tmp_path / "on")
+        _write_vault_moc(tmp_path / "on", son.key, big_moc)
+        on.consolidator.estimate_session_prompt_tokens(son)
+        on_prompt = _probe_system_prompt(on)
+
+        off = _make_loop(
+            tmp_path / "off",
+            estimated_tokens=1,
+            context_window_tokens=200,
+            wiki_enabled=False,
+        )
+        soff = off.sessions.get_or_create("cli:test")
+        _seed_global_memory(tmp_path / "off")
+        _write_vault_moc(tmp_path / "off", soff.key, big_moc)
+        off.consolidator.estimate_session_prompt_tokens(soff)
+        off_prompt = _probe_system_prompt(off)
+
+        assert on_prompt != off_prompt
+        assert "X" * 5000 in on_prompt          # wiki-on: vault MOC
+        assert "X" * 5000 not in off_prompt     # wiki-off: global MEMORY.md
+        assert GLOBAL_MEMORY in off_prompt
+
+    def test_probe_unchanged_when_wiki_disabled(self, tmp_path) -> None:
+        """Regression guard: wiki_enabled=False ⇒ probe builds the identical
+        wiki-off prompt (global MEMORY.md, no vault), no behavior change."""
+        loop = _make_loop(
+            tmp_path,
+            estimated_tokens=77,
+            context_window_tokens=200,
+            wiki_enabled=False,
+        )
+        session = loop.sessions.get_or_create("cli:test")
+        _seed_global_memory(tmp_path)
+        # A vault exists but wiki is OFF — it must be ignored entirely.
+        _write_vault_moc(tmp_path, session.key, VAULT_MOC)
+
+        tokens, _src = loop.consolidator.estimate_session_prompt_tokens(session)
+
+        prompt = _probe_system_prompt(loop)
+        assert "GLOBAL-MEMORY-PROBE-FACT" in prompt
+        assert "VAULT-ONLY-PROBE-FACT" not in prompt
+        assert tokens == 77

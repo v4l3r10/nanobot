@@ -62,6 +62,15 @@ class ContextBuilder:
     # and the wiki-off _MAX_RECENT_HISTORY=50 are deliberately unchanged.
     _MAX_RECENT_HISTORY_WIKI = 10
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
+    # Hard cap on the per-user vault MOC / USER.md injected on the wiki-on hot
+    # path (every turn). Same 32_000 value as _MAX_HISTORY_CHARS — both bound a
+    # single durable-knowledge section that Lint normally keeps small, so one
+    # shared ceiling is the least surprising choice and keeps the bound
+    # uniform; a separate name documents intent and lets the two diverge later
+    # without touching call sites. This is what makes I1's token probe
+    # guaranteed-conservative: the probe and the real turn read the same
+    # bounded text. The wiki-OFF path (global get_memory_context) is unchanged.
+    _MAX_MEMORY_CHARS = 32_000
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
     def __init__(
@@ -100,24 +109,46 @@ class ContextBuilder:
         verbatim so the prompt is byte-identical to a stock install.
         """
         root = workspace or self.workspace
+        # Single source of truth for "the wiki read path is fully activated
+        # for this call" (M3). The read block below and every wiki branch are
+        # gated on this ONE predicate so they can never diverge: a falsy but
+        # non-None key (e.g. "") would otherwise skip the read yet take the
+        # wiki branch, leaving the user with NEITHER vault memory/profile NOR
+        # the global fallback. bool(session_key) is False for both None and
+        # "" -> safe wiki-off fallback in both cases. The wiki-off path stays
+        # byte-identical (this predicate only ever suppresses the wiki block).
+        wiki_active = self.wiki_enabled and bool(session_key)
+
         # Resolve the per-user vault MOC iff the wiki read path is fully
         # activated for this call. Anything missing -> wiki_moc stays None and
         # every branch below falls back to the verbatim original behaviour.
         wiki_moc: str | None = None
         vault_user: str | None = None
-        if self.wiki_enabled and session_key:
+        if wiki_active:
             vroot = vault_dir(root, session_key)
             with suppress(OSError):
                 moc_path = vroot / "MEMORY.md"
                 if moc_path.is_file():
+                    # Intentionally lock-free and torn-read-safe: Lint ALWAYS
+                    # rewrites this MOC via atomic_write_text (tmp file +
+                    # os.replace), never an in-place open(...,'w'), so a
+                    # concurrent Lint can only swap the whole file, never
+                    # expose a partial write. Do NOT change Lint to write the
+                    # MOC non-atomically. (M2)
                     text = moc_path.read_text(encoding="utf-8")
                     if text.strip():
-                        wiki_moc = text
+                        # Deterministic hot-path bound (M1): a corrupted /
+                        # pre-Lint / hand-edited MOC must not blow up the
+                        # prompt every turn. Same truncate_text helper the
+                        # history path uses.
+                        wiki_moc = truncate_text(text, self._MAX_MEMORY_CHARS)
             with suppress(OSError):
                 user_path = vroot / "USER.md"
                 if user_path.is_file():
-                    vault_user = user_path.read_text(encoding="utf-8")
-        wiki_active = self.wiki_enabled and session_key is not None
+                    vault_user = truncate_text(
+                        user_path.read_text(encoding="utf-8"),
+                        self._MAX_MEMORY_CHARS,
+                    )
 
         parts = [self._get_identity(channel=channel, workspace=root)]
 
