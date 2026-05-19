@@ -236,6 +236,16 @@ class WikiNoteTool(_FsTool, ContextAware):
         )
 
     @classmethod
+    def enabled(cls, ctx: Any) -> bool:
+        # Master switch (I-1): only register — and therefore only emit the
+        # tool's JSON schema into the provider ``tools=`` array — when the
+        # resolved ``dream.wiki_enabled`` is true. ``getattr`` default False
+        # so a ToolContext that predates / omits the field (subagents, unit
+        # tests building a SimpleNamespace ctx) keeps the tool gated OFF,
+        # preserving byte-identity with pre-wiki nanobot.
+        return bool(getattr(ctx, "wiki_enabled", False))
+
+    @classmethod
     def create(cls, ctx: Any) -> Tool:
         # Reuse _FsTool.create verbatim so _workspace / allowed_dir / sandbox
         # are wired exactly like every other filesystem tool. _FsTool.create
