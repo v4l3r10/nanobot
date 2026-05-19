@@ -801,6 +801,32 @@ def run_lint(vault: Vault, today: dt.date) -> LintReport:
     return report
 
 
+def rebuild_indexes_and_moc(vault: Vault) -> bool:
+    """Deterministic, LLM-free regeneration of every type ``_index.md`` and
+    the root ``MEMORY.md`` MOC from the vault's CURRENT on-disk frontmatter.
+
+    This is exactly Lint phase 1 (read-only ``_scan``) + phase 6
+    (``_regenerate_indexes``) + phase 7 (``_regenerate_moc``), WITHOUT the
+    mutating curation phases (reheat-relocate / stale->cold decay / dedup /
+    broken-link audit) and WITHOUT touching ``.lint.log``. It moves, merges,
+    cools and deletes NOTHING -- side effects are confined to ``_index.md``
+    files and ``MEMORY.md``. Because it never alters page frontmatter or
+    locations, running it between Dream cycles cannot perturb Dream's
+    idempotence (a later full ``run_lint`` over unchanged inputs still
+    produces its byte-identical result). Itself idempotent
+    (``_write_if_changed``): a second consecutive call writes nothing.
+
+    Contract: the caller MUST have initialized ``vault`` (``vault.schema``
+    is required by phase 7's MOC cap) -- mirrors ``run_lint``. Returns True
+    iff a regeneration write actually happened.
+    """
+    report = LintReport()
+    entries = _scan(vault, report)
+    _regenerate_indexes(vault, entries, report)
+    _regenerate_moc(vault, entries, report)
+    return bool(report.indexes_regenerated or report.moc_regenerated)
+
+
 def _stale_to_cold_impl(
     vault: Vault,
     entries: list[_Entry],
