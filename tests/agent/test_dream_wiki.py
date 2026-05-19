@@ -271,6 +271,48 @@ class TestDreamWikiEnabled:
         assert page.type == "people"
         assert "dark mode" in page.body
 
+    async def test_wiki_enabled_first_cycle_migrates_legacy_workspace(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """Task 7.1: the FIRST wiki-enabled Dream cycle migrates the LEGACY
+        global memory/USER into the unified vault (via ensure_initialized),
+        then Lint builds the MOC — closing the 6.1 enable-ordering window.
+
+        The ``store`` fixture already wrote a NON-template ``memory/MEMORY.md``
+        ("# Memory\n- Project X active") and a root ``USER.md``
+        ("# User\n- Developer")."""
+        dream.wiki_enabled = True
+
+        store.append_history("event 1")
+        store.append_history("event 2")
+
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+
+        assert result is True
+        vault_root = store.workspace / "memory" / "users" / "unified_default"
+        # One-shot migration marker set on the first cycle.
+        assert (vault_root / ".migrated").is_file()
+        # Legacy memory imported as a concepts page + Lint built the MOC.
+        imported = vault_root / "wiki" / "concepts" / "imported-memory.md"
+        assert imported.is_file()
+        assert "Project X active" in imported.read_text(encoding="utf-8")
+        moc = vault_root / "MEMORY.md"
+        assert moc.is_file()
+        assert "[[concepts/imported-memory]]" in moc.read_text(encoding="utf-8")
+        # Legacy global USER.md became the vault USER.md (what 6.1 reads).
+        assert (vault_root / "USER.md").read_text(encoding="utf-8") == "# User\n- Developer"
+        # Legacy sources are byte-unchanged (never deleted/modified).
+        assert store.read_memory() == "# Memory\n- Project X active"
+        assert store.read_user() == "# User\n- Developer"
+
     async def test_wiki_failure_does_not_break_legacy(
         self, dream, mock_provider, mock_runner, store, monkeypatch,
     ):

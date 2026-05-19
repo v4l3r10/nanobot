@@ -1404,7 +1404,13 @@ class Dream:
                 try:
                     for slug in self._vaults_for_batch(batch):
                         vault = Vault(self.store.workspace / "memory" / "users" / slug)
-                        vault.ensure_initialized()
+                        # Task 7.1: pass the workspace so the FIRST wiki-enabled
+                        # cycle one-shot-migrates the LEGACY global
+                        # memory/MEMORY.md + root USER.md into this vault
+                        # (gated by migrate_legacy's own .migrated marker),
+                        # then run_lint below builds the MOC — closing the 6.1
+                        # enable-ordering window. Wiki-off never reaches here.
+                        vault.ensure_initialized(self.store.workspace)
                         # Same lock key the wiki_note tool takes
                         # (get_vault_lock(vault_slug(session_key))) so Dream-side
                         # Ingest/Lint and the agent-side wiki_note tool never

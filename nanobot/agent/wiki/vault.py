@@ -55,7 +55,9 @@ class Vault:
         self.root: Path = Path(vault_root)
         self.wiki_dir: Path = self.root / "wiki"
 
-    def ensure_initialized(self) -> None:
+    def ensure_initialized(
+        self, legacy_workspace: Path | None = None
+    ) -> None:
         """Idempotently materialize the vault's ``wiki/`` tree.
 
         Creates ``wiki_dir`` (``parents=True, exist_ok=True``) and, only if
@@ -69,8 +71,17 @@ class Vault:
         overwritten, so the cached :attr:`schema` and existing read-only
         behaviour are unaffected).
 
-        NOTE: Task 7.1 extends this with legacy MEMORY.md/USER.md migration;
-        4.5 deliberately does NO legacy migration here.
+        Task 7.1 -- legacy migration: when ``legacy_workspace`` is provided
+        (the Dream 4.5 wiki block passes ``self.store.workspace``), a one-time
+        bootstrap of that workspace's LEGACY global ``memory/MEMORY.md`` +
+        root ``USER.md`` into this vault is attempted AFTER the mkdir+SCHEMA
+        copy, gated one-shot by :func:`migrate_legacy`'s own
+        ``vault.root/.migrated`` marker. When ``legacy_workspace`` is ``None``
+        (the default -- every existing caller / the 4.5 tests) this method is
+        BYTE-IDENTICAL to before: mkdir ``wiki/`` + copy SCHEMA only, no
+        migration, no ``.migrated`` marker. The migrate import is function
+        -local so the leaf ``migrate`` module's ``Vault`` use stays
+        typing-only and the ``vault -> migrate`` edge introduces no cycle.
         """
         self.wiki_dir.mkdir(parents=True, exist_ok=True)
         schema_path = self.wiki_dir / "SCHEMA.md"
@@ -79,6 +90,10 @@ class Vault:
                 schema_path,
                 _BUNDLED_SCHEMA.read_text(encoding="utf-8"),
             )
+        if legacy_workspace is not None:
+            from nanobot.agent.wiki.migrate import migrate_legacy
+
+            migrate_legacy(Path(legacy_workspace), self)
 
     @cached_property
     def schema(self) -> Schema:
