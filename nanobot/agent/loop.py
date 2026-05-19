@@ -175,6 +175,7 @@ class AgentLoop:
         max_messages: int = 120,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
+        wiki_enabled: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
         image_generation_provider_config: ProviderConfig | None = None,
@@ -235,7 +236,12 @@ class AgentLoop:
         self._pending_turn_latency_ms: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+            wiki_enabled=wiki_enabled,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
@@ -347,6 +353,7 @@ class AgentLoop:
             channels_config=config.channels,
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
+            wiki_enabled=defaults.dream.wiki_enabled,
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
@@ -602,6 +609,12 @@ class AgentLoop:
         pending_summary: str | None,
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
+        # Pass the effective session key so the wiki read path (when enabled)
+        # resolves THIS user's per-user vault MOC/USER.md. session.key is the
+        # already-resolved effective key (unified or channel:chat); prefer it,
+        # falling back to the msg-derived effective key. When the wiki is off
+        # ContextBuilder ignores this entirely (verbatim original path).
+        effective_key = session.key or self._effective_session_key(msg)
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -611,6 +624,7 @@ class AgentLoop:
             sender_id=msg.sender_id,
             session_summary=pending_summary,
             session_metadata=session.metadata,
+            session_key=effective_key,
         )
 
     async def _dispatch_command_inline(
@@ -1101,6 +1115,9 @@ class AgentLoop:
             sender_id=msg.sender_id,
             session_summary=pending,
             session_metadata=session.metadata,
+            # `key` is the effective session key resolved above; lets the
+            # wiki read path target this user's vault (no-op when wiki off).
+            session_key=key,
         )
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
