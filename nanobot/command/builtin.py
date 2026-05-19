@@ -206,7 +206,11 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
     if snapshot:
-        loop._schedule_background(loop.consolidator.archive(snapshot))
+        # Task 7.2: thread the EFFECTIVE session key so the consolidated
+        # snapshot of the session being reset routes to THAT user's vault.
+        loop._schedule_background(
+            loop.consolidator.archive(snapshot, session_key=session.key)
+        )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content="New session started.",

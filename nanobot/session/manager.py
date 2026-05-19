@@ -279,7 +279,15 @@ class Session:
         already_consolidated = min(before_last_consolidated, dropped_count)
         archive_chunk = dropped[already_consolidated:]
         if archive_chunk and on_archive:
-            on_archive(archive_chunk)
+            # Task 7.2: thread THIS session's EFFECTIVE key (self.key —
+            # unified or channel:chat_id) so the raw breadcrumb routes to
+            # this user's per-user wiki vault. on_archive is
+            # MemoryStore.raw_archive (accepts session_key); a custom
+            # callback without the kwarg falls back to a keyless call.
+            try:
+                on_archive(archive_chunk, session_key=self.key)
+            except TypeError:
+                on_archive(archive_chunk)
         logger.info(
             "Session file cap hit for {}: dropped {}, raw-archived {}, kept {}",
             self.key,

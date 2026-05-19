@@ -464,6 +464,221 @@ class TestDreamWikiEnabled:
         assert alice.is_file()
 
 
+# --- Task 7.2: per-user history routing + multi-user vault isolation --------
+
+
+class TestVaultsForBatchGrouping:
+    """``_vaults_for_batch`` groups a batch by ``vault_slug(session_key)`` and
+    returns the SORTED distinct slug list (deterministic)."""
+
+    def test_vaults_for_batch_groups_by_session_key(self, dream):
+        batch = [
+            {"cursor": 1, "timestamp": "t", "content": "a", "session_key": "telegram:1"},
+            {"cursor": 2, "timestamp": "t", "content": "b", "session_key": "telegram:1"},
+            {"cursor": 3, "timestamp": "t", "content": "c", "session_key": "telegram:2"},
+            {"cursor": 4, "timestamp": "t", "content": "d"},  # legacy / untagged
+        ]
+        assert dream._vaults_for_batch(batch) == [
+            "telegram_1",
+            "telegram_2",
+            "unified_default",
+        ]
+
+    def test_all_unified_collapses_to_single_slug(self, dream):
+        batch = [
+            {"cursor": 1, "timestamp": "t", "content": "a", "session_key": "unified:default"},
+            {"cursor": 2, "timestamp": "t", "content": "b", "session_key": "unified:default"},
+        ]
+        assert dream._vaults_for_batch(batch) == ["unified_default"]
+
+    def test_all_legacy_untagged_collapses_to_unified(self, dream):
+        batch = [
+            {"cursor": 1, "timestamp": "t", "content": "a"},
+            {"cursor": 2, "timestamp": "t", "content": "b"},
+        ]
+        assert dream._vaults_for_batch(batch) == ["unified_default"]
+
+
+def _content_echo_provider(mock_provider):
+    """Make the mocked provider's Ingest call emit a PAGE whose body is the
+    user-prompt history text it received.
+
+    Phase 1 (legacy) gets the FIRST call (plain analysis string). Every
+    subsequent call is an Ingest call: we echo the conversation-history text
+    from the user message into a single PAGE body, so a vault that received
+    another user's slice would visibly contain that user's text — making any
+    cross-bleed detectable.
+    """
+    state = {"calls": 0}
+
+    async def _side_effect(*args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return MagicMock(content="New fact", finish_reason="stop")
+        messages = kwargs.get("messages") or (args[1] if len(args) > 1 else [])
+        user_msg = next(
+            (m["content"] for m in messages if m.get("role") == "user"), ""
+        )
+        return MagicMock(
+            content=f"[PAGE concepts/dump]\n{user_msg}\n",
+            finish_reason="stop",
+        )
+
+    mock_provider.chat_with_retry.side_effect = _side_effect
+    return state
+
+
+class TestMultiUserVaultIsolation:
+    """Task 7.2: each user's history slice is consolidated into THAT user's
+    own per-user vault — no cross-bleed."""
+
+    async def test_multiuser_ingest_isolation(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """Two tagged users → two distinct vaults; each vault contains ONLY
+        its own user's text. The Ingest slice each vault received is the
+        filtered per-slug batch, NOT the whole batch."""
+        dream.wiki_enabled = True
+
+        store.append_history("USER ONE secret alpha", session_key="telegram:1")
+        store.append_history("USER TWO secret beta", session_key="telegram:2")
+        store.append_history("USER ONE more alpha", session_key="telegram:1")
+
+        _content_echo_provider(mock_provider)
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+
+        users = store.workspace / "memory" / "users"
+        v1_page = users / "telegram_1" / "wiki" / "concepts" / "dump.md"
+        v2_page = users / "telegram_2" / "wiki" / "concepts" / "dump.md"
+        assert v1_page.is_file()
+        assert v2_page.is_file()
+
+        v1_text = v1_page.read_text(encoding="utf-8")
+        v2_text = v2_page.read_text(encoding="utf-8")
+
+        # User 1's vault has ONLY user 1 content.
+        assert "USER ONE secret alpha" in v1_text
+        assert "USER ONE more alpha" in v1_text
+        assert "USER TWO secret beta" not in v1_text
+
+        # User 2's vault has ONLY user 2 content.
+        assert "USER TWO secret beta" in v2_text
+        assert "USER ONE secret alpha" not in v2_text
+        assert "USER ONE more alpha" not in v2_text
+
+        # No spurious unified vault (every entry was tagged per-user).
+        assert not (users / "unified_default").exists()
+
+    async def test_unified_session_collapses_to_one_vault(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """All entries keyed ``unified:default`` (simulating
+        ``unified_session=True``) → ONLY ``memory/users/unified_default/``,
+        no per-user vaults."""
+        dream.wiki_enabled = True
+
+        store.append_history("device A", session_key="unified:default")
+        store.append_history("device B", session_key="unified:default")
+
+        _content_echo_provider(mock_provider)
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+
+        users = store.workspace / "memory" / "users"
+        assert (users / "unified_default").is_dir()
+        others = [p.name for p in users.iterdir() if p.name != "unified_default"]
+        assert others == [], f"unexpected per-user vaults: {others}"
+
+    async def test_legacy_untagged_history_routes_to_unified(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """A history.jsonl with LEGACY records lacking ``session_key`` is
+        routed to ``unified_default`` only (back-compat)."""
+        dream.wiki_enabled = True
+
+        # Hand-write legacy records WITHOUT the session_key field.
+        store.history_file.write_text(
+            '{"cursor": 1, "timestamp": "2026-04-01 10:00", "content": "legacy one"}\n'
+            '{"cursor": 2, "timestamp": "2026-04-01 10:01", "content": "legacy two"}\n',
+            encoding="utf-8",
+        )
+
+        _content_echo_provider(mock_provider)
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+
+        users = store.workspace / "memory" / "users"
+        assert (users / "unified_default").is_dir()
+        others = [p.name for p in users.iterdir() if p.name != "unified_default"]
+        assert others == [], f"legacy entries leaked to per-user vaults: {others}"
+        dump = users / "unified_default" / "wiki" / "concepts" / "dump.md"
+        assert dump.is_file()
+        body = dump.read_text(encoding="utf-8")
+        assert "legacy one" in body
+        assert "legacy two" in body
+
+    async def test_legacy_migration_gated_only_unified_with_live_routing(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """C1 gate under LIVE multi-slug routing (no monkeypatch of
+        ``_vaults_for_batch``): real per-user entries produce real per-user
+        vaults; the legacy GLOBAL memory/USER blob migrates ONLY into
+        ``unified_default``. Per-user vaults get their own Ingest slice but
+        NEVER a ``.migrated`` / ``imported-memory.md`` / ``USER.md``."""
+        dream.wiki_enabled = True
+
+        # Mixed batch: a unified-keyed entry AND two distinct per-user ones.
+        store.append_history("unified line", session_key="unified:default")
+        store.append_history("alpha for one", session_key="telegram:1")
+        store.append_history("beta for two", session_key="telegram:2")
+
+        _content_echo_provider(mock_provider)
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+
+        users = store.workspace / "memory" / "users"
+        unified_root = users / "unified_default"
+        v1 = users / "telegram_1"
+        v2 = users / "telegram_2"
+
+        # Unified vault migrated exactly as in 7.1.
+        assert (unified_root / ".migrated").is_file()
+        assert (unified_root / "wiki" / "concepts" / "imported-memory.md").is_file()
+        assert (unified_root / "USER.md").read_text(encoding="utf-8") == "# User\n- Developer"
+
+        # Per-user vaults: initialized + got their OWN slice, but NEVER the
+        # global blob (C1 gate holds under live routing).
+        for v, own, foreign in (
+            (v1, "alpha for one", "beta for two"),
+            (v2, "beta for two", "alpha for one"),
+        ):
+            assert (v / "wiki" / "SCHEMA.md").is_file()
+            assert not (v / ".migrated").exists()
+            assert not (v / "wiki" / "concepts" / "imported-memory.md").exists()
+            assert not (v / "USER.md").exists()
+            dump = (v / "wiki" / "concepts" / "dump.md").read_text(encoding="utf-8")
+            assert own in dump
+            assert foreign not in dump
+            assert "unified line" not in dump
+
+
 # --- Concurrency guard (Task 4.6) ------------------------------------------
 
 
