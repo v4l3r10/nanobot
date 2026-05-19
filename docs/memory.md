@@ -312,6 +312,12 @@ These commands now cover the wiki as well as the legacy memory files, because `G
 
 > ⚠ **Production prerequisite (known caveat, not yet implemented).** The process-wide Dream-run lock is held across the Ingest LLM call, and there is currently **no outer Dream timeout** — only the provider SDK's default request timeout. A wedged LLM call would therefore hold the global Dream lock and stall subsequent Dream cycles. Before enabling `wikiEnabled: true` in a production deployment, ensure a bounded provider request timeout (or keep the gate off). This is a known operational caveat and a planned hardening, not a blocker for the gated-off default.
 
+### Low-latency MOC refresh
+
+A successful `wiki_note` create or append now triggers a deterministic, LLM-free post-turn regeneration of that user's `_index.md` files and root `MEMORY.md` MOC. Durable facts therefore land in the always-injected MOC the very next turn, without waiting for the 2h Dream. The heavy Dream pass — Ingest plus curation (Karpathy checks, dedup, decay) — is unchanged and still runs on its normal cadence as the quality pass; the post-turn refresh only keeps the navigation fresh, it does not move, merge, or decay pages. Both the post-turn refresh and the underlying `wiki_note` tool are gated by `dream.wiki_enabled`: with the wiki off, behavior is byte-identical to stock nanobot.
+
+To actually get the agent to write durable facts, deploy the AGENTS.md directive in [`wiki-agents-directive.md`](./wiki-agents-directive.md); see [`wiki-moc-decouple-design.md`](./wiki-moc-decouple-design.md) for the full design.
+
 ## In Practice
 
 What this means in daily use is simple:
