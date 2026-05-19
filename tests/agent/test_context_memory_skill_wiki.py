@@ -140,10 +140,12 @@ def _active_skills_section(prompt: str) -> str:
     from the ``# Active Skills`` header up to the part boundary that starts the
     next top-level section (``\\n\\n---\\n\\n# Skills``), or end of prompt.
     """
-    start = prompt.index("# Active Skills")
+    marker = "# Active Skills\n\n"
+    start = prompt.index(marker)
     rest = prompt[start:]
     boundary = rest.find("\n\n---\n\n# Skills")
-    return rest if boundary == -1 else rest[:boundary]
+    assert boundary != -1, "expected a '# Skills' part to follow '# Active Skills'"
+    return rest[:boundary]
 
 
 def test_wiki_off_path_is_byte_identical_to_no_substitution(tmp_path):
