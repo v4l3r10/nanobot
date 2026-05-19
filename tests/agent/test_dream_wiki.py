@@ -313,6 +313,60 @@ class TestDreamWikiEnabled:
         assert store.read_memory() == "# Memory\n- Project X active"
         assert store.read_user() == "# User\n- Developer"
 
+    async def test_legacy_migration_gated_to_unified_vault_only(
+        self, dream, mock_provider, mock_runner, store, monkeypatch,
+    ):
+        """C1 gate: ``migrate_legacy`` reads the SINGLE GLOBAL
+        ``memory/MEMORY.md`` + root ``USER.md``. The Dream call site must pass
+        ``legacy_workspace`` ONLY for the ``unified_default`` slug — so when
+        Task 7.2 makes ``_vaults_for_batch`` return per-user slugs, the global
+        memory/USER blob (incl. another user's profile) is NOT fanned into
+        every vault.
+
+        Today ``_vaults_for_batch`` returns only ``[unified_default]`` so the
+        gate is behavior-identical; here we simulate the post-7.2 world by
+        making it return the unified slug PLUS an extra per-user slug, then
+        assert the extra vault is initialized (wiki/ + SCHEMA) but NEVER
+        migrated (no ``.migrated`` marker, no imported-memory page, no
+        USER.md), while the unified vault IS migrated exactly as before."""
+        dream.wiki_enabled = True
+        store.append_history("event 1")
+        store.append_history("event 2")
+
+        unified = vault_slug("unified:default")
+        extra = vault_slug("telegram:999")
+        assert unified == "unified_default"
+        assert extra != unified
+        monkeypatch.setattr(dream, "_vaults_for_batch", lambda _b: [unified, extra])
+
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+
+        users = store.workspace / "memory" / "users"
+        unified_root = users / unified
+        extra_root = users / extra
+
+        # Unified vault: migrated exactly as before (golden 7.1 behavior).
+        assert (unified_root / ".migrated").is_file()
+        assert (unified_root / "wiki" / "concepts" / "imported-memory.md").is_file()
+        assert (unified_root / "USER.md").read_text(encoding="utf-8") == "# User\n- Developer"
+
+        # Extra (per-user) vault: initialized but the global blob was NOT
+        # fanned in — NO migration ran for it (C1 gate holds).
+        assert (extra_root / "wiki" / "SCHEMA.md").is_file()
+        assert not (extra_root / ".migrated").exists()
+        assert not (extra_root / "wiki" / "concepts" / "imported-memory.md").exists()
+        assert not (extra_root / "USER.md").exists()
+
     async def test_wiki_failure_does_not_break_legacy(
         self, dream, mock_provider, mock_runner, store, monkeypatch,
     ):
