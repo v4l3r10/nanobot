@@ -433,3 +433,247 @@ class TestVaultVersioning:
         assert vault_part == sorted(vault_part)
         assert "memory/users/a_slug/MEMORY.md" in vault_part
         assert "memory/users/z_slug/wiki/p.md" in vault_part
+
+
+# ---------------------------------------------------------------------------
+# Code-review follow-up to Task 5.1 — revert must be a true per-commit
+# inverse (C1 data loss), atomic (C2), symlink-safe (I1), single-scan (I2).
+# These are the contract /dream-restore (Task 5.2) relies on.
+# ---------------------------------------------------------------------------
+
+
+class TestRevertPerCommitInverse:
+    def test_revert_nontip_preserves_later_files(self, vault_git, tmp_path):
+        """C1 regression: reverting a NON-tip commit must undo ONLY that
+        commit and must NOT destroy vault files created by *later* commits.
+
+        On the pre-fix code this fails: revert(B) reverts to B's parent
+        tree over the whole effective set, so the unrelated page p2 added
+        by the later commit C (not in B's parent tree, on disk) is deleted
+        and that deletion is committed — silent committed data loss.
+        """
+        people = tmp_path / "memory" / "users" / "unified_default" / "wiki" / "people"
+        people.mkdir(parents=True, exist_ok=True)
+        p1 = people / "p1.md"
+        p2 = people / "p2.md"
+
+        vault_git.init()
+        p1.write_text("A", encoding="utf-8")
+        vault_git.auto_commit("commit A: p1=A")  # A
+
+        p1.write_text("B", encoding="utf-8")
+        sha_b = vault_git.auto_commit("commit B: p1=B")  # B (modifies p1)
+        assert sha_b is not None
+
+        p2.write_text("P2", encoding="utf-8")
+        sha_c = vault_git.auto_commit("commit C: add unrelated p2")  # C
+        assert sha_c is not None
+
+        # Revert the NON-tip commit B. B only modified p1 (A→B).
+        new_sha = vault_git.revert(sha_b)
+        assert new_sha is not None
+
+        # B's modify is undone …
+        assert p1.read_text(encoding="utf-8") == "A"
+        # … but C's later, unrelated add survives untouched.
+        assert p2.exists(), "p2 added by later commit C must NOT be destroyed"
+        assert p2.read_text(encoding="utf-8") == "P2"
+
+        tree = _commit_tree_paths(tmp_path)
+        pfx = "memory/users/unified_default/wiki/people/"
+        assert pfx + "p1.md" in tree
+        assert pfx + "p2.md" in tree, "the revert commit must not record p2's deletion"
+
+        # And the revert commit itself recorded NO deletion of p2: the diff
+        # of the revert vs its parent must not remove p2.
+        revert_diff = vault_git.diff_commits(sha_c, new_sha)
+        assert "p2.md" not in revert_diff, (
+            "reverting B must not touch p2 at all (no spurious deletion)"
+        )
+
+    def test_revert_of_adding_commit_preserves_later_unrelated_file(
+        self, vault_git, tmp_path
+    ):
+        """Reverting a commit that ADDED a file removes only that file;
+        a later unrelated file is preserved."""
+        people = tmp_path / "memory" / "users" / "unified_default" / "wiki" / "people"
+        people.mkdir(parents=True, exist_ok=True)
+        base = people / "base.md"
+        added = people / "added.md"
+        later = people / "later.md"
+
+        vault_git.init()
+        base.write_text("base", encoding="utf-8")
+        vault_git.auto_commit("A: base")  # A
+
+        added.write_text("added by B", encoding="utf-8")
+        sha_b = vault_git.auto_commit("B: add 'added'")  # B adds added.md
+        assert sha_b is not None
+
+        later.write_text("later", encoding="utf-8")
+        vault_git.auto_commit("C: add unrelated 'later'")  # C adds later.md
+
+        # Revert B (a non-tip commit that ADDED added.md).
+        assert vault_git.revert(sha_b) is not None
+
+        assert not added.exists(), "added.md (added by reverted B) must be removed"
+        assert later.exists(), "later.md (added by later C) must be preserved"
+        assert later.read_text(encoding="utf-8") == "later"
+        assert base.read_text(encoding="utf-8") == "base"
+
+        tree = _commit_tree_paths(tmp_path)
+        pfx = "memory/users/unified_default/wiki/people/"
+        assert pfx + "base.md" in tree
+        assert pfx + "added.md" not in tree
+        assert pfx + "later.md" in tree
+
+    def test_revert_leaves_unchanged_legacy_files_untouched(self, vault_git, tmp_path):
+        """A revert must touch ONLY the affected paths; unrelated unchanged
+        legacy files must not even be rewritten (per-commit inverse, not a
+        whole-tree reset)."""
+        vault = tmp_path / "memory" / "users" / "unified_default" / "wiki"
+        vault.mkdir(parents=True, exist_ok=True)
+        vault_git.init()
+        (tmp_path / "SOUL.md").write_text("soul stays", encoding="utf-8")
+        (vault / "SCHEMA.md").write_text("schema A", encoding="utf-8")
+        vault_git.auto_commit("A")  # A: SOUL set, SCHEMA=A
+
+        (vault / "SCHEMA.md").write_text("schema B", encoding="utf-8")
+        sha_b = vault_git.auto_commit("B: only SCHEMA changes")  # B
+        assert sha_b is not None
+
+        soul_mtime_before = (tmp_path / "SOUL.md").stat().st_mtime_ns
+        assert vault_git.revert(sha_b) is not None
+
+        assert (vault / "SCHEMA.md").read_text(encoding="utf-8") == "schema A"
+        # SOUL.md was not part of commit B → must be byte- and mtime-stable.
+        assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == "soul stays"
+        assert (tmp_path / "SOUL.md").stat().st_mtime_ns == soul_mtime_before, (
+            "an unchanged legacy file must not be rewritten by revert"
+        )
+
+
+class TestRevertAtomicAndScan:
+    def test_revert_is_atomic_per_file(self, vault_git, tmp_path, monkeypatch):
+        """C2: every file rewrite in revert goes through atomic_write_text
+        (no raw write_text), so a crash mid-revert leaves each file fully
+        old or fully new — never truncated."""
+        import nanobot.utils.gitstore as gs
+
+        people = tmp_path / "memory" / "users" / "unified_default" / "wiki" / "people"
+        people.mkdir(parents=True, exist_ok=True)
+        page = people / "alice.md"
+
+        vault_git.init()
+        page.write_text("A", encoding="utf-8")
+        vault_git.auto_commit("A")
+        page.write_text("B", encoding="utf-8")
+        sha_b = vault_git.auto_commit("B")
+        assert sha_b is not None
+
+        calls: list[str] = []
+        real = gs.atomic_write_text
+
+        def _spy(path, content, **kw):
+            calls.append(str(path))
+            return real(path, content, **kw)
+
+        monkeypatch.setattr(gs, "atomic_write_text", _spy)
+
+        assert vault_git.revert(sha_b) is not None
+        assert page.read_text(encoding="utf-8") == "A"
+        # The reverted page was rewritten via the atomic helper.
+        assert any(str(page) == c or c.endswith("alice.md") for c in calls), (
+            "revert must rewrite files via atomic_write_text, not write_text"
+        )
+        # No stale temp file left behind anywhere in the vault.
+        assert not list(
+            (tmp_path / "memory").rglob("*.tmp")
+        ), "atomic write must not leave a .tmp file"
+
+    def test_revert_double_scan_avoided(self, vault_git, tmp_path):
+        """I2: a single revert must not scan the unbounded vault tree more
+        than once (revert scans, then triggers auto_commit which would
+        scan AGAIN). Bounded invariant: <= 1 vault scan per revert."""
+        people = tmp_path / "memory" / "users" / "unified_default" / "wiki" / "people"
+        people.mkdir(parents=True, exist_ok=True)
+        page = people / "alice.md"
+
+        vault_git.init()
+        page.write_text("A", encoding="utf-8")
+        vault_git.auto_commit("A")
+        page.write_text("B", encoding="utf-8")
+        sha_b = vault_git.auto_commit("B")
+        assert sha_b is not None
+
+        original = GitStore._scan_vault_files
+        count = {"n": 0}
+
+        def _counting(self):
+            count["n"] += 1
+            return original(self)
+
+        GitStore._scan_vault_files = _counting
+        try:
+            assert vault_git.revert(sha_b) is not None
+        finally:
+            GitStore._scan_vault_files = original
+
+        assert count["n"] <= 1, (
+            f"revert scanned the vault {count['n']}x; bounded invariant is <=1"
+        )
+
+
+class TestScanSymlinkSafety:
+    def test_scan_excludes_symlinks(self, vault_git, tmp_path):
+        """I1: a symlink inside the agent-writable vault pointing OUTSIDE
+        the workspace must never be scanned/committed (exfiltration)."""
+        import os
+
+        secret_dir = tmp_path.parent / "outside_secret_dir"
+        secret_dir.mkdir(parents=True, exist_ok=True)
+        secret = secret_dir / "secret.txt"
+        secret.write_text("TOP SECRET", encoding="utf-8")
+
+        wiki = tmp_path / "memory" / "users" / "unified_default" / "wiki"
+        wiki.mkdir(parents=True, exist_ok=True)
+        (wiki / "real.md").write_text("legit page", encoding="utf-8")
+
+        link = wiki / "leak.md"
+        try:
+            os.symlink(secret, link)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation not permitted in this environment")
+
+        scanned = vault_git._scan_vault_files()
+        assert any(p.endswith("real.md") for p in scanned)
+        assert all("leak.md" not in p for p in scanned), (
+            "a symlink inside the vault must be excluded from the scan"
+        )
+
+        vault_git.init()
+        sha = vault_git.auto_commit("commit vault with a symlink present")
+        assert sha is not None
+        tree = _commit_tree_paths(tmp_path)
+        assert "memory/users/unified_default/wiki/real.md" in tree
+        assert "memory/users/unified_default/wiki/leak.md" not in tree
+        # The external secret content never entered the commit tree.
+        from dulwich.repo import Repo
+
+        with Repo(str(tmp_path)) as repo:
+            blob_data = b""
+            head = repo.refs[b"HEAD"]
+            for entry in repo.get_walker():
+                tree_obj = repo[entry.commit.tree]
+                for _, _, sha_b in _iter_all_blobs(repo, tree_obj):
+                    blob_data += repo[sha_b].data
+        assert b"TOP SECRET" not in blob_data
+
+
+def _iter_all_blobs(repo, tree, prefix=""):
+    for name, _mode, sha in tree.items():
+        obj = repo[sha]
+        if obj.type_name == b"tree":
+            yield from _iter_all_blobs(repo, obj, prefix + name.decode() + "/")
+        elif obj.type_name == b"blob":
+            yield prefix + name.decode(), _mode, sha
