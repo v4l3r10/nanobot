@@ -4,7 +4,6 @@ import base64
 import mimetypes
 import platform
 from contextlib import suppress
-from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -17,7 +16,10 @@ from nanobot.utils.helpers import (
     detect_image_mime,
     truncate_text,
 )
-from nanobot.utils.prompt_templates import render_template
+from nanobot.utils.prompt_templates import (
+    is_bundled_template_content,
+    render_template,
+)
 
 
 class ContextBuilder:
@@ -242,12 +244,12 @@ class ContextBuilder:
 
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
-        """Check if *content* is identical to the bundled template (user hasn't customized it)."""
-        with suppress(Exception):
-            tpl = pkg_files("nanobot") / "templates" / template_path
-            if tpl.is_file():
-                return content.strip() == tpl.read_text(encoding="utf-8").strip()
-        return False
+        """Check if *content* is identical to the bundled template (user hasn't customized it).
+
+        Delegates to the shared leaf helper so this check and the Task 7.1
+        legacy-migration template guard can never diverge.
+        """
+        return is_bundled_template_content(content, template_path)
 
     def build_messages(
         self,

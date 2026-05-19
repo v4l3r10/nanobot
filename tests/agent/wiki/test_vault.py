@@ -125,6 +125,33 @@ def test_ensure_initialized_is_idempotent(tmp_path):
     assert schema_file.stat().st_mtime_ns == mtime
 
 
+def test_ensure_initialized_no_legacy_workspace_is_byte_identical(tmp_path):
+    """Task 7.1 wiring guard: ensure_initialized() WITHOUT a legacy workspace
+    behaves EXACTLY as before — mkdir wiki/ + copy SCHEMA only, NO migration,
+    NO .migrated marker, NO MEMORY.md MOC / imported-memory page."""
+    v = Vault(tmp_path / "memory" / "users" / "fresh")
+
+    v.ensure_initialized()
+
+    assert v.wiki_dir.is_dir()
+    assert (v.wiki_dir / "SCHEMA.md").is_file()
+    # The 4.5 contract: nothing beyond wiki/ + SCHEMA.md.
+    assert not (v.root / ".migrated").exists()
+    assert not (v.root / "USER.md").exists()
+    assert not (v.root / "MEMORY.md").exists()
+    assert v.is_empty()
+    # The vault root holds exactly the wiki/ dir (no migration side effects).
+    assert sorted(p.name for p in v.root.iterdir()) == ["wiki"]
+
+
+def test_ensure_initialized_with_none_legacy_is_byte_identical(tmp_path):
+    """Passing legacy_workspace=None explicitly is the same no-migration path."""
+    v = Vault(tmp_path / "memory" / "users" / "fresh")
+    v.ensure_initialized(legacy_workspace=None)
+    assert not (v.root / ".migrated").exists()
+    assert sorted(p.name for p in v.root.iterdir()) == ["wiki"]
+
+
 def test_ensure_initialized_does_not_overwrite_existing_schema(tmp_path):
     """An existing per-vault SCHEMA.md is preserved verbatim (never clobbered
     by the bundled master)."""
