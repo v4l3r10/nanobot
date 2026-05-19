@@ -481,12 +481,18 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
                 f"Restored Dream memory to the state before `{sha}`.\n\n"
                 f"- New safety commit: `{new_sha}`\n"
                 f"- Restored files: {changed_files}\n\n"
+                f"This undid **only** that one Dream change — anything created or "
+                f"changed since (later Dream cycles, new wiki pages) is preserved.\n\n"
                 f"Use `/dream-log {new_sha}` to inspect the restore diff."
             )
         else:
             content = (
-                f"Couldn't restore Dream change `{sha}`.\n\n"
-                "It may not exist, or it may be the first saved version with no earlier state to restore."
+                f"Nothing to undo for `{sha}`.\n\n"
+                "That commit has no tracked changes to reverse — it may already be "
+                "reverted, may not exist, or may be the first saved version with no "
+                "earlier state. Your memory and wiki are unchanged.\n\n"
+                "Use `/dream-restore` to list recent versions, or `/dream-log` to "
+                "inspect the latest one."
             )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
