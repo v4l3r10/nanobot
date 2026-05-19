@@ -170,11 +170,153 @@ In practical terms:
 - `maxBatchSize` controls how many new `history.jsonl` entries Dream consumes in one run. Larger batches catch up faster; smaller batches are lighter and steadier.
 - `maxIterations` limits how many read/edit steps Dream can take while updating `SOUL.md`, `USER.md`, and `MEMORY.md`. It is a safety budget, not a quality score.
 - `intervalH` is the normal way to configure Dream. Internally it runs as an `every` schedule, not as a cron expression.
+- `wikiEnabled` (default `false`) turns on the per-user wiki-tree layer described in [Wiki-tree memory](#wiki-tree-memory-per-user-navigable-memory). `lintCadenceH` is reserved for a future decoupled Lint cadence and does not change behavior today.
 
 Legacy note:
 
 - Older source-based configs may still contain `dream.cron`. nanobot continues to honor it for backward compatibility, but new configs should use `intervalH`.
 - Older source-based configs may still contain `dream.model`. nanobot continues to honor it for backward compatibility, but new configs should use `modelOverride`.
+
+## Wiki-tree memory (per-user navigable memory)
+
+### What it is
+
+The wiki-tree layer is an optional, Obsidian-style per-user Markdown wiki built on top of the memory described above. It does not replace `SOUL.md`, `USER.md`, `MEMORY.md`, or `history.jsonl` — it adds a navigable knowledge tree the agent can walk on its own.
+
+- The agent reads and writes leaf pages through the `wiki_note` tool (read / create / append / search).
+- The Dream cycle's **Ingest** phase distills new `history.jsonl` entries into pages; its **Lint** phase curates them (decay, dedup, broken-link audit) and regenerates the navigation indexes.
+- It is **off by default**. A stock install behaves exactly like pre-wiki nanobot.
+
+The structure follows the "LLM Wiki" idea: pages filed by type, navigation through wikilinks and a small Map-of-Content (MOC), no embeddings and no database. Knowledge hierarchy lives in the link graph, not in folders.
+
+### How to enable
+
+Wiki-tree memory is gated by a single config knob under `agents.defaults.dream`:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "dream": {
+        "wikiEnabled": true
+      }
+    }
+  }
+}
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `wikiEnabled` | `false` | Master switch for the whole wiki subsystem (Ingest/Lint + per-user MOC prompt injection). |
+| `lintCadenceH` | `null` | Reserved for a future decoupled Lint cadence. **Current behavior:** Lint runs on every Dream wiki cycle regardless of this value; the field is accepted but does not yet change cadence. This is a planned refinement, not current behavior. |
+
+Enablement is operationally automatic: set `wikiEnabled: true` and the next Dream cycle does the rest (migration + first MOC). No manual vault setup is needed.
+
+> Transient on first enable: between flipping the knob and the first Dream-Lint cycle, a user's prompt has the usual SOUL / AGENTS / TOOLS content but not yet wiki memory or profile. This is normal and self-resolves on the first Dream cycle that runs after enabling.
+
+### The master switch (golden guarantee)
+
+With `wikiEnabled: false` (the default), nanobot is byte-identical to pre-wiki nanobot:
+
+- no `memory/users/` directory is ever created;
+- the `wiki_note` tool is not registered, so its schema is never sent to the provider — the runtime behavior, system prompt, and tool set are byte-identical to pre-wiki nanobot;
+- the Dream cycle behaves exactly as before (same cursor, compaction, and git path).
+
+The only on-disk change with the switch off is that new `history.jsonl` records now carry an inert `session_key` field; it is ignored by every non-wiki consumer and legacy records without it are read unchanged.
+
+It is safe to ship the feature dark and leave it off indefinitely.
+
+### Per-user vaults
+
+When enabled, each session gets its own *vault*:
+
+```text
+workspace/memory/users/<vault_slug>/
+├── MEMORY.md          # the per-user MOC — this is what gets injected into THAT user's prompt
+├── USER.md            # per-user profile (the vault owns the profile when wiki is active)
+├── .lint.log          # append-only audit of every Lint run
+├── .migrated          # one-shot migration marker (unified_default only)
+└── wiki/
+    ├── SCHEMA.md       # this vault's schema (copied from the bundled master on first use)
+    ├── people/    _index.md  alice.md …
+    ├── projects/  _index.md  payment-svc.md …
+    ├── concepts/  _index.md  auth-model.md …
+    ├── decisions/ _index.md  …
+    └── .cold/<type>/…  # decayed pages, dropped from the MOC, still readable by the tool
+```
+
+`vault_slug` maps the session key `channel:chat_id` to a filesystem-safe directory name by replacing `:` with `_` and stripping unsafe characters — e.g. `telegram:1` → `telegram_1`. Vaults are strictly isolated: one user's pages, indexes, and MOC never bleed into another's.
+
+### Unified session collapse
+
+`unified_session: true` routes every channel into the single `unified_default` vault (single-user, multi-device). The same collapse is the back-compat floor for anything that is not a clean per-user key: legacy untagged history, and any malformed `session_key` (JSON `null`, a non-string like `123`, an empty string, a list/dict) all route to `unified_default`. This routing is total — a bad `session_key` value can never crash the Dream cycle; it just lands in the unified vault.
+
+### Migration (one-time, automatic)
+
+The first wiki-enabled Dream cycle migrates the legacy global memory into the wiki:
+
+- the global `memory/MEMORY.md` becomes one `concepts/imported-memory.md` page, and the root `USER.md` is copied into the vault's `USER.md`;
+- this happens **only for the `unified_default` vault** (the C1 invariant). Per-user vaults never receive the global blob, so a multi-user deployment cannot leak one user's profile into another's vault;
+- it is strictly one-shot per vault, guarded by the `.migrated` marker;
+- the legacy files are **never deleted** — they remain on disk as the git-history floor;
+- a stock/template `MEMORY.md` is detected and not imported as if it were real memory.
+
+So enablement is just the config flip: the next Dream cycle migrates and Lint builds the MOC.
+
+### Decay and reheat lifecycle
+
+Each type has a `cold_after_days` budget in `SCHEMA.md`. On Lint:
+
+- a hot page whose `last_touched` is older than its type's budget is moved to `wiki/.cold/<type>/` and dropped from the MOC;
+- `pinned: true` in a page's frontmatter makes it immune to decay;
+- an explicit `wiki_note` read of a cold page reheats it in place (status flips back to hot, `last_touched` is bumped); the **next** Lint relocates it out of `.cold/` back to its hot home and re-indexes it into the MOC;
+- `append` deliberately refuses `.cold/` paths — cold pages reheat only via `read`.
+
+Nothing is hard-deleted: `.cold/` plus git history are the floor. The only thing that truly removes a page is a Lint dedup/merge or a manual deletion.
+
+### SCHEMA.md knobs
+
+The bundled master schema ships at `nanobot/templates/memory/wiki/SCHEMA.md` and is copied into each vault on first use:
+
+```yaml
+types:
+  people:    { folder: people,    cold_after_days: 180 }
+  projects:  { folder: projects,  cold_after_days: 90 }
+  concepts:  { folder: concepts,  cold_after_days: 365 }
+  decisions: { folder: decisions, cold_after_days: null }
+required_frontmatter: [type, title, status, created, updated, last_touched]
+moc_max_lines: 120
+```
+
+- `types` defines the allowed page types, their filing folder, and per-type decay (`cold_after_days: null` = never decays);
+- `required_frontmatter` is the admission gate — a page missing any of these keys (or with an unknown `type`) is refused by the `wiki_note` tool;
+- `moc_max_lines` is the soft cap on the regenerated MOC.
+
+To customize types or decay policy for a vault, edit that vault's `wiki/SCHEMA.md` (a per-vault `SCHEMA.md` overrides the bundled master and is never overwritten once present). Editing the bundled master changes the default for vaults created afterward.
+
+### `/dream-log` and `/dream-restore`
+
+These commands now cover the wiki as well as the legacy memory files, because `GitStore` versions everything under `memory/users/**`:
+
+- `/dream-log` shows the latest Dream change, including wiki page changes;
+- `/dream-restore` with no arguments lists recent commits;
+- `/dream-restore <sha>` is a true per-commit inverse over the tracked memory tree: it undoes exactly that commit's changes (including wiki pages it added/modified) while preserving later and unrelated pages and the legacy files;
+- restoring a commit with nothing to undo (e.g. the first version) returns a plain "Nothing to undo" message — that is informational, not an error.
+
+### Resilience and operational notes
+
+- **Per-user isolation of failures:** if Ingest or Lint raises for one vault, the failure is logged with that vault's slug and swallowed. The other users still ingest, the legacy memory path and Dream cursor are unaffected, and that user's batch stays in `history.jsonl` for a later cycle.
+- **Idempotent on crash-resume:** re-delivering the same history batch with the same model output is a byte-stable no-op (Ingest skips text already present; Lint only writes when bytes would change).
+- **Per-vault lock (H2):** the same per-vault async lock serializes same-user Dream-Ingest against the `wiki_note` tool, while distinct users' vaults proceed concurrently.
+- **Total read-side routing:** the `history.jsonl` `session_key` field is read defensively — any malformed value routes to `unified_default` rather than raising.
+
+> ⚠ **Production prerequisite (known caveat, not yet implemented).** The process-wide Dream-run lock is held across the Ingest LLM call, and there is currently **no outer Dream timeout** — only the provider SDK's default request timeout. A wedged LLM call would therefore hold the global Dream lock and stall subsequent Dream cycles. Before enabling `wikiEnabled: true` in a production deployment, ensure a bounded provider request timeout (or keep the gate off). This is a known operational caveat and a planned hardening, not a blocker for the gated-off default.
+
+### Low-latency MOC refresh
+
+A successful `wiki_note` create or append now triggers a deterministic, LLM-free post-turn regeneration of that user's `_index.md` files and root `MEMORY.md` MOC. Durable facts therefore land in the always-injected MOC the very next turn, without waiting for the 2h Dream. The heavy Dream pass — Ingest plus curation (Karpathy checks, dedup, decay) — is unchanged and still runs on its normal cadence as the quality pass; the post-turn refresh only keeps the navigation fresh, it does not move, merge, or decay pages. Both the post-turn refresh and the underlying `wiki_note` tool are gated by `dream.wiki_enabled` (the `wikiEnabled` key under `agents.defaults.dream`): with the wiki off, behavior is byte-identical to stock nanobot.
+
+To actually get the agent to write durable facts, the capture/recall directive must be active. When `dream.wiki_enabled` is true the `memory` skill automatically presents this wiki-aware guidance — no workspace `AGENTS.md` edit needed; when false, the legacy memory skill is shown unchanged. See [`wiki-agents-directive.md`](./wiki-agents-directive.md) for operator details and [`wiki-moc-decouple-design.md`](./wiki-moc-decouple-design.md) for the full design.
 
 ## In Practice
 

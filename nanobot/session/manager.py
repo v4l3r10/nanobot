@@ -279,7 +279,17 @@ class Session:
         already_consolidated = min(before_last_consolidated, dropped_count)
         archive_chunk = dropped[already_consolidated:]
         if archive_chunk and on_archive:
-            on_archive(archive_chunk)
+            # Task 7.2: thread THIS session's EFFECTIVE key (self.key —
+            # unified or channel:chat_id) so the raw breadcrumb routes to
+            # this user's per-user wiki vault. I2 (review follow-up): every
+            # real in-tree on_archive is the bound MemoryStore.raw_archive,
+            # which accepts session_key — so the old `except TypeError:
+            # on_archive(archive_chunk)` keyless fallback was DEAD code that
+            # could only ever fire by MASKING a TypeError raised DEEP INSIDE a
+            # correctly-signatured raw_archive, silently re-invoking it
+            # keyless (double-archive / mis-route to unified) or losing the
+            # archive. Dropped: a real interior TypeError now PROPAGATES.
+            on_archive(archive_chunk, session_key=self.key)
         logger.info(
             "Session file cap hit for {}: dropped {}, raw-archived {}, kept {}",
             self.key,

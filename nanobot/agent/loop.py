@@ -27,6 +27,10 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.wiki.lint import rebuild_indexes_and_moc
+from nanobot.agent.wiki.moc_refresh import take_dirty
+from nanobot.agent.wiki.paths import vault_dir, vault_slug
+from nanobot.agent.wiki.vault import Vault
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -45,6 +49,7 @@ from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 from nanobot.utils.session_attachments import merge_turn_media_into_last_assistant
+from nanobot.utils.vault_lock import get_vault_lock
 from nanobot.utils.webui_titles import mark_webui_session, maybe_generate_webui_title_after_turn
 from nanobot.utils.webui_turn_helpers import publish_turn_run_status
 
@@ -187,6 +192,7 @@ class AgentLoop:
         max_messages: int = 120,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
+        wiki_enabled: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
         image_generation_provider_config: ProviderConfig | None = None,
@@ -247,7 +253,12 @@ class AgentLoop:
         self._pending_turn_latency_ms: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+            wiki_enabled=wiki_enabled,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
@@ -360,6 +371,7 @@ class AgentLoop:
             channels_config=config.channels,
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
+            wiki_enabled=defaults.dream.wiki_enabled,
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
@@ -465,6 +477,11 @@ class AgentLoop:
             provider_snapshot_loader=self._provider_snapshot_loader,
             image_generation_provider_configs=self._image_generation_provider_configs,
             timezone=self.context.timezone or "UTC",
+            # Resolved master switch (ContextBuilder holds the value plumbed
+            # from config.agents.defaults.dream.wiki_enabled). Gates
+            # WikiNoteTool registration so a wiki-OFF install never sends the
+            # tool schema to the provider (byte-identity with v0.2.0).
+            wiki_enabled=self.context.wiki_enabled,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
@@ -615,6 +632,12 @@ class AgentLoop:
         pending_summary: str | None,
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
+        # Pass the effective session key so the wiki read path (when enabled)
+        # resolves THIS user's per-user vault MOC/USER.md. session.key is the
+        # already-resolved effective key (unified or channel:chat); prefer it,
+        # falling back to the msg-derived effective key. When the wiki is off
+        # ContextBuilder ignores this entirely (verbatim original path).
+        effective_key = session.key or self._effective_session_key(msg)
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -624,6 +647,7 @@ class AgentLoop:
             sender_id=msg.sender_id,
             session_summary=pending_summary,
             session_metadata=session.metadata,
+            session_key=effective_key,
         )
 
     async def _dispatch_command_inline(
@@ -960,6 +984,15 @@ class AgentLoop:
                             channel=msg.channel, chat_id=msg.chat_id,
                             content="", metadata=msg.metadata or {},
                         ))
+                    # Wiki MOC decouple: keep the always-injected root MOC fresh
+                    # within the turn it was written, decoupled from the heavy 2h
+                    # Dream Ingest. Gated on the same master switch; per-vault
+                    # isolated; the dirty signal is only set by a successful
+                    # wiki_note write (which itself cannot fire when wiki is off
+                    # -> double-gated -> golden-safe). Runs for ALL channels
+                    # (placed before the websocket-only block).
+                    if self.context.wiki_enabled and take_dirty(vault_slug(session_key)):
+                        self._schedule_background(self._refresh_vault_moc(session_key))
                     if msg.channel == "websocket":
                         # Signal that the turn is fully complete (all tools executed,
                         # final text streamed).  This lets WS clients know when to
@@ -1065,6 +1098,29 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
+    async def _refresh_vault_moc(self, session_key: str) -> None:
+        """Post-turn: regenerate this vault's _index.md + root MEMORY.md
+        (deterministic, LLM-free) so a just-written wiki_note page is in
+        the always-injected MOC next turn -- without waiting for Dream.
+
+        Serialized against wiki_note / Dream's wiki block via the SAME
+        per-vault lock. ensure_initialized() is called with NO
+        legacy_workspace: per-user vaults must NEVER run migrate_legacy
+        (it would fan the single global memory blob into this vault ->
+        permanent cross-user bleed; that gate stays Dream/unified-only).
+        Best-effort: any failure is logged and swallowed so it never
+        breaks the user's turn (the next write / Dream will retry).
+        """
+        slug = vault_slug(session_key)
+        try:
+            async with get_vault_lock(slug):
+                vault = Vault(vault_dir(Path(self.workspace), session_key))
+                vault.ensure_initialized()  # NO legacy_workspace (isolation)
+                rebuild_indexes_and_moc(vault)
+        except Exception:
+            logger.exception(
+                "post-turn MOC refresh failed for vault {}", slug)
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -1124,6 +1180,9 @@ class AgentLoop:
             sender_id=msg.sender_id,
             session_summary=pending,
             session_metadata=session.metadata,
+            # `key` is the effective session key resolved above; lets the
+            # wiki read path target this user's vault (no-op when wiki off).
+            session_key=key,
         )
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(

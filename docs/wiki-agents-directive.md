@@ -1,0 +1,11 @@
+# Wiki capture/recall directive — now ships in-product
+
+This is a behavioral policy: it makes the agent proactively *capture* durable facts (and *recall* them before answering from ignorance) via the `wiki_note` tool, instead of waiting to be asked. It is policy only — the `wiki_note` tool self-describes its own mechanics in its schema, so the policy deliberately does not repeat them.
+
+**This is now automatic — no `AGENTS.md` edit required.** Whenever the wiki master switch is enabled (`dream.wiki_enabled` — written `wikiEnabled` under `agents.defaults.dream` in `config.json`; see [How to enable](./memory.md#how-to-enable)), the always-injected `memory` skill is automatically replaced with the wiki-aware capture/recall guidance. The substitution is gated on the wiki being active for the call (`dream.wiki_enabled` true *and* a session key); with the wiki off, the legacy memory skill is shown unchanged and runtime is byte-identical to stock nanobot. Operators no longer hand-paste anything into the workspace `AGENTS.md`, and there is nothing to revert.
+
+**Canonical source (single source of truth):** the policy text lives in [`nanobot/templates/agent/memory_skill_wiki.md`](../nanobot/templates/agent/memory_skill_wiki.md). It is rendered in-product and injected in the `memory` skill's slot when the wiki is active. This doc intentionally does **not** reproduce the policy text — read the template for the exact wording.
+
+**Optional manual override (reference only).** Operators who want to further customize the directive — e.g. tighten capture rules for a specific deployment — can copy the block from `nanobot/templates/agent/memory_skill_wiki.md` and append a customized variant to the **end of the bot's *workspace* `AGENTS.md`** (the per-user/agent workspace bootstrap file, re-read every turn, not this repository's `AGENTS.md`). This is **optional** and **secondary**: the template above remains the single source of truth; a manual block is only an operator override layered on top, and is itself inert while the wiki is off (the `wiki_note` tool is not registered, so the directive has nothing to act on).
+
+See [`wiki-moc-decouple-design.md`](./wiki-moc-decouple-design.md) §5 for the design rationale and [`memory.md`](./memory.md) for the memory-system overview.

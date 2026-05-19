@@ -4,19 +4,22 @@ import base64
 import mimetypes
 import platform
 from contextlib import suppress
-from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.agent.wiki.paths import vault_dir
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
     truncate_text,
 )
-from nanobot.utils.prompt_templates import render_template
+from nanobot.utils.prompt_templates import (
+    is_bundled_template_content,
+    render_template,
+)
 
 
 class ContextBuilder:
@@ -25,12 +28,37 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
+    # When the wiki is enabled, durable knowledge lives in the per-user vault
+    # (navigable via the wiki_note tool); the replayed history tail is just a
+    # short recency window, so it is capped much smaller. _MAX_HISTORY_CHARS
+    # and the wiki-off _MAX_RECENT_HISTORY=50 are deliberately unchanged.
+    _MAX_RECENT_HISTORY_WIKI = 10
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
+    # Hard cap on the per-user vault MOC / USER.md injected on the wiki-on hot
+    # path (every turn). Same 32_000 value as _MAX_HISTORY_CHARS — both bound a
+    # single durable-knowledge section that Lint normally keeps small, so one
+    # shared ceiling is the least surprising choice and keeps the bound
+    # uniform; a separate name documents intent and lets the two diverge later
+    # without touching call sites. This is what makes I1's token probe
+    # guaranteed-conservative: the probe and the real turn read the same
+    # bounded text. The wiki-OFF path (global get_memory_context) is unchanged.
+    _MAX_MEMORY_CHARS = 32_000
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
-    def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        timezone: str | None = None,
+        disabled_skills: list[str] | None = None,
+        wiki_enabled: bool = False,
+    ):
         self.workspace = workspace
         self.timezone = timezone
+        # Master gate for the wiki-tree memory read path (Task 3.1 knob,
+        # plumbed from config.agents.defaults.dream.wiki_enabled). Default
+        # False so the system prompt is byte-identical to a stock v0.2.0
+        # install — the single most safety-critical invariant.
+        self.wiki_enabled = wiki_enabled
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
@@ -39,21 +67,115 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         channel: str | None = None,
         session_summary: str | None = None,
+        session_key: str | None = None,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the system prompt from identity, bootstrap files, memory, and skills.
+
+        ``session_key`` is the effective session key, passed explicitly by the
+        caller (the plan's chosen approach — an explicit argument rather than a
+        ContextVar — so the per-user vault is resolved purely from arguments and
+        every call site stays auditable). It is only consulted when
+        ``self.wiki_enabled`` is True. When the wiki is off, or no
+        ``session_key`` is available, the original (pre-6.1) code path runs
+        verbatim so the prompt is byte-identical to a stock install.
+        """
+        # Single source of truth for "the wiki read path is fully activated
+        # for this call" (M3). The read block below and every wiki branch are
+        # gated on this ONE predicate so they can never diverge: a falsy but
+        # non-None key (e.g. "") would otherwise skip the read yet take the
+        # wiki branch, leaving the user with NEITHER vault memory/profile NOR
+        # the global fallback. bool(session_key) is False for both None and
+        # "" -> safe wiki-off fallback in both cases. The wiki-off path stays
+        # byte-identical (this predicate only ever suppresses the wiki block).
+        wiki_active = self.wiki_enabled and bool(session_key)
+
+        # Resolve the per-user vault MOC iff the wiki read path is fully
+        # activated for this call. Anything missing -> wiki_moc stays None and
+        # every branch below falls back to the verbatim original behaviour.
+        wiki_moc: str | None = None
+        vault_user: str | None = None
+        if wiki_active:
+            vroot = vault_dir(self.workspace, session_key)
+            with suppress(OSError):
+                moc_path = vroot / "MEMORY.md"
+                if moc_path.is_file():
+                    # Intentionally lock-free and torn-read-safe: Lint ALWAYS
+                    # rewrites this MOC via atomic_write_text (tmp file +
+                    # os.replace), never an in-place open(...,'w'), so a
+                    # concurrent Lint can only swap the whole file, never
+                    # expose a partial write. Do NOT change Lint to write the
+                    # MOC non-atomically. (M2)
+                    text = moc_path.read_text(encoding="utf-8")
+                    if text.strip():
+                        # Deterministic hot-path bound (M1): a corrupted /
+                        # pre-Lint / hand-edited MOC must not blow up the
+                        # prompt every turn. Same truncate_text helper the
+                        # history path uses.
+                        wiki_moc = truncate_text(text, self._MAX_MEMORY_CHARS)
+            with suppress(OSError):
+                user_path = vroot / "USER.md"
+                if user_path.is_file():
+                    vault_user = truncate_text(
+                        user_path.read_text(encoding="utf-8"),
+                        self._MAX_MEMORY_CHARS,
+                    )
+
         parts = [self._get_identity(channel=channel)]
 
-        bootstrap = self._load_bootstrap_files()
-        if bootstrap:
-            parts.append(bootstrap)
+        # USER.md de-duplication: when the wiki read path is active the vault
+        # owns the user profile, so the global workspace-root USER.md must not
+        # also be injected by the bootstrap block (no double / stale profile).
+        # SOUL.md / AGENTS.md / TOOLS.md handling is untouched.
+        if wiki_active:
+            bootstrap = self._load_bootstrap_files(skip={"USER.md"})
+            if bootstrap:
+                parts.append(bootstrap)
+            if vault_user and vault_user.strip():
+                parts.append(f"## USER.md\n\n{vault_user}")
+        else:
+            bootstrap = self._load_bootstrap_files()
+            if bootstrap:
+                parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
-            parts.append(f"# Memory\n\n{memory}")
+        if wiki_active:
+            # Wiki source of truth: inject the Lint-regenerated per-user MOC
+            # (same wrapper/heading; only the content source changes). If the
+            # vault is empty / the MOC is absent or blank, skip the section
+            # entirely — do NOT fall back to the global MEMORY.md.
+            if wiki_moc and wiki_moc.strip():
+                parts.append(f"# Memory\n\n{wiki_moc}")
+        else:
+            memory = self.memory.get_memory_context()
+            if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+                parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
+            if wiki_active and "memory" in always_skills:
+                # Wiki active: the legacy `memory` skill (MEMORY.md / grep
+                # history.jsonl) is stale and misleading — the per-user vault
+                # MOC + wiki_note are the real mechanism. Substitute ONLY the
+                # `memory` body with the wiki-aware guidance, preserving the
+                # exact `### Skill: <name>` / `\n\n---\n\n` shape
+                # load_skills_for_context produces and the original ordering
+                # (each skill emitted in get_always_skills() order, the wiki
+                # body in `memory`'s slot). Other always-skills are loaded
+                # verbatim. This branch is unreachable when wiki is off, so
+                # the wiki-OFF system prompt is byte-identical to before.
+                wiki_mem = render_template("agent/memory_skill_wiki.md").strip()
+                rendered = []
+                # `### Skill: <name>` wrapper + `\n\n---\n\n` join below MUST mirror the source of
+                # truth nanobot/agent/skills.py:load_skills_for_context (L104-109); keep in sync.
+                for name in always_skills:
+                    if name == "memory":
+                        rendered.append(f"### Skill: memory\n\n{wiki_mem}")
+                    else:
+                        body = self.skills.load_skills_for_context([name])
+                        if body:
+                            rendered.append(body)
+                always_content = "\n\n---\n\n".join(p for p in rendered if p)
+            else:
+                always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
@@ -63,7 +185,10 @@ class ContextBuilder:
 
         entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
         if entries:
-            capped = entries[-self._MAX_RECENT_HISTORY:]
+            history_cap = (
+                self._MAX_RECENT_HISTORY_WIKI if wiki_active else self._MAX_RECENT_HISTORY
+            )
+            capped = entries[-history_cap:]
             history_text = "\n".join(
                 f"- [{e['timestamp']}] {e['content']}" for e in capped
             )
@@ -121,11 +246,19 @@ class ContextBuilder:
 
         return _to_blocks(left) + _to_blocks(right)
 
-    def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+    def _load_bootstrap_files(self, skip: set[str] | None = None) -> str:
+        """Load all bootstrap files from workspace.
+
+        ``skip`` (default None) names bootstrap files to omit; used by the
+        wiki read path to suppress the global USER.md (the vault owns it).
+        With ``skip`` None/empty the iteration is the verbatim original, so
+        the wiki-off prompt is byte-identical.
+        """
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
+            if skip and filename in skip:
+                continue
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
@@ -135,12 +268,12 @@ class ContextBuilder:
 
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
-        """Check if *content* is identical to the bundled template (user hasn't customized it)."""
-        with suppress(Exception):
-            tpl = pkg_files("nanobot") / "templates" / template_path
-            if tpl.is_file():
-                return content.strip() == tpl.read_text(encoding="utf-8").strip()
-        return False
+        """Check if *content* is identical to the bundled template (user hasn't customized it).
+
+        Delegates to the shared leaf helper so this check and the Task 7.1
+        legacy-migration template guard can never diverge.
+        """
+        return is_bundled_template_content(content, template_path)
 
     def build_messages(
         self,
@@ -154,8 +287,15 @@ class ContextBuilder:
         sender_id: str | None = None,
         session_summary: str | None = None,
         session_metadata: Mapping[str, Any] | None = None,
+        session_key: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Build the complete message list for an LLM call."""
+        """Build the complete message list for an LLM call.
+
+        ``session_key`` is threaded straight to :meth:`build_system_prompt`
+        so the wiki read path can resolve the caller's per-user vault. None
+        (the default, and the consolidator token-probe case) keeps the
+        verbatim wiki-off behaviour.
+        """
         extra = goal_state_runtime_lines(session_metadata)
         runtime_ctx = self._build_runtime_context(
             channel,
@@ -175,7 +315,7 @@ class ContextBuilder:
         else:
             merged = user_content + [{"type": "text", "text": runtime_ctx}]
         messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel, session_summary=session_summary)},
+            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel, session_summary=session_summary, session_key=session_key)},
             *history,
         ]
         if messages[-1].get("role") == current_role:

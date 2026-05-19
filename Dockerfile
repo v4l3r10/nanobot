@@ -27,6 +27,9 @@ WORKDIR /app
 ENV NANOBOT_SKIP_WEBUI_BUILD=1
 
 # Install Python dependencies first (cached layer)
+# hatch_build.py must be present at `uv pip install .` time: the custom
+# hatchling build hook is loaded during the build and errors with
+# "Build script does not exist: hatch_build.py" if it is missing here.
 COPY pyproject.toml README.md LICENSE hatch_build.py ./
 RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
     uv pip install --system --no-cache . && \

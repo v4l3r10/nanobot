@@ -495,3 +495,208 @@ class TestJournal:
         store.write_journal("2026-05-08", "second")
 
         assert store.read_journal("2026-05-08") == "second"
+
+
+class TestAtomicMemoryWrites:
+    def test_write_memory_leaves_no_tmp_file(self, tmp_path):
+        from nanobot.agent.memory import MemoryStore
+        s = MemoryStore(tmp_path)
+        s.write_memory("# Memory\n- fact")
+        names = sorted(p.name for p in (tmp_path / "memory").iterdir())
+        assert "MEMORY.md" in names
+        assert not any(n.endswith(".tmp") for n in names)
+        assert s.read_memory() == "# Memory\n- fact"
+
+
+class TestAppendHistorySessionKey:
+    """Task 7.2: history records carry a ``session_key`` for per-user vault
+    routing — back-compat with legacy records that LACK the field.
+    """
+
+    def test_append_history_tags_session_key(self, store):
+        """An explicit ``session_key`` lands verbatim in the on-disk record;
+        omitting it defaults to the back-compat unified key; a hand-written
+        LEGACY record lacking the field is read back fine (no KeyError) and
+        treated as ``unified:default`` by readers.
+        """
+        store.append_history("for user 7", session_key="telegram:7")
+        store.append_history("no key given")  # default
+
+        entries = store._read_entries()
+        assert entries[0]["content"] == "for user 7"
+        assert entries[0]["session_key"] == "telegram:7"
+        assert entries[1]["content"] == "no key given"
+        # Default when no key is supplied is the unified back-compat key.
+        assert entries[1]["session_key"] == "unified:default"
+
+        # A legacy record physically lacking session_key must round-trip and
+        # readers must treat it as the unified key (NEVER raise KeyError).
+        store.history_file.write_text(
+            '{"cursor": 1, "timestamp": "2026-04-01 10:00", "content": "legacy"}\n',
+            encoding="utf-8",
+        )
+        legacy = store._read_entries()
+        assert legacy[0]["content"] == "legacy"
+        assert "session_key" not in legacy[0]
+        # Reader contract: .get(...,"unified:default") — no KeyError.
+        assert legacy[0].get("session_key", "unified:default") == "unified:default"
+        # read_unprocessed_history must still surface the legacy record.
+        unproc = store.read_unprocessed_history(since_cursor=0)
+        assert len(unproc) == 1
+        assert unproc[0].get("session_key", "unified:default") == "unified:default"
+
+    def test_session_key_round_trips_through_compaction(self, store):
+        """``compact_history`` (which rewrites the file via ``_write_entries``)
+        must preserve the ``session_key`` field and not choke on legacy
+        records that lack it.
+        """
+        store.max_history_entries = 2
+        store.append_history("a", session_key="telegram:1")
+        store.append_history("b", session_key="telegram:2")
+        store.append_history("c")  # default unified
+        store.compact_history()
+
+        entries = store._read_entries()
+        assert len(entries) == 2
+        assert entries[0]["content"] == "b"
+        assert entries[0]["session_key"] == "telegram:2"
+        assert entries[1]["content"] == "c"
+        assert entries[1]["session_key"] == "unified:default"
+
+    def test_raw_archive_threads_session_key(self, store):
+        """``raw_archive`` forwards its ``session_key`` to the appended
+        record; default stays the unified key (safe back-compat).
+        """
+        store.raw_archive(
+            [{"role": "user", "content": "hi", "timestamp": "2026-04-01 10:00"}],
+            session_key="discord:42",
+        )
+        entries = store._read_entries()
+        assert entries[0]["session_key"] == "discord:42"
+        assert "[RAW]" in entries[0]["content"]
+
+        store2 = MemoryStore(store.workspace.parent / "ws2")
+        store2.raw_archive(
+            [{"role": "user", "content": "hi", "timestamp": "2026-04-01 10:00"}],
+        )
+        e2 = store2._read_entries()
+        assert e2[0]["session_key"] == "unified:default"
+
+
+class TestEntrySlug:
+    """C1 (Task 7.2 review): the read-side slug helper must collapse ABSENT,
+    JSON ``None``, AND ``""`` ``session_key`` all to the unified slug —
+    matching ``append_history``'s write-side ``session_key or 'unified:default'``
+    semantics — and NEVER raise (``vault_slug(None)`` → ``AttributeError``
+    would skip the whole wiki pass for every user that cycle).
+    """
+
+    def test_entry_slug_absent_none_empty_all_unified(self):
+        from nanobot.agent.memory import Dream
+
+        # Absent key.
+        assert Dream._entry_slug({"content": "x"}) == "unified_default"
+        # JSON null.
+        assert Dream._entry_slug({"session_key": None}) == "unified_default"
+        # Empty string.
+        assert Dream._entry_slug({"session_key": ""}) == "unified_default"
+        # Explicit unified.
+        assert Dream._entry_slug(
+            {"session_key": "unified:default"}
+        ) == "unified_default"
+        # A real per-user key still routes to its own slug.
+        assert Dream._entry_slug(
+            {"session_key": "telegram:1"}
+        ) == "telegram_1"
+
+    def test_vaults_for_batch_groups_absent_none_empty_as_unified(
+        self, store, monkeypatch,
+    ):
+        """``_vaults_for_batch`` (which now uses ``_entry_slug``) groups
+        absent / ``None`` / ``""`` session keys all under ``unified_default``
+        alongside a real per-user key — and never raises."""
+        from unittest.mock import MagicMock
+
+        from nanobot.agent.memory import Dream
+
+        dream = Dream(
+            store=store, provider=MagicMock(), model="m", max_batch_size=5,
+        )
+        batch = [
+            {"cursor": 1, "timestamp": "t", "content": "a"},  # absent
+            {"cursor": 2, "timestamp": "t", "content": "b", "session_key": None},
+            {"cursor": 3, "timestamp": "t", "content": "c", "session_key": ""},
+            {"cursor": 4, "timestamp": "t", "content": "d", "session_key": "telegram:9"},
+        ]
+        assert dream._vaults_for_batch(batch) == [
+            "telegram_9",
+            "unified_default",
+        ]
+
+    # --- Residual follow-up to 7.2: _entry_slug must be TOTAL ---------------
+    # ``... or "unified:default"`` only handles FALSY values. A non-str
+    # TRUTHY ``session_key`` (123 / 1.5 / True / list / dict) — reachable
+    # from the SAME external/legacy/hand-edited/malformed history writers
+    # the commit defends against for ``null`` — reaches
+    # ``vault_slug(123)`` → ``123.replace`` → ``AttributeError``. The fixed
+    # ``_entry_slug`` must coerce EVERY non-(non-empty-str) value to the
+    # unified slug and NEVER raise (total over all JSON-deserializable
+    # values). Only a non-empty ``str`` routes per-user.
+
+    # (value record, expected slug) — covers absent + every non-str truthy
+    # plus the falsy ones already collapsed, and real per-user keys.
+    _TOTAL_CASES = [
+        ({"content": "x"}, "unified_default"),  # absent (no session_key)
+        ({"session_key": None}, "unified_default"),
+        ({"session_key": ""}, "unified_default"),
+        ({"session_key": 0}, "unified_default"),
+        ({"session_key": 123}, "unified_default"),
+        ({"session_key": 1.5}, "unified_default"),
+        ({"session_key": True}, "unified_default"),
+        ({"session_key": []}, "unified_default"),
+        ({"session_key": ["x"]}, "unified_default"),
+        ({"session_key": {}}, "unified_default"),
+        ({"session_key": {"a": 1}}, "unified_default"),
+        ({"session_key": "telegram:1"}, "telegram_1"),
+        ({"session_key": "unified:default"}, "unified_default"),
+    ]
+
+    @pytest.mark.parametrize("entry,expected", _TOTAL_CASES)
+    def test_entry_slug_total_over_malformed_session_key(
+        self, entry, expected,
+    ):
+        """``Dream._entry_slug`` is TOTAL: every value ``json.loads`` can
+        produce maps to a valid slug WITHOUT raising. Only a non-empty
+        ``str`` routes per-user; everything else collapses to
+        ``unified_default``. FAILS on ``cd32bf2e`` for the non-str truthy
+        values (``AttributeError`` from ``vault_slug(non-str)``).
+        """
+        from nanobot.agent.memory import Dream
+
+        assert Dream._entry_slug(entry) == expected
+
+    def test_vaults_for_batch_total_over_malformed_session_key(self, store):
+        """``_vaults_for_batch`` over a batch mixing EVERY malformed /
+        non-str ``session_key`` type plus one real per-user key returns a
+        deterministic SORTED DISTINCT slug list WITHOUT raising. FAILS on
+        ``cd32bf2e`` (``AttributeError`` escapes the grouping call).
+        """
+        from unittest.mock import MagicMock
+
+        from nanobot.agent.memory import Dream
+
+        dream = Dream(
+            store=store, provider=MagicMock(), model="m", max_batch_size=99,
+        )
+        batch = []
+        for i, (entry, _expected) in enumerate(self._TOTAL_CASES):
+            rec = {"cursor": i, "timestamp": "t", "content": f"c{i}"}
+            rec.update(entry)
+            batch.append(rec)
+        # Every non-(non-empty-str) collapses to unified_default; only the
+        # two real str keys route per-user (telegram:1, unified:default —
+        # the latter is the unified slug itself). Distinct sorted:
+        assert dream._vaults_for_batch(batch) == [
+            "telegram_1",
+            "unified_default",
+        ]

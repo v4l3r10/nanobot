@@ -85,6 +85,10 @@ class DreamConfig(Base):
     # Cap on the combined character size of the journal notes Phase 1 sees
     # in a single LLM call. 0 disables the cap (truncate_text sentinel).
     daily_notes_max_chars: int = Field(default=8_000, ge=0)
+    # Master gate for the wiki-tree memory subsystem (Ingest/Lint + MOC context
+    # injection). Default off so a stock install is byte-identical to v0.2.0.
+    wiki_enabled: bool = False
+    lint_cadence_h: int | None = Field(default=None, ge=1)  # None => use interval_h
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""

@@ -1,10 +1,11 @@
 """Test session management with cache-friendly message handling."""
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from pathlib import Path
+
 from nanobot.session.manager import Session, SessionManager
 
 # Test constants
@@ -518,7 +519,7 @@ class TestNewCommandArchival:
 
         call_count = 0
 
-        async def _failing_summarize(_messages) -> bool:
+        async def _failing_summarize(_messages, **kwargs) -> bool:
             nonlocal call_count
             call_count += 1
             return False
@@ -551,7 +552,7 @@ class TestNewCommandArchival:
 
         archived_count = -1
 
-        async def _fake_summarize(messages) -> bool:
+        async def _fake_summarize(messages, **kwargs) -> bool:
             nonlocal archived_count
             archived_count = len(messages)
             return True
@@ -578,7 +579,7 @@ class TestNewCommandArchival:
             session.add_message("assistant", f"resp{i}")
         loop.sessions.save(session)
 
-        async def _ok_summarize(_messages) -> bool:
+        async def _ok_summarize(_messages, **kwargs) -> bool:
             return True
 
         loop.consolidator.archive = _ok_summarize  # type: ignore[method-assign]
@@ -604,7 +605,7 @@ class TestNewCommandArchival:
 
         archived = asyncio.Event()
 
-        async def _slow_summarize(_messages) -> bool:
+        async def _slow_summarize(_messages, **kwargs) -> bool:
             await asyncio.sleep(0.1)
             archived.set()
             return True

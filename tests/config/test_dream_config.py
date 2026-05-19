@@ -195,3 +195,30 @@ def test_dream_config_rejects_invalid_daily_notes_settings() -> None:
         DreamConfig(daily_notes_context_days=0)
     with pytest.raises(ValidationError):
         DreamConfig(daily_notes_max_chars=-1)
+
+
+class TestWikiDreamConfig:
+    def test_wiki_defaults_off(self):
+        from nanobot.config.schema import DreamConfig
+        c = DreamConfig()
+        assert c.wiki_enabled is False
+        assert c.lint_cadence_h is None
+
+    def test_wiki_camelcase_json_loads(self):
+        from nanobot.config.schema import DreamConfig
+        c = DreamConfig.model_validate({"wikiEnabled": True, "lintCadenceH": 6})
+        assert c.wiki_enabled is True
+        assert c.lint_cadence_h == 6
+
+    def test_wiki_enabled_round_trips(self):
+        from nanobot.config.schema import DreamConfig
+        c = DreamConfig(wiki_enabled=True)
+        dumped = c.model_dump()
+        assert dumped["wiki_enabled"] is True
+
+    def test_lint_cadence_validation(self):
+        import pytest
+        from pydantic import ValidationError
+        from nanobot.config.schema import DreamConfig
+        with pytest.raises(ValidationError):
+            DreamConfig(lint_cadence_h=0)   # ge=1
