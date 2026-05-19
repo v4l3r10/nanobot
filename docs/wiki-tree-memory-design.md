@@ -2,6 +2,7 @@
 
 - **Data:** 2026-05-18
 - **Stato:** design validato (brainstorming concluso, 6/6 sezioni approvate)
+- **Stato implementazione: IMPLEMENTATO.** La feature è realizzata e dietro il knob `dream.wiki_enabled` (default `false`); milestone M0–M7 complete. La specifica comportamentale di riferimento è la suite end-to-end `tests/agent/test_wiki_e2e.py` (scenari A–I): qualsiasi affermazione su comportamento implementato va verificata lì.
 - **Autore driver:** valerio.cavagni@gmail.com
 - **Documenti correlati:**
   - `REPORT_memoria_nanobot_vs_openhuman.md` (confronto e raccomandazioni P1–P8, H1–H3)
@@ -154,4 +155,22 @@ Questo realizza l'**admission gate** (**P7**: segnali cheap + soglia, niente emb
 ## 9. Questioni aperte
 
 - **Posizione/versionamento di questo documento:** `F:\dev\AI\NanoBot_openHuman` non è un repo git; il clone `nanobot/` è un repo di terze parti (HKUDS/nanobot) — non opportuno committarvi. Da decidere: lasciare il design al root del workspace insieme agli altri artefatti, o inizializzare un repo git dedicato per il workspace.
+  - **Risolto (M7).** Il documento vive in-repo come `docs/wiki-tree-memory-design.md` (Markdown piatto, accanto a `docs/memory.md` / `docs/configuration.md`), versionato sul branch `feat/wiki-tree-memory`. La doc operatore/utente è la sezione "Wiki-tree memory (per-user navigable memory)" aggiunta a `docs/memory.md` (Task 7.4). Il working doc del piano resta fuori repo (`docs/plans/`, gitignored).
 - Dettaglio del formato `search` (ranking keyword/tag/recency) da fissare in fase di plan implementativo.
+  - **Risolto (M2, Task 2.4).** `wiki_note search` (`agent/tools/wiki_note.py`) è plain keyword/tag/recency su pagine hot **e** cold (`iter_pages(include_cold=True)`), niente embeddings/SQLite. Tre modalità mutuamente esclusive: query vuota → più recenti per `last_touched` desc (relpath asc tiebreak); prefisso `tag:` → match esatto case-insensitive sul tag; altrimenti → substring case-insensitive con punteggio per presenza-di-campo (title 3, tag 2, body 1), ordinato score desc / `last_touched` desc / relpath asc. Cap a 20 risultati con nota di overflow. `search` è read-only e **non** fa reheat (solo `read` reidrata una pagina cold).
+
+---
+
+## 10. Stato di chiusura — mappatura questioni → milestone
+
+Le altre decisioni di design aperte in fase di brainstorming sono state chiuse così (riferimento alla suite `tests/agent/test_wiki_e2e.py`, scenari A–I):
+
+- **Plumbing della session key nel ContextBuilder (§6):** argomento `session_key` esplicito passato a `build_system_prompt` (niente ContextVar) — risolto **Task 6.1** (`agent/context.py`); con wiki off o senza key il prompt è byte-identico al pre-wiki (scenario I).
+- **Attribuzione history multi-utente (§1, §6):** `append_history` taggato con `session_key` + routing read-side totale via `_entry_slug` (`agent/memory.py`) — risolto **Task 7.2**; ogni vault riceve solo la propria fetta del batch, nessun cross-bleed (scenario B).
+- **Migrazione legacy unified-only (§6 edge case):** `migrate_legacy` gira solo per `unified_default`, gate `slug == unified` al call-site Dream; i vault per-utente non ricevono mai il blob globale (invariante C1) — risolto **Task 7.1** (`agent/wiki/migrate.py`), enforced sotto routing live (scenario G).
+- **Hand-off reheat / `.cold/` (§4):** contratto pinnato — `read` reidrata in place, il Lint successivo rilocata fuori da `.cold/` (chiave `status == "hot" and ".cold" in path.parts`); `append` rifiuta i path cold — risolto **Task 2.3 / 4.3** (`agent/wiki/lint.py`, `wiki_note.py`), round-trip completo verificato (scenario C).
+- **Cap/eviction su `.cold/` (§5, §8):** confermato **YAGNI / rimandato** come da design — nessun hard-delete, `.cold/` + git restano il pavimento.
+- **Scritture atomiche (H1) e lock per-vault (H2):** `tmp` + `os.replace` (`utils/atomic.py`) ovunque nel tool, in Ingest, in Lint e in migrate; lock per-vault (`utils/vault_lock.get_vault_lock`) condiviso tra Dream-Ingest e `wiki_note` — risolto **M0/M2/M4** (scenari F, H).
+- **Idempotenza Ingest/Lint su retry Dream (§6 testing):** guardia di sostanza C2 in Ingest (`_body_already_present`) + Lint che scrive solo se i byte cambiano — risolto **Task 4.3/4.4**; un batch ri-consegnato è byte-stabile (scenario F).
+- **Versionamento git del wiki (§6):** `GitStore` scansiona dinamicamente `memory/users/**` e lo include in `auto_commit`/`revert`; `/dream-log` e `/dream-restore` coprono il wiki con inverse per-commit — risolto **Task 5.1/5.2** (`utils/gitstore.py`, `command/builtin.py`), scenario D.
+- **Golden "wiki off = nanobot attuale":** `dream.wiki_enabled=false` default, zero artefatti `memory/users/`, prompt sul `MEMORY.md` globale — risolto **Task 3.1 / 6.1**, enforced end-to-end (scenario I).
