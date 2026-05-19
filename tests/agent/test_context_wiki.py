@@ -250,6 +250,93 @@ class TestWikiEnabledHistoryTail:
 # ---------------------------------------------------------------------------
 
 
+class TestWikiSectionSizeCap:
+    """M1 — the vault MOC / USER reads are deterministically size-capped so a
+    corrupted / pre-Lint / hand-edited vault cannot blow up the hot-path
+    prompt on every turn. ``truncate_text`` semantics: when over the cap the
+    section content is ``text[:cap] + "\\n... (truncated)"``.
+    """
+
+    _SUFFIX = "\n... (truncated)"
+
+    def test_wiki_moc_is_size_capped(self, tmp_path):
+        cap = ContextBuilder._MAX_MEMORY_CHARS
+        oversized = "M" * (cap * 3)
+        _populate_workspace(tmp_path)
+        _write_vault_moc(tmp_path, "unified:default", oversized)
+
+        builder = ContextBuilder(workspace=tmp_path, wiki_enabled=True)
+        prompt = builder.build_system_prompt(session_key="unified:default")
+
+        mem = _memory_section(prompt)
+        assert mem is not None
+        body = mem[len("# Memory\n\n"):]
+        # Capped to the prefix + the stable truncation suffix, deterministic.
+        assert body == oversized[:cap] + self._SUFFIX
+        assert len(body) == cap + len(self._SUFFIX)
+        # Far below the raw 3x size that would otherwise be injected verbatim.
+        assert len(body) < len(oversized)
+
+    def test_wiki_user_is_size_capped(self, tmp_path):
+        cap = ContextBuilder._MAX_MEMORY_CHARS
+        oversized = "U" * (cap * 3)
+        _populate_workspace(tmp_path)
+        _write_vault_moc(tmp_path, "unified:default", VAULT_MOC)
+        _write_vault_user(tmp_path, "unified:default", oversized)
+
+        builder = ContextBuilder(workspace=tmp_path, wiki_enabled=True)
+        prompt = builder.build_system_prompt(session_key="unified:default")
+
+        user_part = None
+        for part in prompt.split("\n\n---\n\n"):
+            if part.startswith("## USER.md\n\n"):
+                user_part = part
+                break
+        assert user_part is not None
+        body = user_part[len("## USER.md\n\n"):]
+        assert body == oversized[:cap] + self._SUFFIX
+        assert len(body) == cap + len(self._SUFFIX)
+
+    def test_wiki_under_cap_moc_is_verbatim(self, tmp_path):
+        """A normal-sized MOC is injected verbatim (cap is a ceiling only)."""
+        _populate_workspace(tmp_path)
+        _write_vault_moc(tmp_path, "unified:default", VAULT_MOC)
+        builder = ContextBuilder(workspace=tmp_path, wiki_enabled=True)
+        prompt = builder.build_system_prompt(session_key="unified:default")
+        mem = _memory_section(prompt)
+        assert mem == f"# Memory\n\n{VAULT_MOC}"
+
+
+class TestWikiEmptyStringSessionKey:
+    """M3 — the read block and the ``wiki_active`` branch must share ONE
+    predicate so a falsy-but-not-None key (``""``) can never make them
+    disagree (read skipped, branch active ⇒ user loses BOTH memory and
+    profile). ``session_key=""`` must behave exactly like the safe
+    ``session_key=None`` fallback (= wiki-off byte-for-byte)."""
+
+    def test_empty_string_session_key_falls_back_safely(self, tmp_path):
+        _populate_workspace(tmp_path, history_entries=3)
+        # A vault exists for the unified slug, but the EMPTY key must not
+        # resolve to it (and must not crash) — it falls back to wiki-off.
+        _write_vault_moc(tmp_path, "unified:default", VAULT_MOC)
+
+        on = ContextBuilder(workspace=tmp_path, wiki_enabled=True)
+        off = ContextBuilder(workspace=tmp_path, wiki_enabled=False)
+
+        p_empty = on.build_system_prompt(session_key="")
+        p_none = on.build_system_prompt(session_key=None)
+        p_off = off.build_system_prompt()
+
+        # Empty key == None key == wiki-off, byte-for-byte.
+        assert p_empty == p_none == p_off
+        # Concretely: global memory present, global USER present, vault hidden.
+        mem = _memory_section(p_empty)
+        assert mem == GLOBAL_MEMORY_RENDERED
+        assert "## USER.md" in p_empty
+        assert ROOT_USER in p_empty
+        assert "vault-only durable fact" not in p_empty
+
+
 class TestUnifiedSessionVaultPath:
     def test_unified_session_uses_unified_default_vault(self, tmp_path):
         assert vault_slug("unified:default") == "unified_default"
