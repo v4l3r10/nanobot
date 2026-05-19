@@ -26,6 +26,10 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.wiki.lint import rebuild_indexes_and_moc
+from nanobot.agent.wiki.moc_refresh import take_dirty
+from nanobot.agent.wiki.paths import vault_dir, vault_slug
+from nanobot.agent.wiki.vault import Vault
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -44,6 +48,7 @@ from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 from nanobot.utils.session_attachments import merge_turn_media_into_last_assistant
+from nanobot.utils.vault_lock import get_vault_lock
 from nanobot.utils.webui_titles import mark_webui_session, maybe_generate_webui_title_after_turn
 from nanobot.utils.webui_turn_helpers import publish_turn_run_status
 
@@ -956,6 +961,15 @@ class AgentLoop:
                             channel=msg.channel, chat_id=msg.chat_id,
                             content="", metadata=msg.metadata or {},
                         ))
+                    # Wiki MOC decouple: keep the always-injected root MOC fresh
+                    # within the turn it was written, decoupled from the heavy 2h
+                    # Dream Ingest. Gated on the same master switch; per-vault
+                    # isolated; the dirty signal is only set by a successful
+                    # wiki_note write (which itself cannot fire when wiki is off
+                    # -> double-gated -> golden-safe). Runs for ALL channels
+                    # (placed before the websocket-only block).
+                    if self.context.wiki_enabled and take_dirty(vault_slug(session_key)):
+                        self._schedule_background(self._refresh_vault_moc(session_key))
                     if msg.channel == "websocket":
                         # Signal that the turn is fully complete (all tools executed,
                         # final text streamed).  This lets WS clients know when to
@@ -1060,6 +1074,29 @@ class AgentLoop:
         task = asyncio.create_task(coro)
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
+
+    async def _refresh_vault_moc(self, session_key: str) -> None:
+        """Post-turn: regenerate this vault's _index.md + root MEMORY.md
+        (deterministic, LLM-free) so a just-written wiki_note page is in
+        the always-injected MOC next turn -- without waiting for Dream.
+
+        Serialized against wiki_note / Dream's wiki block via the SAME
+        per-vault lock. ensure_initialized() is called with NO
+        legacy_workspace: per-user vaults must NEVER run migrate_legacy
+        (it would fan the single global memory blob into this vault ->
+        permanent cross-user bleed; that gate stays Dream/unified-only).
+        Best-effort: any failure is logged and swallowed so it never
+        breaks the user's turn (the next write / Dream will retry).
+        """
+        slug = vault_slug(session_key)
+        try:
+            async with get_vault_lock(slug):
+                vault = Vault(vault_dir(Path(self.workspace), session_key))
+                vault.ensure_initialized()  # NO legacy_workspace (isolation)
+                rebuild_indexes_and_moc(vault)
+        except Exception:
+            logger.exception(
+                "post-turn MOC refresh failed for vault {}", slug)
 
     def stop(self) -> None:
         """Stop the agent loop."""
