@@ -53,7 +53,9 @@ import nanobot.agent.memory as memory_mod
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import Dream, MemoryStore
 from nanobot.agent.runner import AgentRunResult
-from nanobot.agent.tools.context import RequestContext
+from nanobot.agent.tools.context import RequestContext, ToolContext
+from nanobot.agent.tools.loader import ToolLoader
+from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.wiki_note import WikiNoteTool
 from nanobot.agent.wiki.lint import run_lint
 from nanobot.agent.wiki.page import Page, parse_page, serialize_page
@@ -898,3 +900,80 @@ class TestWikiOffGoldenE2E:
         mock_provider.chat_with_retry.assert_not_called()
         mock_runner.run.assert_not_called()
         assert not (store.workspace / "memory" / "users").exists()
+
+
+# =========================================================================== #
+# I-1. Master-switch: wiki_note tool MUST NOT be registered / sent to the LLM
+#      when wiki_enabled=False (final-review must-fix; restores byte-identity
+#      with v0.2.0 — the extra tool definition every turn broke the guarantee).
+# =========================================================================== #
+
+
+class TestWikiNoteToolGatedOnWikiEnabled:
+    """``WikiNoteTool`` must be gated on the resolved ``dream.wiki_enabled``.
+
+    With the gate OFF the loader must NOT register it and
+    ``registry.get_definitions()`` (the exact list sent to the provider as
+    the ``tools=`` array every turn) must NOT contain ``wiki_note`` — so a
+    stock wiki-OFF install is byte-identical to pre-wiki nanobot. With the
+    gate ON it must register exactly as before (e2e A/G/H depend on it).
+    """
+
+    @staticmethod
+    def _load(workspace, *, wiki_enabled: bool) -> ToolRegistry:
+        """Drive the real loader+ToolContext path the production loop uses
+        (loop.py ``_register_default_tools`` builds this same ToolContext and
+        calls ``ToolLoader().load(ctx, registry)``)."""
+        from nanobot.config.schema import ToolsConfig
+
+        ctx = ToolContext(
+            config=ToolsConfig(),
+            workspace=str(workspace),
+            wiki_enabled=wiki_enabled,
+        )
+        registry = ToolRegistry()
+        ToolLoader().load(ctx, registry)
+        return registry
+
+    @staticmethod
+    def _definition_names(registry: ToolRegistry) -> set[str]:
+        names: set[str] = set()
+        for schema in registry.get_definitions():
+            fn = schema.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+                names.add(fn["name"])
+            elif isinstance(schema.get("name"), str):
+                names.add(schema["name"])
+        return names
+
+    def test_wiki_note_tool_absent_when_disabled(self, tmp_path):
+        """The I-1 regression. On the pre-fix code ``WikiNoteTool`` has no
+        ``enabled()`` override -> it is registered AND in get_definitions()
+        even with the gate off (this assertion FAILS pre-fix). Post-fix it
+        is absent when disabled and present when enabled."""
+        off = self._load(tmp_path, wiki_enabled=False)
+        on = self._load(tmp_path, wiki_enabled=True)
+
+        off_names = self._definition_names(off)
+        on_names = self._definition_names(on)
+
+        # Gate OFF: not registered, not in the provider tools= array.
+        assert "wiki_note" not in off.tool_names, (
+            "wiki_note registered while wiki_enabled=False — breaks the "
+            "master-switch byte-identity guarantee (v0.2.0 baseline)"
+        )
+        assert "wiki_note" not in off_names, (
+            "wiki_note in registry.get_definitions() while wiki_enabled=False "
+            "— its JSON schema would be sent to the provider every turn"
+        )
+
+        # Gate ON: registered + in the provider tools= array (feature works;
+        # e2e A/G/H rely on the tool existing under wiki_enabled=True).
+        assert "wiki_note" in on.tool_names
+        assert "wiki_note" in on_names
+
+        # Byte-identity-leaning: the disabled tool set differs from the
+        # enabled one by EXACTLY {"wiki_note"} and nothing else (no other
+        # tool's registration semantics changed).
+        assert on_names - off_names == {"wiki_note"}
+        assert off_names - on_names == set()

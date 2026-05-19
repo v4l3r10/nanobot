@@ -219,8 +219,10 @@ Enablement is operationally automatic: set `wikiEnabled: true` and the next Drea
 With `wikiEnabled: false` (the default), nanobot is byte-identical to pre-wiki nanobot:
 
 - no `memory/users/` directory is ever created;
-- the system prompt uses the global `memory/MEMORY.md` exactly as before;
+- the `wiki_note` tool is not registered, so its schema is never sent to the provider — the runtime behavior, system prompt, and tool set are byte-identical to pre-wiki nanobot;
 - the Dream cycle behaves exactly as before (same cursor, compaction, and git path).
+
+The only on-disk change with the switch off is that new `history.jsonl` records now carry an inert `session_key` field; it is ignored by every non-wiki consumer and legacy records without it are read unchanged.
 
 It is safe to ship the feature dark and leave it off indefinitely.
 

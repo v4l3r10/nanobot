@@ -503,6 +503,11 @@ class AgentLoop:
             image_generation_provider_configs=self._image_generation_provider_configs,
             timezone=self.context.timezone or "UTC",
             workspace_sandbox=self.workspace_scopes.sandbox_status,
+            # Resolved master switch (ContextBuilder holds the value plumbed
+            # from config.agents.defaults.dream.wiki_enabled). Gates
+            # WikiNoteTool registration so a wiki-OFF install never sends the
+            # tool schema to the provider (byte-identity with v0.2.0).
+            wiki_enabled=self.context.wiki_enabled,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)

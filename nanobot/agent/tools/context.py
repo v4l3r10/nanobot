@@ -57,3 +57,8 @@ class ToolContext:
     image_generation_provider_configs: dict[str, Any] | None = None
     timezone: str = "UTC"
     workspace_sandbox: Any | None = None
+    # Resolved ``dream.wiki_enabled`` master switch (plumbed from
+    # ``AgentLoop`` at the single construction site). Default ``False`` so
+    # any other ToolContext constructor (subagents, tests) is safe and the
+    # wiki tool stays gated OFF unless explicitly enabled.
+    wiki_enabled: bool = False
