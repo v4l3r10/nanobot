@@ -72,12 +72,34 @@ def test_rebuild_does_not_move_cool_or_dedup(tmp_path):
 
 def test_rebuild_matches_run_lint_regeneration_on_settled_vault(tmp_path):
     """On a settled (no curation needed) vault, the cheap pass and full
-    run_lint produce the SAME MEMORY.md (no divergence)."""
+    run_lint produce the SAME _index.md / MEMORY.md (no divergence)."""
     v = _vault(tmp_path)
     _page(v, "concepts", "alpha", "Alpha")
     _page(v, "people", "bob", "Bob")
     run_lint(v, dt.date(2026, 5, 19))
-    moc_lint = (v.root / "MEMORY.md").read_text(encoding="utf-8")
+
+    # Snapshot the settled vault: MOC + every _index.md (relative keys, sorted).
+    moc_lint = (v.root / "MEMORY.md").read_bytes()
+    index_snapshot = {
+        p.relative_to(v.wiki_dir): p.read_bytes()
+        for p in sorted(v.wiki_dir.rglob("_index.md"))
+    }
+    assert index_snapshot, "run_lint should have produced at least one _index.md"
+
+    # Wipe everything the cheap pass is responsible for regenerating.
     (v.root / "MEMORY.md").unlink()
+    for rel in index_snapshot:
+        (v.wiki_dir / rel).unlink()
+
     assert rebuild_indexes_and_moc(v) is True
-    assert (v.root / "MEMORY.md").read_text(encoding="utf-8") == moc_lint
+
+    # MOC byte-parity.
+    assert (v.root / "MEMORY.md").read_bytes() == moc_lint
+
+    # _index.md byte-parity: exact same set of relpaths, exact same bytes.
+    rebuilt_indexes = {
+        p.relative_to(v.wiki_dir): p.read_bytes()
+        for p in sorted(v.wiki_dir.rglob("_index.md"))
+    }
+    assert sorted(rebuilt_indexes) == sorted(index_snapshot)
+    assert rebuilt_indexes == index_snapshot
