@@ -130,10 +130,31 @@ def test_wiki_on_memory_body_renders_after_moc_section(tmp_path):
     assert "GLOBAL-MEMORY-FACT" not in prompt
 
 
+def _active_skills_section(prompt: str) -> str:
+    """Return the EXACT ``# Active Skills`` part of the assembled prompt.
+
+    ``build_system_prompt`` joins top-level parts with ``\\n\\n---\\n\\n`` and
+    the part right after ``# Active Skills`` is the ``# Skills`` summary
+    (``agent/skills_section.md``). The Active-Skills content itself joins
+    individual skills with the same ``\\n\\n---\\n\\n``, so the section runs
+    from the ``# Active Skills`` header up to the part boundary that starts the
+    next top-level section (``\\n\\n---\\n\\n# Skills``), or end of prompt.
+    """
+    start = prompt.index("# Active Skills")
+    rest = prompt[start:]
+    boundary = rest.find("\n\n---\n\n# Skills")
+    return rest if boundary == -1 else rest[:boundary]
+
+
 def test_wiki_off_path_is_byte_identical_to_no_substitution(tmp_path):
-    """Defense-in-depth: with wiki off, the Active Skills block equals exactly
-    what ``load_skills_for_context(get_always_skills())`` produces — proving
-    the non-wiki code path is unchanged by this feature."""
+    """Task 3 wiki-OFF byte-identity golden: with wiki off, the *entire*
+    ``# Active Skills`` section of the full system prompt is byte-identical to
+    ``# Active Skills\\n\\n`` + ``load_skills_for_context(get_always_skills())``
+    rebuilt from the unmodified ``SKILL.md`` files — proving the Task 2
+    substitution branch (``if wiki_active and "memory" in always_skills``) is
+    provably NOT taken and the non-wiki code path is unchanged by this feature.
+    Deterministic; no mocks beyond the existing harness; exact equality of the
+    isolated section slice (not a weaker containment check)."""
     _populate_workspace(tmp_path)
     builder = ContextBuilder(workspace=tmp_path, wiki_enabled=False)
     prompt = builder.build_system_prompt(session_key="telegram:1")
@@ -141,4 +162,4 @@ def test_wiki_off_path_is_byte_identical_to_no_substitution(tmp_path):
     always = builder.skills.get_always_skills()
     assert "memory" in always  # sanity: resolves under the test harness
     expected = builder.skills.load_skills_for_context(always)
-    assert f"# Active Skills\n\n{expected}" in prompt
+    assert _active_skills_section(prompt) == f"# Active Skills\n\n{expected}"
