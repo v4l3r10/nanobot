@@ -556,3 +556,71 @@ class TestEntrySlug:
             "telegram_9",
             "unified_default",
         ]
+
+    # --- Residual follow-up to 7.2: _entry_slug must be TOTAL ---------------
+    # ``... or "unified:default"`` only handles FALSY values. A non-str
+    # TRUTHY ``session_key`` (123 / 1.5 / True / list / dict) — reachable
+    # from the SAME external/legacy/hand-edited/malformed history writers
+    # the commit defends against for ``null`` — reaches
+    # ``vault_slug(123)`` → ``123.replace`` → ``AttributeError``. The fixed
+    # ``_entry_slug`` must coerce EVERY non-(non-empty-str) value to the
+    # unified slug and NEVER raise (total over all JSON-deserializable
+    # values). Only a non-empty ``str`` routes per-user.
+
+    # (value record, expected slug) — covers absent + every non-str truthy
+    # plus the falsy ones already collapsed, and real per-user keys.
+    _TOTAL_CASES = [
+        ({"content": "x"}, "unified_default"),  # absent (no session_key)
+        ({"session_key": None}, "unified_default"),
+        ({"session_key": ""}, "unified_default"),
+        ({"session_key": 0}, "unified_default"),
+        ({"session_key": 123}, "unified_default"),
+        ({"session_key": 1.5}, "unified_default"),
+        ({"session_key": True}, "unified_default"),
+        ({"session_key": []}, "unified_default"),
+        ({"session_key": ["x"]}, "unified_default"),
+        ({"session_key": {}}, "unified_default"),
+        ({"session_key": {"a": 1}}, "unified_default"),
+        ({"session_key": "telegram:1"}, "telegram_1"),
+        ({"session_key": "unified:default"}, "unified_default"),
+    ]
+
+    @pytest.mark.parametrize("entry,expected", _TOTAL_CASES)
+    def test_entry_slug_total_over_malformed_session_key(
+        self, entry, expected,
+    ):
+        """``Dream._entry_slug`` is TOTAL: every value ``json.loads`` can
+        produce maps to a valid slug WITHOUT raising. Only a non-empty
+        ``str`` routes per-user; everything else collapses to
+        ``unified_default``. FAILS on ``cd32bf2e`` for the non-str truthy
+        values (``AttributeError`` from ``vault_slug(non-str)``).
+        """
+        from nanobot.agent.memory import Dream
+
+        assert Dream._entry_slug(entry) == expected
+
+    def test_vaults_for_batch_total_over_malformed_session_key(self, store):
+        """``_vaults_for_batch`` over a batch mixing EVERY malformed /
+        non-str ``session_key`` type plus one real per-user key returns a
+        deterministic SORTED DISTINCT slug list WITHOUT raising. FAILS on
+        ``cd32bf2e`` (``AttributeError`` escapes the grouping call).
+        """
+        from unittest.mock import MagicMock
+
+        from nanobot.agent.memory import Dream
+
+        dream = Dream(
+            store=store, provider=MagicMock(), model="m", max_batch_size=99,
+        )
+        batch = []
+        for i, (entry, _expected) in enumerate(self._TOTAL_CASES):
+            rec = {"cursor": i, "timestamp": "t", "content": f"c{i}"}
+            rec.update(entry)
+            batch.append(rec)
+        # Every non-(non-empty-str) collapses to unified_default; only the
+        # two real str keys route per-user (telegram:1, unified:default —
+        # the latter is the unified slug itself). Distinct sorted:
+        assert dream._vaults_for_batch(batch) == [
+            "telegram_1",
+            "unified_default",
+        ]
