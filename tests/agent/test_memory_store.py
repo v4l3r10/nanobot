@@ -505,3 +505,54 @@ class TestAppendHistorySessionKey:
         )
         e2 = store2._read_entries()
         assert e2[0]["session_key"] == "unified:default"
+
+
+class TestEntrySlug:
+    """C1 (Task 7.2 review): the read-side slug helper must collapse ABSENT,
+    JSON ``None``, AND ``""`` ``session_key`` all to the unified slug —
+    matching ``append_history``'s write-side ``session_key or 'unified:default'``
+    semantics — and NEVER raise (``vault_slug(None)`` → ``AttributeError``
+    would skip the whole wiki pass for every user that cycle).
+    """
+
+    def test_entry_slug_absent_none_empty_all_unified(self):
+        from nanobot.agent.memory import Dream
+
+        # Absent key.
+        assert Dream._entry_slug({"content": "x"}) == "unified_default"
+        # JSON null.
+        assert Dream._entry_slug({"session_key": None}) == "unified_default"
+        # Empty string.
+        assert Dream._entry_slug({"session_key": ""}) == "unified_default"
+        # Explicit unified.
+        assert Dream._entry_slug(
+            {"session_key": "unified:default"}
+        ) == "unified_default"
+        # A real per-user key still routes to its own slug.
+        assert Dream._entry_slug(
+            {"session_key": "telegram:1"}
+        ) == "telegram_1"
+
+    def test_vaults_for_batch_groups_absent_none_empty_as_unified(
+        self, store, monkeypatch,
+    ):
+        """``_vaults_for_batch`` (which now uses ``_entry_slug``) groups
+        absent / ``None`` / ``""`` session keys all under ``unified_default``
+        alongside a real per-user key — and never raises."""
+        from unittest.mock import MagicMock
+
+        from nanobot.agent.memory import Dream
+
+        dream = Dream(
+            store=store, provider=MagicMock(), model="m", max_batch_size=5,
+        )
+        batch = [
+            {"cursor": 1, "timestamp": "t", "content": "a"},  # absent
+            {"cursor": 2, "timestamp": "t", "content": "b", "session_key": None},
+            {"cursor": 3, "timestamp": "t", "content": "c", "session_key": ""},
+            {"cursor": 4, "timestamp": "t", "content": "d", "session_key": "telegram:9"},
+        ]
+        assert dream._vaults_for_batch(batch) == [
+            "telegram_9",
+            "unified_default",
+        ]

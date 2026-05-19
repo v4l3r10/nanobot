@@ -163,6 +163,52 @@ class TestAgentLoopTTLParam:
         archived = archive_fn.call_args.args[0]
         assert [m["content"] for m in archived] == ["u2", "u3"]
 
+    def test_enforce_file_cap_passes_session_key_exactly_once(self, tmp_path):
+        """I2 (Task 7.2 review): ``enforce_file_cap`` must call ``on_archive``
+        with ``session_key=self.key`` EXACTLY ONCE — no keyless double-call.
+
+        Every real in-tree ``on_archive`` is the bound ``MemoryStore.raw_archive``
+        which accepts ``session_key``, so the old ``except TypeError`` keyless
+        fallback was DEAD; option (a) drops it entirely.
+        """
+        from nanobot.session.manager import Session
+
+        archive_fn = MagicMock()
+        session = Session(key="telegram:7")
+        for i in range(8):
+            session.add_message("user", f"u{i}")
+        session.last_consolidated = 2
+
+        session.enforce_file_cap(on_archive=archive_fn, limit=4)
+
+        archive_fn.assert_called_once()
+        assert archive_fn.call_args.kwargs == {"session_key": "telegram:7"}
+
+    def test_enforce_file_cap_interior_typeerror_propagates(self, tmp_path):
+        """I2: a ``TypeError`` raised DEEP INSIDE a correctly-signatured
+        ``on_archive`` must PROPAGATE — it must NOT be silently swallowed and
+        the call must NOT be retried keyless (which would double/mis-route the
+        archive). The masking ``except TypeError`` shim is gone.
+        """
+        from nanobot.session.manager import Session
+
+        calls: list[dict] = []
+
+        def _archive(chunk, *, session_key=None):
+            calls.append({"session_key": session_key})
+            raise TypeError("interior bug, NOT a signature mismatch")
+
+        session = Session(key="telegram:7")
+        for i in range(8):
+            session.add_message("user", f"u{i}")
+        session.last_consolidated = 2
+
+        with pytest.raises(TypeError, match="interior bug"):
+            session.enforce_file_cap(on_archive=_archive, limit=4)
+
+        # Called exactly once, WITH session_key — never retried keyless.
+        assert calls == [{"session_key": "telegram:7"}]
+
 
 class TestAutoCompact:
     """Test the _archive method."""
