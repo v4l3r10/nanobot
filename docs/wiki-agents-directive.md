@@ -2,7 +2,7 @@
 
 This is a behavioral policy: it makes the agent proactively *capture* durable facts (and *recall* them before answering from ignorance) via the `wiki_note` tool, instead of waiting to be asked. It is policy only — the `wiki_note` tool self-describes its own mechanics in its schema, so this block deliberately does not repeat them.
 
-**Where it goes:** append the block below, verbatim, to the **end of the bot's *workspace* `AGENTS.md`** — the per-user/agent workspace bootstrap file, **not** this repository's `AGENTS.md`. That workspace file is re-read every turn, so the directive takes effect from the very next message with no restart. It is fully reversible: delete the block to revert. It is also **inert unless the wiki master switch `dream.wiki_enabled` is true** — with the wiki off the `wiki_note` tool is not even registered, so the directive has nothing to act on.
+**Where it goes:** append the block below, verbatim, to the **end of the bot's *workspace* `AGENTS.md`** — the per-user/agent workspace bootstrap file, **not** this repository's `AGENTS.md`. That workspace file is re-read every turn, so the directive takes effect from the very next message with no restart. It is fully reversible: delete the block to revert. It is also **inert unless the wiki master switch is enabled** (`dream.wiki_enabled` — written `wikiEnabled` under `agents.defaults.dream` in `config.json`; see [How to enable](./memory.md#how-to-enable)) — with the wiki off the `wiki_note` tool is not even registered, so the directive has nothing to act on.
 
 ```markdown
 ## Long-term memory (wiki_note)
