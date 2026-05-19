@@ -186,7 +186,29 @@ class ContextBuilder:
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
+            if wiki_active and "memory" in always_skills:
+                # Wiki active: the legacy `memory` skill (MEMORY.md / grep
+                # history.jsonl) is stale and misleading — the per-user vault
+                # MOC + wiki_note are the real mechanism. Substitute ONLY the
+                # `memory` body with the wiki-aware guidance, preserving the
+                # exact `### Skill: <name>` / `\n\n---\n\n` shape
+                # load_skills_for_context produces and the original ordering
+                # (each skill emitted in get_always_skills() order, the wiki
+                # body in `memory`'s slot). Other always-skills are loaded
+                # verbatim. This branch is unreachable when wiki is off, so
+                # the wiki-OFF system prompt is byte-identical to before.
+                wiki_mem = render_template("agent/memory_skill_wiki.md").strip()
+                rendered = []
+                for name in always_skills:
+                    if name == "memory":
+                        rendered.append(f"### Skill: memory\n\n{wiki_mem}")
+                    else:
+                        body = self.skills.load_skills_for_context([name])
+                        if body:
+                            rendered.append(body)
+                always_content = "\n\n---\n\n".join(p for p in rendered if p)
+            else:
+                always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
