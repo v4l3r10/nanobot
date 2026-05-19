@@ -10,6 +10,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from nanobot.utils.atomic import atomic_write_text
+
 
 @dataclass
 class CommitInfo:
@@ -67,15 +69,54 @@ class GitStore:
 
         Returns repo-relative POSIX paths, sorted. Empty when the directory
         is absent (the stock / wiki-disabled case → no behavior change).
+
+        Security (I1 — symlink exfiltration): ``memory/users/`` is the
+        agent-writable vault root. ``rglob`` follows symlinks and CPython's
+        traversal of symlinked *directories* is version-dependent, so we
+        are explicit rather than relying on ``rglob`` semantics: a candidate
+        is included only if it is a regular file, is not itself a symlink,
+        has **no** symlinked component anywhere between the vault root and
+        the file, and its real (fully resolved) path still lies under the
+        workspace. Any path failing these (e.g. ``leak.md -> ../secret``)
+        is silently skipped so external content can never enter a commit.
+
+        Scalability (I2 — documented forward-looking characteristic): this
+        is an O(total entries under ``memory/users/**``) directory walk and
+        it runs on **every** ``auto_commit`` (i.e. every Dream cycle, under
+        the Dream lock) and once per :meth:`revert`. The design's ``.cold/``
+        archive is an unbounded floor (git holds history), so this cost
+        grows monotonically with vault size. Cross-cycle caching is
+        deliberately out of scope here (YAGNI); :meth:`revert` already
+        avoids the redundant second scan (see I2 there). Later milestones
+        inherit this note: if vault size becomes a latency problem, the fix
+        is an incremental/index-backed scan, not ad-hoc caching.
         """
         root = self._workspace.joinpath(*self._VAULTS_REL)
         if not root.is_dir():
             return []
+        try:
+            ws_real = self._workspace.resolve()
+            root_real = root.resolve()
+        except OSError:
+            return []
         found: list[str] = []
         for p in root.rglob("*"):
-            if p.is_file():
+            try:
+                if not p.is_file() or p.is_symlink():
+                    # Not a regular file, or the leaf itself is a symlink.
+                    continue
+                # Reject any symlinked component between the vault root and
+                # the file (rglob may have descended through one), and make
+                # sure the real target stays inside the workspace.
+                real = p.resolve()
+                if root_real not in real.parents and real != root_real:
+                    continue
+                if ws_real not in real.parents:
+                    continue
                 rel = p.relative_to(self._workspace)
-                found.append(rel.as_posix())
+            except OSError:
+                continue
+            found.append(rel.as_posix())
         return sorted(found)
 
     def _effective_tracked_files(self) -> list[str]:
@@ -153,7 +194,10 @@ class GitStore:
     # -- daily operations ------------------------------------------------------
 
     def auto_commit(
-        self, message: str, extra_paths: list[str] | None = None
+        self,
+        message: str,
+        extra_paths: list[str] | None = None,
+        _add_paths: list[str] | None = None,
     ) -> str | None:
         """Stage tracked memory files and commit if there are changes.
 
@@ -161,6 +205,12 @@ class GitStore:
         no longer exist on disk so their *deletion* is staged — the dynamic
         ``memory/users/**`` scan only sees files that still exist, so a
         reverted-away wiki page would otherwise linger in the next tree.
+
+        ``_add_paths`` is an internal optimization (I2): :meth:`revert`
+        already computed the effective tracked set for its own work, so it
+        passes it through here to avoid a redundant second
+        :meth:`_scan_vault_files` walk of the (unbounded) vault within a
+        single revert. External callers must not use it.
 
         Returns the short commit SHA, or None if nothing to commit.
         """
@@ -187,7 +237,11 @@ class GitStore:
                 return None
 
             msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
-            add_paths = self._effective_tracked_files()
+            add_paths = (
+                list(_add_paths)
+                if _add_paths is not None
+                else self._effective_tracked_files()
+            )
             if extra_paths:
                 seen = set(add_paths)
                 add_paths += [p for p in extra_paths if p not in seen]
@@ -389,28 +443,40 @@ class GitStore:
     # -- restore ---------------------------------------------------------------
 
     def revert(self, commit: str) -> str | None:
-        """Revert (undo) the changes introduced by the given commit.
+        """Revert commit ``C``: a **true per-commit inverse**.
 
-        Restores tracked memory files (the legacy base **and** the per-user
-        wiki vault subtree, ``memory/users/**``) to the state at the commit's
-        parent, then creates a new commit recording the revert.
+        ``revert(C)`` undoes *only* the changes ``C`` itself introduced,
+        regardless of where ``C`` sits in history, and leaves every path
+        ``C`` did not touch exactly as it currently is on disk. This is the
+        exact contract ``/dream-restore`` (Task 5.2) relies on so a user can
+        safely revert *any* of the last commits — not just the tip.
 
-        Revert semantics (Task 5.1 — relied on by 5.2's ``/dream-restore``):
-        the working state is made to match the *parent* tree over the union
-        of (a) the effective tracked set and (b) every path in the parent
-        tree. Concretely:
+        Algorithm:
 
-        * a path present in the parent tree is rewritten to its parent-state
-          content (recreating files the reverted commit *deleted*);
-        * a currently-tracked path **absent** from the parent tree is removed
-          (deleting files the reverted commit *added* — e.g. a new wiki
-          page). Empty parent dirs are pruned so the tree mirrors the parent.
+        * Read both ``C``'s tree and ``C``'s parent tree.
+        * The **affected set** = every path whose blob differs between the
+          two trees, plus every path present in exactly one of them — i.e.
+          precisely the paths ``C`` added, modified, or deleted (a clean
+          ``diff(C-parent, C)``). Paths identical in both trees, and paths
+          absent from both (e.g. unrelated vault pages created by *later*
+          commits, or unchanged legacy files), are **never** in this set.
+        * For each affected path: if it exists in ``C``'s **parent** tree,
+          rewrite it to that parent-state content (undoing ``C``'s modify,
+          or recreating what ``C`` deleted); if it is **absent** from the
+          parent tree, delete it on disk and stage the deletion (undoing
+          what ``C`` *added* — e.g. a new wiki page). Empty dirs left by a
+          deletion are pruned.
+        * All other paths — including later, unrelated ``memory/users/**``
+          pages and untouched legacy files — are left 100% untouched (not
+          even rewritten/restated). This makes ``revert(C)`` the algebraic
+          inverse of ``C`` and never causes silent committed data loss of
+          files created after ``C``.
 
-        This is correct for "restore the wiki to a prior commit": files that
-        differ in HEAD vs the target are returned to the target content, and
-        files that exist only on one side are added/removed as needed.
+        All file rewrites go through :func:`atomic_write_text` so a crash
+        mid-revert leaves at most one file in-flight and every other file
+        fully old or fully new (recoverable) — the codebase durability bar.
 
-        Returns the new commit SHA, or None on failure.
+        Returns the new revert commit SHA, or None on failure / no-op.
         """
         if not self.is_initialized():
             return None
@@ -432,27 +498,31 @@ class GitStore:
                     logger.warning("Git revert: cannot revert root commit {}", commit)
                     return None
 
-                # Use the parent's tree — this undoes the commit's changes
+                c_tree = repo[commit_obj.tree]
                 parent_obj = repo[commit_obj.parents[0]]
-                tree = repo[parent_obj.tree]
+                parent_tree = repo[parent_obj.tree]
 
-                parent_paths = set(self._iter_tree_paths(repo, tree))
-                # Union of what we track now and what existed in the parent so
-                # files added by the reverted commit get pruned and files it
-                # deleted get recreated.
-                targets = set(self._effective_tracked_files()) | parent_paths
+                # The affected set is exactly C's own added/modified/deleted
+                # paths (diff of C vs its parent) — nothing else. Determined
+                # purely from the two trees, so later/unrelated files are
+                # provably outside it and are never touched.
+                affected = self._diff_tree_paths(repo, parent_tree, c_tree)
 
                 touched: list[str] = []
                 deleted: list[str] = []
-                for filepath in sorted(targets):
-                    content = self._read_blob_from_tree(repo, tree, filepath)
+                for filepath in affected:
+                    parent_content = self._read_blob_from_tree(
+                        repo, parent_tree, filepath
+                    )
                     dest = self._workspace / filepath
-                    if content is not None:
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_text(content, encoding="utf-8")
+                    if parent_content is not None:
+                        # Present in C's parent → restore parent content
+                        # (undo C's modify, or recreate what C deleted).
+                        atomic_write_text(dest, parent_content)
                         touched.append(filepath)
                     elif dest.exists():
-                        # Present now but absent in the parent → undo the add.
+                        # Absent in C's parent but present in C → C added
+                        # it. Undo the add.
                         dest.unlink()
                         self._prune_empty_dirs(dest.parent)
                         touched.append(filepath)
@@ -461,11 +531,17 @@ class GitStore:
             if not touched:
                 return None
 
-            # Commit the restored state. Deleted paths are passed explicitly
-            # so their removal is staged (the dynamic scan can't see a file
-            # that no longer exists on disk).
+            # Commit the inverse. ``deleted`` is passed via extra_paths so
+            # the removals are staged (the dynamic scan can't see files that
+            # no longer exist). I2: pass the already-known effective tracked
+            # set through so auto_commit does NOT re-scan the unbounded vault
+            # a second time within this single revert (bounded: <=1 scan).
             msg = f"revert: undo {commit}"
-            return self.auto_commit(msg, extra_paths=deleted or None)
+            return self.auto_commit(
+                msg,
+                extra_paths=deleted or None,
+                _add_paths=self._effective_tracked_files(),
+            )
         except Exception:
             logger.exception("Git revert failed for {}", commit)
             return None
@@ -498,6 +574,43 @@ class GitStore:
                 yield from GitStore._iter_tree_paths(repo, obj, prefix + n + "/")
             elif obj.type_name == b"blob":
                 yield prefix + n
+
+    @staticmethod
+    def _blob_index(repo, tree, prefix: str = "") -> dict[str, bytes]:
+        """Map every blob path under ``tree`` to its blob SHA (bytes).
+
+        Deterministic full walk; used to diff two trees by content.
+        """
+        out: dict[str, bytes] = {}
+        for name, _mode, sha in tree.items():
+            n = name.decode()
+            obj = repo[sha]
+            if obj.type_name == b"tree":
+                out.update(GitStore._blob_index(repo, obj, prefix + n + "/"))
+            elif obj.type_name == b"blob":
+                out[prefix + n] = sha
+        return out
+
+    @staticmethod
+    def _diff_tree_paths(repo, tree_a, tree_b) -> list[str]:
+        """Paths that differ between ``tree_a`` (parent) and ``tree_b`` (C).
+
+        Returns the sorted set of paths that are added, removed, or have a
+        different blob SHA between the two trees — i.e. exactly the paths a
+        single commit changed relative to its parent. A path with an
+        identical blob SHA in both trees is **not** returned (so revert
+        never restates an unchanged file), and a path absent from both is
+        of course absent here (so unrelated/later files are never touched).
+        Deterministic (sorted) ordering.
+        """
+        idx_a = GitStore._blob_index(repo, tree_a)
+        idx_b = GitStore._blob_index(repo, tree_b)
+        changed = {
+            p
+            for p in set(idx_a) | set(idx_b)
+            if idx_a.get(p) != idx_b.get(p)
+        }
+        return sorted(changed)
 
     @staticmethod
     def _read_blob_from_tree(repo, tree, filepath: str) -> str | None:
