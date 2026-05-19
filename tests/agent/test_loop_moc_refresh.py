@@ -260,3 +260,60 @@ async def test_dispatch_no_refresh_when_wiki_disabled_even_if_dirty(
     # The dirty mark was NOT even consumed by the disabled path
     # (the gate short-circuits before take_dirty). Clean up for isolation.
     take_dirty(vault_slug(sk))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_wiki_off_turn_writes_zero_wiki_artifacts(
+    tmp_path: Path,
+) -> None:
+    """GOLDEN byte-identity: a full wiki-OFF turn whose slug is marked dirty
+    must (a) schedule NO background MOC refresh AND (b) leave ZERO on-disk
+    wiki artifacts under the session's vault — no ``MEMORY.md`` (the MOC),
+    no ``wiki/**/_index.md``, no ``.migrated`` marker, indeed no vault dir
+    at all. This locks the *loop-trigger* leg of the project's wiki-off
+    golden alongside the existing Dream-path golden
+    (tests/agent/test_dream_wiki.py) and ContextBuilder-prompt golden
+    (tests/agent/test_context_wiki.py): with the master switch off the
+    post-turn trigger is fully inert (double-gate: the gate short-circuits
+    before ``take_dirty`` and before ``_schedule_background``).
+
+    Deterministic: the scheduled-refresh decision is captured synchronously
+    inside ``_dispatch`` via the shared ``_capture_scheduled`` harness (no
+    background-task timing). The on-disk assertion is independent of that
+    capture — the real wiki-off ``_dispatch`` code path must itself never
+    touch the vault regardless of how a refresh would have been scheduled.
+    """
+    loop = _make_loop(tmp_path, wiki_enabled=False)
+    assert loop.context.wiki_enabled is False
+    calls = _capture_scheduled(loop)
+
+    msg = InboundMessage(
+        channel="telegram", sender_id="u1", chat_id="c-golden", content="hi"
+    )
+    sk = loop._effective_session_key(msg)
+    mark_vault_dirty(vault_slug(sk))
+
+    vroot = vault_dir(Path(tmp_path), sk)
+
+    await loop._dispatch(msg)
+
+    # (a) No background refresh scheduled (master-switch gate held).
+    assert calls == []
+
+    # (b) Zero on-disk wiki artifacts for this vault — the wiki-off turn
+    #     created nothing. Assert the whole vault dir is absent first
+    #     (strongest), then each specific artifact for a precise failure.
+    assert not vroot.exists(), (
+        f"wiki vault {vroot} was created on a wiki-OFF turn — "
+        "golden byte-identity violated (the loop trigger touched the wiki)"
+    )
+    assert not (vroot / "MEMORY.md").exists()
+    assert not (vroot / ".migrated").exists()
+    assert not (vroot / "wiki").exists()
+    assert not list(vroot.rglob("_index.md"))
+    # Belt-and-braces: no per-user vault root anywhere under the workspace.
+    assert not (Path(tmp_path) / "memory" / "users").exists()
+
+    # The dirty mark was NOT even consumed by the disabled path
+    # (the gate short-circuits before take_dirty). Clean up for isolation.
+    take_dirty(vault_slug(sk))
