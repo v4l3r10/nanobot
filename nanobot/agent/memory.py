@@ -1267,24 +1267,35 @@ class Dream:
 
     @staticmethod
     def _entry_slug(entry: dict[str, Any]) -> str:
-        """Vault slug for ONE history record (C1 — null-safe, write-aligned).
+        """Vault slug for ONE history record — TOTAL, write-aligned, never raises.
 
-        ``entry.get("session_key") or "unified:default"`` collapses ALL of:
+        ``isinstance(sk, str) and sk`` routes ONLY a non-empty ``str``
+        ``session_key`` per-user; EVERYTHING else collapses to the unified
+        key, then applies ``vault_slug``. This is TOTAL over every value
+        ``json.loads`` can produce from an untrusted ``history.jsonl``:
 
         * ABSENT ``session_key`` (legacy record physically lacking the field),
-        * JSON ``null`` → Python ``None`` (external / legacy / hand-edited /
-          malformed writers — the class the codebase defends against),
+        * JSON ``null`` → Python ``None``,
         * empty string ``""``,
+        * falsy non-str (``0``, ``[]``, ``{}``),
+        * **truthy non-str** (``123``, ``1.5``, ``True``, ``["x"]``,
+          ``{"a": 1}``) — reachable from the SAME external / legacy /
+          hand-edited / malformed writers ``null`` is; ``... or
+          "unified:default"`` does NOT collapse these (they are truthy),
+          so the OLD code reached ``vault_slug(123)`` →
+          ``int.replace`` → ``AttributeError``.
 
-        to the unified key, then applies ``vault_slug``. This MIRRORS
+        All of the above → the unified slug. This MIRRORS
         ``append_history``'s write side (``session_key or "unified:default"``)
-        so the read side is consistent with the write side and NEVER raises
-        ``AttributeError`` on ``vault_slug(None)`` (``None.replace`` would
-        crash). Used by BOTH ``_vaults_for_batch`` (grouping) AND the
-        ``Dream.run()`` per-slug slice (filtering) so grouping and slicing
-        can never diverge.
+        and makes the read side defensively TOTAL: it can NEVER raise
+        ``AttributeError`` on ``vault_slug(non-str)`` (which would skip the
+        whole wiki pass for every user that cycle — the cursor has already
+        advanced — see ``_vaults_for_batch``). Used by BOTH
+        ``_vaults_for_batch`` (grouping) AND the ``Dream.run()`` per-slug
+        slice (filtering) so grouping and slicing can never diverge.
         """
-        return vault_slug(entry.get("session_key") or "unified:default")
+        sk = entry.get("session_key")
+        return vault_slug(sk if isinstance(sk, str) and sk else "unified:default")
 
     def _vaults_for_batch(self, batch: list[dict[str, Any]]) -> list[str]:
         """Vault slugs the wiki Ingest+Lint pass should run for this batch.
@@ -1298,18 +1309,26 @@ class Dream:
         ``vault_slug`` is applied (not hardcoded) so a slug stays in lockstep
         with the slug the ``wiki_note`` tool / per-vault lock use.
 
-        Collapse behavior (back-compat, BY CONSTRUCTION) — NEVER raises:
+        Collapse behavior (back-compat, BY CONSTRUCTION) — TOTAL, NEVER
+        raises (``_entry_slug`` is total over every value ``json.loads``
+        can produce from an untrusted ``history.jsonl``):
 
         * ``unified_session=True`` → every entry's ``session_key`` is
           ``"unified:default"`` → one slug ``vault_slug("unified:default")``
           == ``"unified_default"`` → exactly the pre-7.2 single-vault path.
-        * ``session_key`` ABSENT (legacy untagged record), JSON ``None``
-          (``null`` from an external/legacy/hand-edited/malformed writer), OR
-          empty ``""`` → ALL collapse to the unified slug (write-side
-          aligned; ``vault_slug(None)`` is NEVER reached → no
-          ``AttributeError`` that would skip the entire wiki pass for every
-          user this cycle, C1).
-        * Mixed real per-user keys → one slug per distinct user, sorted.
+        * ANY non-(non-empty-``str``) ``session_key`` — ABSENT (legacy
+          untagged record), JSON ``None`` (``null``), empty ``""``, falsy
+          non-str (``0``/``[]``/``{}``), OR **truthy non-str**
+          (``123``/``1.5``/``True``/``list``/``dict`` from an external /
+          legacy / hand-edited / malformed writer) → ALL collapse to the
+          unified slug (write-side aligned). ``vault_slug`` is NEVER called
+          with a non-str → no ``AttributeError`` that would skip the entire
+          wiki pass for every user this cycle (the grouping call is OUTSIDE
+          the per-iteration ``try`` and the cursor has already advanced —
+          residual follow-up to 7.2, same data-loss class as C1 via a
+          different bad type).
+        * Mixed real per-user keys (non-empty ``str``) → one slug per
+          distinct user, sorted.
 
         NOTE(Task 7.2 — SEPARATE from the Ingest batch-slicing): the
         ``slug == unified`` gate on ``legacy_workspace`` at the
@@ -1521,8 +1540,11 @@ class Dream:
                 # try wrapped the WHOLE loop: one bad vault aborted every user
                 # sorted after it while the cursor had ALREADY advanced (above)
                 # → unrecoverable for them, defeating 7.2's per-user
-                # independence. _vaults_for_batch itself is now null-safe (C1
-                # _entry_slug) so the grouping call cannot raise. The legacy
+                # independence. _vaults_for_batch itself is now TOTAL
+                # (_entry_slug coerces any non-(non-empty-str) session_key —
+                # absent/None/""/0/non-str/list/dict — to the unified slug)
+                # so the grouping call (which runs OUTSIDE this per-iteration
+                # try, in the `for slug` header) can NEVER raise. The legacy
                 # path / cursor advance / compact / git / Phase 1-2 all ran
                 # BEFORE this block and are UNCHANGED; per-iteration isolation
                 # (not un-advancing the cursor) is the correct mitigation —

@@ -752,6 +752,82 @@ class TestNullSessionKeyRouting:
         )
         assert "tg one line" in tg_dump.read_text(encoding="utf-8")
 
+    async def test_non_str_truthy_session_key_routes_to_unified_not_crash(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """Residual follow-up to 7.2 (same data-loss class as C1, via a
+        different bad type): a batch mixing a ``{"session_key": 123}``
+        record, a ``{"session_key": ["bad"]}`` record, a legacy untagged
+        record, and a ``telegram:1`` record. The non-str TRUTHY keys (123 /
+        list) are reachable from the SAME external/legacy/hand-edited/
+        malformed history writers ``null`` is — and ``... or
+        "unified:default"`` does NOT collapse them (truthy). The
+        malformed-type + untagged content must land in
+        ``unified_default``; ``telegram:1`` in ``telegram_1``; NO
+        ``AttributeError`` escapes ``dream.run()``; NO all-users-skip
+        (telegram_1 IS ingested); the cursor advanced.
+
+        On CURRENT ``cd32bf2e`` ``_entry_slug`` →
+        ``vault_slug(123)`` → ``123.replace(...)`` → ``AttributeError``
+        inside ``_vaults_for_batch``, called at the
+        ``for slug in self._vaults_for_batch(batch):`` line which is
+        OUTSIDE/BEFORE the per-iteration ``try`` (the old batch-global try
+        was removed). The wiki block has no outer handler → the exception
+        escapes ``dream.run()`` after the cursor ALREADY advanced → ONE
+        poison record = ALL users' wiki ingest skipped this cycle,
+        unrecoverable (telegram_1 NOT ingested).
+        """
+        dream.wiki_enabled = True
+
+        # Hand-write malformed non-str truthy session_key records + a legacy
+        # untagged record + a real per-user one.
+        store.history_file.write_text(
+            '{"cursor": 1, "timestamp": "2026-04-01 10:00", "content": '
+            '"int keyed line", "session_key": 123}\n'
+            '{"cursor": 2, "timestamp": "2026-04-01 10:01", "content": '
+            '"list keyed line", "session_key": ["bad"]}\n'
+            '{"cursor": 3, "timestamp": "2026-04-01 10:02", "content": '
+            '"untagged legacy line"}\n'
+            '{"cursor": 4, "timestamp": "2026-04-01 10:03", "content": '
+            '"tg one line", "session_key": "telegram:1"}\n',
+            encoding="utf-8",
+        )
+
+        _content_echo_provider(mock_provider)
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        # Must NOT raise AttributeError out of dream.run().
+        result = await dream.run()
+        assert result is True
+        assert store.get_last_dream_cursor() == 4
+
+        users = store.workspace / "memory" / "users"
+        # Non-str truthy (123, ["bad"]) + untagged all collapse to unified.
+        unified_dump = users / "unified_default" / "wiki" / "concepts" / "dump.md"
+        assert unified_dump.is_file(), (
+            "non-str truthy session_key was NOT routed to unified_default — "
+            "the wiki pass was skipped for everyone (residual C1)"
+        )
+        unified_body = unified_dump.read_text(encoding="utf-8")
+        assert "int keyed line" in unified_body
+        assert "list keyed line" in unified_body
+        assert "untagged legacy line" in unified_body
+
+        # telegram:1 → its own per-user vault, also ingested (NOT skipped by
+        # the poison record).
+        tg_dump = users / "telegram_1" / "wiki" / "concepts" / "dump.md"
+        assert tg_dump.is_file(), (
+            "telegram:1 was NOT ingested — one non-str truthy record "
+            "skipped ALL users' wiki pass this cycle (residual C1)"
+        )
+        tg_body = tg_dump.read_text(encoding="utf-8")
+        assert "tg one line" in tg_body
+        # No cross-bleed: the malformed-key content stayed unified-only.
+        assert "int keyed line" not in tg_body
+        assert "list keyed line" not in tg_body
+
 
 class TestPerUserIngestFailureIsolation:
     """I1: a per-slug ``run_ingest``/``run_lint`` failure must skip ONLY that
