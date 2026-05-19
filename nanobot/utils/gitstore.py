@@ -225,10 +225,26 @@ class GitStore:
     ) -> str | None:
         """Stage tracked memory files and commit if there are changes.
 
-        ``extra_paths`` lets callers (notably :meth:`revert`) pass paths that
-        no longer exist on disk so their *deletion* is staged — the dynamic
-        ``memory/users/**`` scan only sees files that still exist, so a
-        reverted-away wiki page would otherwise linger in the next tree.
+        ``extra_paths`` lets callers (notably :meth:`revert`) pass paths
+        that must be force-staged this commit. Two uses:
+
+        * Paths that no longer exist on disk so their *deletion* is staged —
+          the dynamic ``memory/users/**`` scan only sees files that still
+          exist, so a reverted-away wiki page would otherwise linger.
+        * Paths :meth:`revert` recreated/rewrote whose ``porcelain.status``
+          classification is dulwich-version dependent. A statically-tracked
+          legacy file that ``revert`` recreates (absent from the HEAD index)
+          may be reported by some dulwich builds as *clean* — not unstaged,
+          not staged, not untracked. Passing it here makes ``not
+          extra_paths`` False so the no-op short-circuit cannot fire and the
+          recovery is deterministically ``porcelain.add``-ed and committed,
+          regardless of the status classification. ``porcelain.add``
+          tolerates the mixed set (recreated files exist; deleted ones do
+          not — a missing tracked path is staged as a deletion).
+
+        A non-empty ``extra_paths`` therefore *guarantees* a commit attempt
+        whenever the caller actually changed something; the status-gated
+        no-op short-circuit only applies when ``extra_paths`` is empty.
 
         ``_add_paths`` is an internal optimization (I2): :meth:`revert`
         already computed the effective tracked set for its own work, so it
@@ -526,7 +542,22 @@ class GitStore:
         mid-revert leaves at most one file in-flight and every other file
         fully old or fully new (recoverable) — the codebase durability bar.
 
-        Returns the new revert commit SHA, or None on failure / no-op.
+        Commit guarantee (B1): whenever ``revert`` makes ANY filesystem
+        change — rewriting/recreating a restored path *or* deleting a
+        ``C``-added path — the resulting revert commit is *always* created
+        and records exactly those paths. It never leaves a recovered file
+        uncommitted/unprotected (which a later Dream/compaction rebuilding
+        memory from HEAD would silently destroy). This holds regardless of
+        how the underlying dulwich build classifies a recreated
+        statically-tracked file in ``porcelain.status``.
+
+        Returns the new revert commit SHA when it changed anything (the
+        algebraic inverse, committed and atomic, never touching unrelated
+        or later files). Returns None ONLY on failure, or on a *genuine*
+        no-op — ``C`` changed nothing under tracking, or its effect is
+        already undone — in which case NO empty commit is created. For
+        ``/dream-restore`` (Task 5.2): a None return means "nothing to
+        undo"; a non-None sha means "restored, HEAD is now <sha>".
         """
         if not self.is_initialized():
             return None
@@ -558,8 +589,14 @@ class GitStore:
                 # provably outside it and are never touched.
                 affected = self._diff_tree_paths(repo, parent_tree, c_tree)
 
+                # Every path this revert actually changed on disk
+                # (restored/recreated content OR deleted a C-added file).
+                # Deletions are included here too — the old separate
+                # ``deleted`` list existed only to feed extra_paths; now
+                # the whole set is force-staged, which both stages the
+                # removals (the dynamic scan can't see gone files) and
+                # guarantees recreated legacy files are committed (B1).
                 touched: list[str] = []
-                deleted: list[str] = []
                 for filepath in affected:
                     parent_content = self._read_blob_from_tree(
                         repo, parent_tree, filepath
@@ -568,6 +605,26 @@ class GitStore:
                     if parent_content is not None:
                         # Present in C's parent → restore parent content
                         # (undo C's modify, or recreate what C deleted).
+                        # Skip the rewrite — and do NOT mark the path
+                        # touched — when the on-disk content already equals
+                        # the parent state. This keeps revert a true
+                        # per-commit inverse that "never restates an
+                        # unchanged file" (mtime-stable) AND makes ``touched``
+                        # reflect only *real* work, so a genuine no-op (e.g.
+                        # reverting the same commit twice) yields an empty
+                        # ``touched`` and the B1 force-commit cannot create
+                        # an empty/no-op commit.
+                        try:
+                            already = (
+                                dest.is_file()
+                                and not dest.is_symlink()
+                                and dest.read_text(encoding="utf-8")
+                                == parent_content
+                            )
+                        except (OSError, UnicodeDecodeError):
+                            already = False
+                        if already:
+                            continue
                         atomic_write_text(dest, parent_content)
                         touched.append(filepath)
                     elif dest.exists():
@@ -576,20 +633,33 @@ class GitStore:
                         dest.unlink()
                         self._prune_empty_dirs(dest.parent)
                         touched.append(filepath)
-                        deleted.append(filepath)
 
             if not touched:
+                # Genuine no-op: C changed nothing under tracking, or its
+                # changes are already undone (e.g. revert-of-the-same-commit
+                # twice). Do NOT force a commit — return None without
+                # creating an empty/no-op commit. This is the ONLY path that
+                # returns None for an initialized repo with a valid parent.
                 return None
 
-            # Commit the inverse. ``deleted`` is passed via extra_paths so
-            # the removals are staged (the dynamic scan can't see files that
-            # no longer exist). I2: pass the already-known effective tracked
-            # set through so auto_commit does NOT re-scan the unbounded vault
-            # a second time within this single revert (bounded: <=1 scan).
+            # B1 fix: revert did real work, so the inverse MUST be committed
+            # — never silently dropped by auto_commit's status-gated no-op
+            # short-circuit. Pass the FULL touched set (restored/recreated
+            # ∪ deleted) via extra_paths: this both (a) stages deletions the
+            # dynamic scan can't see (files now gone) and (b) force-stages
+            # recreated statically-tracked legacy files (e.g.
+            # memory/MEMORY.md, SOUL.md) that some dulwich builds report as
+            # "clean" after recreation, which would otherwise hit the no-op
+            # guard and return None with the recovery uncommitted (B1). With
+            # ``touched`` non-empty, ``not extra_paths`` is False so the
+            # guard cannot short-circuit and porcelain.add+commit run.
+            # I2: pass the already-known effective tracked set through so
+            # auto_commit does NOT re-scan the unbounded vault a second time
+            # within this single revert (bounded invariant: <=1 scan).
             msg = f"revert: undo {commit}"
             return self.auto_commit(
                 msg,
-                extra_paths=deleted or None,
+                extra_paths=touched,
                 _add_paths=self._effective_tracked_files(),
             )
         except Exception:
