@@ -141,3 +141,133 @@ async def test_dream_restore_success_mentions_files_and_followup() -> None:
     assert "- New safety commit: `eeee9999`" in out.content
     assert "- Restored files: `SOUL.md`, `memory/MEMORY.md`" in out.content
     assert "Use `/dream-log eeee9999` to inspect the restore diff." in out.content
+
+
+# -- Task 5.2: wiki (memory/users/**) coverage ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dream_log_shows_wiki_changes() -> None:
+    """/dream-log surfaces memory/users/** wiki paths alongside legacy files.
+
+    Lock/characterization test: 5.1 made the underlying git ops cover the
+    wiki vault and `_extract_changed_files` does not whitelist/filter paths,
+    so no production change is needed here — this test guarantees it stays
+    that way.
+    """
+    commit = CommitInfo(sha="abcd1234", message="dream: 2026-04-04, 2 change(s)", timestamp="2026-04-04 12:00")
+    wiki_path = "memory/users/unified_default/wiki/people/alice.md"
+    diff = (
+        "diff --git a/memory/MEMORY.md b/memory/MEMORY.md\n"
+        "--- a/memory/MEMORY.md\n"
+        "+++ b/memory/MEMORY.md\n"
+        "@@ -1 +1 @@\n"
+        "-old index\n"
+        "+new index\n"
+        f"diff --git a/{wiki_path} b/{wiki_path}\n"
+        f"--- a/{wiki_path}\n"
+        f"+++ b/{wiki_path}\n"
+        "@@ -0,0 +1 @@\n"
+        "+Alice is a new person.\n"
+    )
+    git = _FakeGit(commits=[commit], diff_map={commit.sha: (commit, diff)})
+
+    out = await cmd_dream_log(_make_ctx("/dream-log", git))
+
+    # Wiki path appears in the changed-files summary line ...
+    assert f"`{wiki_path}`" in out.content
+    assert "`memory/MEMORY.md`" in out.content
+    # ... and in the diff body itself.
+    assert f"diff --git a/{wiki_path} b/{wiki_path}" in out.content
+    assert "+Alice is a new person." in out.content
+
+
+@pytest.mark.asyncio
+async def test_dream_restore_sha_success_message() -> None:
+    """revert -> new sha: success copy names both shas and the safety guarantee."""
+    commit = CommitInfo(sha="abcd1234", message="dream: latest", timestamp="2026-04-04 12:00")
+    wiki_path = "memory/users/unified_default/wiki/people/alice.md"
+    diff = (
+        "diff --git a/memory/MEMORY.md b/memory/MEMORY.md\n"
+        "--- a/memory/MEMORY.md\n"
+        "+++ b/memory/MEMORY.md\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        f"diff --git a/{wiki_path} b/{wiki_path}\n"
+        f"--- a/{wiki_path}\n"
+        f"+++ b/{wiki_path}\n"
+        "@@ -0,0 +1 @@\n"
+        "+Alice.\n"
+    )
+    git = _FakeGit(diff_map={commit.sha: (commit, diff)}, revert_result="eeee9999")
+
+    out = await cmd_dream_restore(_make_ctx("/dream-restore abcd1234", git, args="abcd1234"))
+
+    assert "abcd1234" in out.content
+    assert "eeee9999" in out.content
+    # wiki + memory files surfaced in the restore summary
+    assert f"`{wiki_path}`" in out.content
+    assert "`memory/MEMORY.md`" in out.content
+    # accurately states ONLY that commit was undone and later changes preserved
+    low = out.content.lower()
+    assert "only" in low
+    assert "later" in low or "since" in low or "preserv" in low
+    # not presented as a failure
+    assert "couldn't restore" not in low
+    assert "failed" not in low
+
+
+@pytest.mark.asyncio
+async def test_dream_restore_none_is_nothing_to_undo_not_failure() -> None:
+    """revert -> None on a real commit: distinct 'nothing to undo', not a failure."""
+    commit = CommitInfo(sha="abcd1234", message="dream: latest", timestamp="2026-04-04 12:00")
+    diff = (
+        "diff --git a/memory/MEMORY.md b/memory/MEMORY.md\n"
+        "--- a/memory/MEMORY.md\n"
+        "+++ b/memory/MEMORY.md\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    git = _FakeGit(diff_map={commit.sha: (commit, diff)}, revert_result=None)
+
+    out = await cmd_dream_restore(_make_ctx("/dream-restore abcd1234", git, args="abcd1234"))
+
+    low = out.content.lower()
+    assert "nothing to undo" in low
+    assert "abcd1234" in out.content
+    # explicitly NOT failure/alarm wording
+    assert "couldn't restore" not in low
+    assert "failed" not in low
+    assert "error" not in low
+
+
+@pytest.mark.asyncio
+async def test_dream_restore_unknown_sha_no_crash() -> None:
+    """A clearly bogus sha must not crash; revert -> None path gives a sane message."""
+    git = _FakeGit(diff_map={}, revert_result=None)
+
+    out = await cmd_dream_restore(_make_ctx("/dream-restore zzzzzzzz", git, args="zzzzzzzz"))
+
+    low = out.content.lower()
+    assert "zzzzzzzz" in out.content
+    assert "nothing to undo" in low
+    assert "failed" not in low
+
+
+@pytest.mark.asyncio
+async def test_dream_restore_no_args_lists_recent() -> None:
+    """No-args behavior preserved: lists recent commits (incl. wiki-affecting ones)."""
+    commits = [
+        CommitInfo(sha="abcd1234", message="dream: latest", timestamp="2026-04-04 12:00"),
+        CommitInfo(sha="bbbb2222", message="dream: older", timestamp="2026-04-04 08:00"),
+    ]
+    git = _FakeGit(commits=commits)
+
+    out = await cmd_dream_restore(_make_ctx("/dream-restore", git))
+
+    assert "## Dream Restore" in out.content
+    assert "`abcd1234` 2026-04-04 12:00 - dream: latest" in out.content
+    assert "`bbbb2222` 2026-04-04 08:00 - dream: older" in out.content
+    assert "Restore a version with `/dream-restore <sha>`." in out.content
