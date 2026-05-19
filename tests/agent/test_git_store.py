@@ -677,3 +677,241 @@ def _iter_all_blobs(repo, tree, prefix=""):
             yield from _iter_all_blobs(repo, obj, prefix + name.decode() + "/")
         elif obj.type_name == b"blob":
             yield prefix + name.decode(), _mode, sha
+
+
+def _head_blob(workspace: Path, relpath: str) -> str | None:
+    """Return the decoded content of ``relpath`` in the HEAD commit tree.
+
+    Returns None if the path is absent from HEAD's tree. Used to assert
+    that a recreation/recovery was *actually committed* (not just left
+    on disk uncommitted).
+    """
+    from dulwich.repo import Repo
+
+    with Repo(str(workspace)) as repo:
+        head = repo.refs[b"HEAD"]
+        tree = repo[repo[head].tree]
+        current = tree
+        for part in Path(relpath).parts:
+            try:
+                entry = current[part.encode()]
+            except KeyError:
+                return None
+            obj = repo[entry[1]]
+            if obj.type_name == b"blob":
+                return obj.data.decode("utf-8")
+            if obj.type_name == b"tree":
+                current = obj
+            else:
+                return None
+        return None
+
+
+def _head_sha(workspace: Path) -> bytes:
+    """Full HEAD commit SHA (bytes) — used to assert HEAD did/didn't move."""
+    from dulwich.repo import Repo
+
+    with Repo(str(workspace)) as repo:
+        return repo.refs[b"HEAD"]
+
+
+# ---------------------------------------------------------------------------
+# Review follow-up to Task 5.1 — B1: revert MUST always commit the recovery
+# of a deleted statically-tracked file (regression vs baseline). The recreated
+# legacy file is reported "clean" by dulwich status (absent from HEAD index,
+# not surfaced as untracked), so the old code hit auto_commit's no-op guard
+# and silently returned None — leaving the recovery uncommitted/unprotected.
+# ---------------------------------------------------------------------------
+
+
+class TestRevertOfDeleteIsCommitted:
+    def test_revert_of_legacy_delete_is_committed(self, vault_git, tmp_path):
+        """B1 regression (MUST fail on 4721c2b2): reverting a commit that
+        DELETED a statically-tracked legacy file must recreate the file AND
+        commit that recovery (return a real sha, advance HEAD, record the
+        file in the revert commit's tree). Covers both memory/MEMORY.md (the
+        prime /dream-restore target) and a second static file SOUL.md."""
+        vault_git.init()
+        mem = tmp_path / "memory" / "MEMORY.md"
+        soul = tmp_path / "SOUL.md"
+
+        # --- memory/MEMORY.md: A sets content, B deletes it ---
+        mem.write_text("MEM-Y", encoding="utf-8")
+        soul.write_text("SOUL-Y", encoding="utf-8")
+        vault_git.auto_commit("A: MEM-Y + SOUL-Y")  # A
+
+        mem.unlink()
+        sha_b = vault_git.auto_commit("B: delete memory/MEMORY.md")  # B
+        assert sha_b is not None
+        # Sanity: B's commit tree really dropped memory/MEMORY.md.
+        assert _head_blob(tmp_path, "memory/MEMORY.md") is None
+
+        new_sha = vault_git.revert(sha_b)
+        # On 4721c2b2 this is None (recovery never committed) → B1.
+        assert new_sha is not None, (
+            "revert of a legacy-file delete must commit the recovery, not "
+            "return None"
+        )
+        # File recreated on disk with the pre-delete content …
+        assert mem.exists()
+        assert mem.read_text(encoding="utf-8") == "MEM-Y"
+        # … and the recreation is ACTUALLY committed: HEAD advanced and the
+        # revert commit's tree contains memory/MEMORY.md == "MEM-Y".
+        assert _head_sha(tmp_path) != sha_b
+        assert _head_blob(tmp_path, "memory/MEMORY.md") == "MEM-Y"
+        # State is now committed → a follow-up auto_commit is a clean no-op.
+        assert vault_git.auto_commit("noop after recovery") is None
+
+        # --- SOUL.md: a second static file deleted then revert-recovered ---
+        soul.unlink()
+        sha_d = vault_git.auto_commit("D: delete SOUL.md")  # D
+        assert sha_d is not None
+        assert _head_blob(tmp_path, "SOUL.md") is None
+
+        new_sha2 = vault_git.revert(sha_d)
+        assert new_sha2 is not None
+        assert soul.exists()
+        assert soul.read_text(encoding="utf-8") == "SOUL-Y"
+        assert _head_blob(tmp_path, "SOUL.md") == "SOUL-Y"
+        assert vault_git.auto_commit("noop after SOUL recovery") is None
+
+    def test_revert_of_legacy_delete_committed_even_when_status_reports_clean(
+        self, vault_git, tmp_path, monkeypatch
+    ):
+        """B1 root-cause, environment-independent (MUST fail on 4721c2b2).
+
+        The original bug manifests only on dulwich builds whose
+        ``porcelain.status`` reports a recreated statically-tracked file
+        (absent from the HEAD index, not yet ``git add``-ed) as *clean* —
+        not unstaged, not staged, not untracked. Some builds instead
+        surface it as ``untracked`` (masking the bug). To pin the exact
+        regression deterministically on every platform, force the
+        documented "clean" classification: with the old code the no-op
+        guard then short-circuits ``return None`` and the recovery is
+        never committed; with the fix the non-empty force-staged
+        ``touched`` set keeps the guard from firing and the recovery is
+        committed regardless.
+        """
+        from dulwich import porcelain as _real_porcelain
+        from dulwich.porcelain import GitStatus
+
+        vault_git.init()
+        mem = tmp_path / "memory" / "MEMORY.md"
+        mem.write_text("MEM-Y", encoding="utf-8")
+        vault_git.auto_commit("A: MEM-Y")
+        mem.unlink()
+        sha_b = vault_git.auto_commit("B: delete memory/MEMORY.md")
+        assert sha_b is not None
+
+        real_status = _real_porcelain.status
+
+        def _clean_for_recreated(*a, **kw):
+            """Mask the recreated legacy file as fully clean (the broken
+            dulwich classification the task documents)."""
+            st = real_status(*a, **kw)
+            untracked = [
+                u
+                for u in st.untracked
+                if "MEMORY.md" not in str(u)
+            ]
+            unstaged = [
+                u
+                for u in st.unstaged
+                if "MEMORY.md" not in str(u)
+            ]
+            return GitStatus(
+                staged=st.staged, unstaged=unstaged, untracked=untracked
+            )
+
+        monkeypatch.setattr(_real_porcelain, "status", _clean_for_recreated)
+
+        new_sha = vault_git.revert(sha_b)
+        # Old code: no-op guard sees clean + empty extra_paths → returns
+        # None, recovery uncommitted. Fixed code: touched non-empty →
+        # force-staged → committed.
+        assert new_sha is not None, (
+            "revert must commit the recovery even when porcelain.status "
+            "classifies the recreated legacy file as clean (B1)"
+        )
+        assert mem.read_text(encoding="utf-8") == "MEM-Y"
+        assert _head_blob(tmp_path, "memory/MEMORY.md") == "MEM-Y"
+        assert _head_sha(tmp_path) != sha_b
+
+    def test_revert_genuine_noop_returns_none(self, vault_git, tmp_path):
+        """The force-commit must fire ONLY when revert did real work. A
+        revert whose target commit has nothing left to undo (revert it,
+        then revert the same commit again) must return None and create NO
+        empty/no-op commit (HEAD sha unchanged)."""
+        vault_git.init()
+        page = tmp_path / "memory" / "users" / "u" / "wiki" / "p.md"
+        page.parent.mkdir(parents=True, exist_ok=True)
+
+        page.write_text("A", encoding="utf-8")
+        vault_git.auto_commit("A")  # A
+        page.write_text("B", encoding="utf-8")
+        sha_b = vault_git.auto_commit("B: p=B")  # B
+        assert sha_b is not None
+
+        # First revert of B does real work (p: B→A) and commits.
+        first = vault_git.revert(sha_b)
+        assert first is not None
+        assert page.read_text(encoding="utf-8") == "A"
+
+        head_before = _head_sha(tmp_path)
+        # Reverting B AGAIN: B's parent content is already on disk and
+        # already committed → affected paths produce no filesystem change
+        # → touched is empty → genuine no-op.
+        second = vault_git.revert(sha_b)
+        assert second is None, "a genuine no-op revert must return None"
+        assert _head_sha(tmp_path) == head_before, (
+            "a genuine no-op revert must NOT create an empty commit"
+        )
+
+    def test_revert_modify_undo_still_committed(self, vault_git, tmp_path):
+        """Regression guard: the prior-correct modify-undo case still
+        commits (restored content recorded in the revert tree)."""
+        vault_git.init()
+        soul = tmp_path / "SOUL.md"
+        soul.write_text("soul A", encoding="utf-8")
+        vault_git.auto_commit("A")
+        soul.write_text("soul B", encoding="utf-8")
+        sha_b = vault_git.auto_commit("B")
+        assert sha_b is not None
+
+        new_sha = vault_git.revert(sha_b)
+        assert new_sha is not None
+        assert soul.read_text(encoding="utf-8") == "soul A"
+        assert _head_blob(tmp_path, "SOUL.md") == "soul A"
+        assert _head_sha(tmp_path) != sha_b
+
+    def test_revert_add_undo_still_committed_and_isolated(
+        self, vault_git, tmp_path
+    ):
+        """Regression guard: reverting an ADDing commit still commits the
+        deletion, HEAD advances, and a later unrelated file is untouched."""
+        people = tmp_path / "memory" / "users" / "u" / "wiki" / "people"
+        people.mkdir(parents=True, exist_ok=True)
+        base = people / "base.md"
+        added = people / "added.md"
+        later = people / "later.md"
+
+        vault_git.init()
+        base.write_text("base", encoding="utf-8")
+        vault_git.auto_commit("A: base")
+        added.write_text("added by B", encoding="utf-8")
+        sha_b = vault_git.auto_commit("B: add added.md")
+        assert sha_b is not None
+        later.write_text("later", encoding="utf-8")
+        vault_git.auto_commit("C: add later.md")
+
+        new_sha = vault_git.revert(sha_b)
+        assert new_sha is not None
+        assert _head_sha(tmp_path) != sha_b
+        assert not added.exists()
+        assert later.exists() and later.read_text(encoding="utf-8") == "later"
+
+        tree = _commit_tree_paths(tmp_path)
+        pfx = "memory/users/u/wiki/people/"
+        assert pfx + "added.md" not in tree
+        assert pfx + "later.md" in tree
+        assert pfx + "base.md" in tree
