@@ -1049,9 +1049,6 @@ async def test_search_does_not_reheat(tmp_path):
 # --- Task 3: wiki_note marks its vault dirty on create/append success ---
 
 
-from nanobot.agent.wiki.moc_refresh import take_dirty  # noqa: E402
-
-
 def _tool_for(tmp_path, session_key):
     """``_tool`` parametrized by session key (same wiring as ``_tool``)."""
     t = WikiNoteTool.create(_ctx(tmp_path))
@@ -1065,6 +1062,8 @@ def _tool_for(tmp_path, session_key):
 
 
 async def test_wiki_note_create_marks_vault_dirty(tmp_path):
+    from nanobot.agent.wiki.moc_refresh import take_dirty
+
     t = _tool_for(tmp_path, "telegram:42")
     slug = vault_slug("telegram:42")
     # Clean precondition (no stale mark from another test).
@@ -1087,6 +1086,8 @@ async def test_wiki_note_create_marks_vault_dirty(tmp_path):
 
 
 async def test_wiki_note_failed_create_does_not_mark(tmp_path):
+    from nanobot.agent.wiki.moc_refresh import take_dirty
+
     t = _tool_for(tmp_path, "telegram:42")
     slug = vault_slug("telegram:42")
     assert take_dirty(slug) is False
@@ -1104,6 +1105,8 @@ async def test_wiki_note_failed_create_does_not_mark(tmp_path):
 
 
 async def test_wiki_note_append_marks_vault_dirty(tmp_path):
+    from nanobot.agent.wiki.moc_refresh import take_dirty
+
     t = _tool_for(tmp_path, "telegram:42")
     slug = vault_slug("telegram:42")
     assert take_dirty(slug) is False
@@ -1130,6 +1133,8 @@ async def test_wiki_note_append_marks_vault_dirty(tmp_path):
 
 
 async def test_wiki_note_failed_append_does_not_mark(tmp_path):
+    from nanobot.agent.wiki.moc_refresh import take_dirty
+
     t = _tool_for(tmp_path, "telegram:42")
     slug = vault_slug("telegram:42")
     assert take_dirty(slug) is False
