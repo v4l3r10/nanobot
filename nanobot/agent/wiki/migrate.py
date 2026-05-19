@@ -38,6 +38,7 @@ only as a typing annotation under ``TYPE_CHECKING`` — so the
 
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -48,8 +49,6 @@ from nanobot.utils.atomic import atomic_write_text
 from nanobot.utils.prompt_templates import is_bundled_template_content
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import (no cycle)
-    import datetime
-
     from nanobot.agent.wiki.vault import Vault
 
 __all__ = ["migrate_legacy"]
@@ -71,22 +70,47 @@ _LEGACY_MEMORY_TEMPLATE = "memory/MEMORY.md"
 _PREFERRED_TYPE = "concepts"
 _IMPORTED_SLUG = "imported-memory"
 
+# Review follow-up I1: cap the imported page BODY. A multi-MB legacy
+# memory/MEMORY.md would otherwise become one unbounded page body verbatim.
+# The downstream Dream prompt is already bounded (Task 6.1's
+# _MAX_MEMORY_CHARS) and the MOC is line-capped, but the ON-DISK page is
+# re-parsed and git-blobbed by Lint EVERY Dream cycle — so an unbounded body
+# is an unbounded per-cycle cost. 200_000 chars (~200 KB / tens of thousands
+# of lines) is far larger than any realistic hand-tended MEMORY.md yet small
+# enough that the per-cycle Lint re-parse/git-blob stays cheap. The legacy
+# source is NEVER modified (full original always preserved on disk), so the
+# truncation loses nothing recoverable; the marker below makes that explicit.
+_MAX_IMPORT_BODY_CHARS = 200_000
+_TRUNCATION_MARKER = (
+    "\n\n---\n*(truncated at import; full original preserved in legacy "
+    "memory/MEMORY.md — never deleted)*"
+)
+
 
 def _read_text_or_empty(path: Path) -> str:
-    """Read *path* as UTF-8, returning "" for a missing/odd file (never raises)."""
+    """Read *path* as UTF-8, returning "" for a missing/odd file (never raises).
+
+    Review follow-up I2: a non-utf8 legacy ``MEMORY.md``/``USER.md`` raises
+    ``UnicodeDecodeError`` (a ``UnicodeError``/``ValueError``, NOT ``OSError``).
+    Decoding with ``errors="replace"`` keeps that path from raising AND
+    preserves the recoverable content (friendlier for a one-shot migration
+    than dropping the file entirely); the surviving ``except OSError`` still
+    covers genuine filesystem errors. Without this, the error would escape
+    :func:`migrate_legacy`'s ``except OSError`` fail-safe, the ``.migrated``
+    marker would never be written, and Dream would re-attempt the migration
+    every cycle forever.
+    """
     try:
         if not path.is_file():
             return ""
-        return path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         logger.exception("legacy migration: failed reading {}", path)
         return ""
 
 
 def _today_iso(today: datetime.date | None) -> str:
-    import datetime as _dt
-
-    return (today or _dt.date.today()).isoformat()
+    return (today or datetime.date.today()).isoformat()
 
 
 def _import_memory_type(vault: Vault) -> str:
@@ -134,6 +158,20 @@ def _migrate_memory(workspace: Path, vault: Vault, today_iso: str) -> None:
         )
         return
 
+    # I1: bound the on-disk body so Lint's per-cycle re-parse/git-blob stays
+    # cheap. The legacy source is never touched, so the full original is
+    # always recoverable on disk; the marker makes the truncation explicit.
+    body = text
+    if len(body) > _MAX_IMPORT_BODY_CHARS:
+        logger.warning(
+            "legacy migration: MEMORY.md is {} chars; truncating imported "
+            "page body to {} (full original preserved in legacy "
+            "memory/MEMORY.md)",
+            len(body),
+            _MAX_IMPORT_BODY_CHARS,
+        )
+        body = body[:_MAX_IMPORT_BODY_CHARS] + _TRUNCATION_MARKER
+
     page = Page(
         type=type_,
         title="Imported legacy memory",
@@ -144,7 +182,7 @@ def _migrate_memory(workspace: Path, vault: Vault, today_iso: str) -> None:
         tags=["migrated"],
         links_out=[],
         pinned=None,
-        body=text,
+        body=body,
     )
     atomic_write_text(page_path, serialize_page(page))
     logger.info("legacy migration: imported MEMORY.md -> {}", page_path)
@@ -186,6 +224,21 @@ def migrate_legacy(
     and ``workspace/USER.md`` — the exact paths
     :class:`~nanobot.agent.memory.MemoryStore` resolves.
 
+    .. warning::
+
+       These sources are the **SINGLE GLOBAL** workspace memory/profile —
+       there is exactly ONE ``memory/MEMORY.md`` + ONE root ``USER.md`` for
+       the whole workspace, NOT one per user. ``migrate_legacy`` must
+       therefore ONLY ever run for the back-compat ``unified_default`` vault.
+       Running it for a per-user vault would import that single global blob
+       (including whatever user's ``USER.md`` profile happens to be on disk)
+       into THAT user's vault — silent, permanent cross-user contamination
+       (the per-vault ``.migrated`` marker makes it stick). The Dream 4.5
+       wiki-block call site enforces this by passing ``legacy_workspace``
+       ONLY for the ``unified_default`` slug; Task 7.2's per-user routing
+       MUST preserve that gate. See the gate + comment in
+       ``nanobot/agent/memory.py``.
+
     Effects on first call for a given vault:
 
     * Real (non-blank, non-stock-template) ``MEMORY.md`` -> ONE wiki page at
@@ -200,10 +253,11 @@ def migrate_legacy(
     Return contract: ``True`` iff this call PERFORMED the one-shot migration
     attempt (i.e. created the ``.migrated`` marker this call); ``False`` iff
     it short-circuited because the marker already existed (already migrated —
-    never re-run). Never raises on missing/odd legacy files; on an unexpected
-    ``OSError`` the failure is logged and the marker is still written so the
-    bootstrap cannot loop forever (fail-safe, never corrupting the vault or
-    touching the legacy sources).
+    never re-run). Never raises on missing/odd legacy files (incl. non-utf8
+    ones — review follow-up I2): on ANY unexpected error the failure is
+    logged at ``error`` (operator-actionable) and the marker is STILL written
+    so the bootstrap cannot loop forever (fail-safe, never corrupting the
+    vault or touching the read-only legacy sources).
 
     ``today`` (default: ``datetime.date.today()``) is injectable for
     deterministic testing of the ISO date stamps.
@@ -222,12 +276,20 @@ def migrate_legacy(
     try:
         _migrate_memory(workspace, vault, today_iso)
         _migrate_user(workspace, vault)
-    except OSError:
-        # Fail-safe: log and STILL set the marker below so a transient FS
-        # error can't loop the bootstrap forever. The legacy sources are
-        # read-only here, so they remain byte-intact regardless.
-        logger.exception(
-            "legacy migration: unexpected error; marking migrated to avoid a loop"
+    except Exception:
+        # Fail-safe: catch ANYTHING (not just OSError — review follow-up I2:
+        # a non-utf8 legacy file raises UnicodeError, not OSError) and STILL
+        # set the marker below so a transient/odd error can't loop the
+        # bootstrap forever. The legacy sources are read-only here, so they
+        # remain byte-intact regardless. M1: operator-actionable error log —
+        # this is a genuine failure (the user's legacy memory did NOT migrate)
+        # that we deliberately mark done to avoid a per-cycle loop.
+        logger.opt(exception=True).error(
+            "legacy migration FAILED for vault {} but marked done to prevent "
+            "a per-Dream-cycle retry loop; the legacy sources "
+            "(memory/MEMORY.md, USER.md) are READ-ONLY and intact — manual "
+            "re-migration may be required",
+            vault.root,
         )
 
     # Marker LAST so the migration is one-shot even if nothing was imported.

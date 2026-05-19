@@ -1019,6 +1019,17 @@ class Dream:
         WHOLE ``batch`` is passed to ``run_ingest`` for the single unified
         vault, which would cross-bleed every user's entries once this returns
         more than one slug.
+
+        NOTE(Task 7.2 — SEPARATE from the Ingest batch-slicing above):
+        7.2 MUST also keep the ``slug == unified`` gate on
+        ``legacy_workspace`` at the ``Dream.run()`` wiki-block call site
+        (added in the 7.1 review-fix). ``migrate_legacy`` reads the SINGLE
+        GLOBAL ``memory/MEMORY.md`` + root ``USER.md`` — running it for a
+        per-user slug fans that global blob (incl. another user's ``USER.md``
+        profile) into every vault, a PERMANENT cross-user contamination the
+        per-vault ``.migrated`` marker makes stick. This is a DISTINCT issue
+        from the Ingest cross-bleed: the batch-slicing fix above does NOT
+        cover migration fan-out. Do not remove the gate.
         """
         return [vault_slug("unified:default")]
 
@@ -1192,15 +1203,36 @@ class Dream:
             # byte-identical to v0.2.0 (TestDreamWikiDisabledGolden enforces this).
             if self.wiki_enabled:
                 try:
+                    # C1 (review follow-up): legacy migration is gated to the
+                    # UNIFIED vault ONLY. migrate_legacy reads the SINGLE
+                    # GLOBAL workspace/memory/MEMORY.md + workspace/USER.md
+                    # (there is exactly ONE such pair for the whole workspace,
+                    # NOT one per user). Passing legacy_workspace for a
+                    # per-user slug would import that global blob — including
+                    # whatever USER.md profile is on disk, possibly another
+                    # user's — into THAT user's vault: silent, PERMANENT
+                    # cross-user contamination (the per-vault .migrated marker
+                    # makes it stick). Today _vaults_for_batch returns only
+                    # [unified_default] so this gate is BEHAVIOR-IDENTICAL (the
+                    # unified vault still migrates exactly as in Task 7.1); it
+                    # exists so Task 7.2's per-user routing is safe-by-
+                    # construction. DO NOT remove this `slug == unified` gate
+                    # when 7.2 lands — see migrate_legacy's docstring warning
+                    # and the _vaults_for_batch TODO note.
+                    unified = vault_slug("unified:default")
                     for slug in self._vaults_for_batch(batch):
                         vault = Vault(self.store.workspace / "memory" / "users" / slug)
                         # Task 7.1: pass the workspace so the FIRST wiki-enabled
                         # cycle one-shot-migrates the LEGACY global
-                        # memory/MEMORY.md + root USER.md into this vault
-                        # (gated by migrate_legacy's own .migrated marker),
-                        # then run_lint below builds the MOC — closing the 6.1
-                        # enable-ordering window. Wiki-off never reaches here.
-                        vault.ensure_initialized(self.store.workspace)
+                        # memory/MEMORY.md + root USER.md into the UNIFIED
+                        # vault (gated by migrate_legacy's own .migrated
+                        # marker), then run_lint below builds the MOC — closing
+                        # the 6.1 enable-ordering window. Per-user vaults pass
+                        # None: they MUST NOT import the global blob (C1).
+                        # Wiki-off never reaches here.
+                        vault.ensure_initialized(
+                            self.store.workspace if slug == unified else None
+                        )
                         # Same lock key the wiki_note tool takes
                         # (get_vault_lock(vault_slug(session_key))) so Dream-side
                         # Ingest/Lint and the agent-side wiki_note tool never

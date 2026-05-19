@@ -15,6 +15,8 @@ import datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
 
+import pytest
+
 from nanobot.agent.wiki.lint import run_lint
 from nanobot.agent.wiki.migrate import migrate_legacy
 from nanobot.agent.wiki.page import parse_page
@@ -178,3 +180,111 @@ def test_blank_legacy_memory_not_migrated(tmp_path):
     assert result is True
     assert not vault.page_path("concepts", "imported-memory").exists()
     assert (vault.root / ".migrated").is_file()
+
+
+# --- Review follow-up I2: a non-utf8 legacy file must not loop migration ----
+
+
+def test_non_utf8_legacy_memory_does_not_raise_or_loop(tmp_path):
+    """I2 regression: a non-utf8 ``memory/MEMORY.md`` previously raised
+    ``UnicodeDecodeError`` (a ``ValueError``/``UnicodeError``, NOT ``OSError``)
+    out of ``migrate_legacy`` — escaping its ``except OSError`` fail-safe so
+    the ``.migrated`` marker was NEVER written and Dream re-ran the migration
+    every cycle forever. After the fix: no raise, marker IS written (one-shot),
+    ``migrate_legacy`` returns True, the legacy bytes are untouched, and any
+    imported page is parseable."""
+    workspace, vault = _fresh_vault(tmp_path)
+    legacy_memory = workspace / "memory" / "MEMORY.md"
+    # Latin-1 bytes that are NOT valid UTF-8 (0xe9 = 'é' in latin-1 is an
+    # invalid lone continuation byte in UTF-8). Real "memory" text so the
+    # template/blank guards do not short-circuit before the decode.
+    raw = "cafe resume facade naive".encode("ascii") + b" \xe9\xff\xfe biographie"
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")  # genuinely non-utf8
+    legacy_memory.parent.mkdir(parents=True, exist_ok=True)
+    legacy_memory.write_bytes(raw)
+    mem_before = legacy_memory.read_bytes()
+
+    # Must NOT raise (pre-fix this raised UnicodeDecodeError).
+    result = migrate_legacy(workspace, vault)
+
+    assert result is True
+    marker = vault.root / ".migrated"
+    assert marker.is_file()
+    # One-shot: a second call short-circuits on the marker (no infinite loop).
+    assert migrate_legacy(workspace, vault) is False
+    # Legacy source byte-unchanged (never modified/deleted).
+    assert legacy_memory.read_bytes() == mem_before
+    # If a page was imported it must be parseable (errors="replace" content).
+    page_file = vault.page_path("concepts", "imported-memory")
+    if page_file.is_file():
+        page = parse_page(page_file.read_text(encoding="utf-8"))
+        assert page.type == "concepts"
+        assert page.status == "hot"
+
+
+def test_non_utf8_legacy_user_does_not_raise_or_loop(tmp_path):
+    """I2 regression for the USER.md path: same failure mode via the second
+    ``_read_text_or_empty`` call inside ``migrate_legacy``."""
+    workspace, vault = _fresh_vault(tmp_path)
+    legacy_user = workspace / "USER.md"
+    legacy_user.write_bytes(b"Prenom Jose Muller \xff\xfe\xe9 profile")
+    user_before = legacy_user.read_bytes()
+
+    result = migrate_legacy(workspace, vault)
+
+    assert result is True
+    assert (vault.root / ".migrated").is_file()
+    assert migrate_legacy(workspace, vault) is False
+    assert legacy_user.read_bytes() == user_before
+
+
+# --- Review follow-up I1: imported page body is bounded --------------------
+
+
+def test_oversized_legacy_memory_body_is_capped(tmp_path):
+    """I1 regression: a multi-MB legacy ``memory/MEMORY.md`` must not become
+    one unbounded page body (per-cycle Lint re-parse / git blob cost). The
+    imported body is truncated to ``_MAX_IMPORT_BODY_CHARS`` plus a clear
+    truncation marker; it stays parseable; the legacy source is unchanged."""
+    from nanobot.agent.wiki.migrate import _MAX_IMPORT_BODY_CHARS
+
+    workspace, vault = _fresh_vault(tmp_path)
+    legacy_memory = workspace / "memory" / "MEMORY.md"
+    huge = "A" * (_MAX_IMPORT_BODY_CHARS * 3)
+    legacy_memory.parent.mkdir(parents=True, exist_ok=True)
+    legacy_memory.write_text(huge, encoding="utf-8")
+    mem_before = legacy_memory.read_bytes()
+
+    result = migrate_legacy(workspace, vault)
+
+    assert result is True
+    page_file = vault.page_path("concepts", "imported-memory")
+    assert page_file.is_file()
+    page = parse_page(page_file.read_text(encoding="utf-8"))
+    # Body capped at the bound + a (short) truncation marker line.
+    assert len(page.body) <= _MAX_IMPORT_BODY_CHARS + 200
+    assert len(page.body) < len(huge)
+    assert "truncated at import" in page.body
+    assert page.type == "concepts"
+    assert page.status == "hot"
+    # Legacy source byte-unchanged (full original preserved on disk).
+    assert legacy_memory.read_bytes() == mem_before
+
+
+def test_under_cap_legacy_memory_body_not_truncated(tmp_path):
+    """A normal-sized legacy memory is imported verbatim (no marker)."""
+    from nanobot.agent.wiki.migrate import _MAX_IMPORT_BODY_CHARS
+
+    workspace, vault = _fresh_vault(tmp_path)
+    body = "real memory line\n" * 10
+    assert len(body) < _MAX_IMPORT_BODY_CHARS
+    _write(workspace / "memory" / "MEMORY.md", body)
+
+    assert migrate_legacy(workspace, vault) is True
+
+    page = parse_page(
+        vault.page_path("concepts", "imported-memory").read_text(encoding="utf-8")
+    )
+    assert page.body == body
+    assert "truncated at import" not in page.body

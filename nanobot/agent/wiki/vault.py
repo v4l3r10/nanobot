@@ -82,6 +82,16 @@ class Vault:
         migration, no ``.migrated`` marker. The migrate import is function
         -local so the leaf ``migrate`` module's ``Vault`` use stays
         typing-only and the ``vault -> migrate`` edge introduces no cycle.
+
+        C1 (review follow-up) — callers MUST pass ``legacy_workspace`` ONLY
+        for the back-compat ``unified_default`` vault.
+        :func:`migrate_legacy` reads the SINGLE GLOBAL workspace
+        memory/profile (one pair for the whole workspace, NOT per user);
+        passing it for a per-user vault imports that global blob — possibly
+        another user's ``USER.md`` profile — into THAT user's vault (silent,
+        permanent cross-user contamination). The Dream wiki-block call site
+        enforces this with a ``slug == unified`` gate; Task 7.2's per-user
+        routing MUST keep that gate (see :func:`migrate_legacy`'s docstring).
         """
         self.wiki_dir.mkdir(parents=True, exist_ok=True)
         schema_path = self.wiki_dir / "SCHEMA.md"
