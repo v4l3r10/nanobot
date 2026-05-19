@@ -1044,3 +1044,100 @@ async def test_search_does_not_reheat(tmp_path):
     )
     on_disk = parse_page(cold_file.read_text(encoding="utf-8"))
     assert on_disk.status == "cold"
+
+
+# --- Task 3: wiki_note marks its vault dirty on create/append success ---
+
+
+from nanobot.agent.wiki.moc_refresh import take_dirty  # noqa: E402
+
+
+def _tool_for(tmp_path, session_key):
+    """``_tool`` parametrized by session key (same wiring as ``_tool``)."""
+    t = WikiNoteTool.create(_ctx(tmp_path))
+    channel, _, chat_id = session_key.partition(":")
+    t.set_context(
+        RequestContext(
+            channel=channel, chat_id=chat_id, session_key=session_key
+        )
+    )
+    return t
+
+
+async def test_wiki_note_create_marks_vault_dirty(tmp_path):
+    t = _tool_for(tmp_path, "telegram:42")
+    slug = vault_slug("telegram:42")
+    # Clean precondition (no stale mark from another test).
+    assert take_dirty(slug) is False
+
+    out = await t.execute(
+        operation="create",
+        type="concepts",
+        slug="alpha",
+        title="Alpha",
+        body="b",
+    )
+    # Same success assertion style the existing create tests use.
+    assert out.startswith("Created page"), out
+    assert "alpha" in out.lower()
+
+    # Marked exactly once by the successful create.
+    assert take_dirty(slug) is True
+    assert take_dirty(slug) is False
+
+
+async def test_wiki_note_failed_create_does_not_mark(tmp_path):
+    t = _tool_for(tmp_path, "telegram:42")
+    slug = vault_slug("telegram:42")
+    assert take_dirty(slug) is False
+
+    out = await t.execute(
+        operation="create",
+        type="nonsuchtype",
+        slug="x",
+        title="X",
+    )
+    assert out.lower().startswith("error:"), out
+    assert "unknown type" in out.lower()
+    # A refused create (schema admission gate) must NOT mark the vault.
+    assert take_dirty(slug) is False
+
+
+async def test_wiki_note_append_marks_vault_dirty(tmp_path):
+    t = _tool_for(tmp_path, "telegram:42")
+    slug = vault_slug("telegram:42")
+    assert take_dirty(slug) is False
+
+    created = await t.execute(
+        operation="create",
+        type="concepts",
+        slug="beta",
+        title="Beta",
+        body="start",
+    )
+    assert created.startswith("Created page"), created
+    # Consume the mark left by the successful create so we isolate append.
+    assert take_dirty(slug) is True
+    assert take_dirty(slug) is False
+
+    out = await t.execute(
+        operation="append", path="concepts/beta.md", text="more"
+    )
+    assert not out.startswith("Error:"), out
+
+    assert take_dirty(slug) is True
+    assert take_dirty(slug) is False
+
+
+async def test_wiki_note_failed_append_does_not_mark(tmp_path):
+    t = _tool_for(tmp_path, "telegram:42")
+    slug = vault_slug("telegram:42")
+    assert take_dirty(slug) is False
+
+    out = await t.execute(
+        operation="append", path="concepts/ghost.md", text="x"
+    )
+    assert out.startswith("Error:"), out
+    assert "not found" in out.lower()
+    # A failed append must NOT mark the vault.
+    assert take_dirty(slug) is False

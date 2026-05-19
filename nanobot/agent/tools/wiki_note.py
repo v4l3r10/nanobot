@@ -34,6 +34,7 @@ from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.filesystem import _FsTool
 from nanobot.agent.tools.path_utils import is_under
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
+from nanobot.agent.wiki.moc_refresh import mark_vault_dirty
 from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.paths import vault_dir, vault_slug
 from nanobot.agent.wiki.vault import _COLD_COMPONENT, _NON_PAGE_NAMES, Vault
@@ -487,6 +488,7 @@ class WikiNoteTool(_FsTool, ContextAware):
             except OSError as e:
                 return f"Error: {e}"
 
+        mark_vault_dirty(vault_slug(self._session_key()))
         return f"Appended to {path}"
 
     def _do_search(self, query: str | None) -> str:
@@ -763,4 +765,5 @@ class WikiNoteTool(_FsTool, ContextAware):
                     f"the index: {e}"
                 )
 
+        mark_vault_dirty(vault_slug(self._session_key()))
         return f"Created page {type}/{safe_slug}.md"
