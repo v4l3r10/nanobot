@@ -199,6 +199,8 @@ class ContextBuilder:
                 # the wiki-OFF system prompt is byte-identical to before.
                 wiki_mem = render_template("agent/memory_skill_wiki.md").strip()
                 rendered = []
+                # `### Skill: <name>` wrapper + `\n\n---\n\n` join below MUST mirror the source of
+                # truth nanobot/agent/skills.py:load_skills_for_context (L104-109); keep in sync.
                 for name in always_skills:
                     if name == "memory":
                         rendered.append(f"### Skill: memory\n\n{wiki_mem}")
