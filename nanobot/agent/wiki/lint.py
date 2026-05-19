@@ -78,7 +78,7 @@ from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.vault import _COLD_COMPONENT, _NON_PAGE_NAMES, Vault
 from nanobot.utils.atomic import atomic_write_text
 
-__all__ = ["LintReport", "run_lint"]
+__all__ = ["LintReport", "rebuild_indexes_and_moc", "run_lint"]
 
 
 @dataclass
