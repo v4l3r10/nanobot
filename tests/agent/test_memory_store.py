@@ -506,3 +506,78 @@ class TestAtomicMemoryWrites:
         assert "MEMORY.md" in names
         assert not any(n.endswith(".tmp") for n in names)
         assert s.read_memory() == "# Memory\n- fact"
+
+
+class TestAppendHistorySessionKey:
+    """Task 7.2: history records carry a ``session_key`` for per-user vault
+    routing — back-compat with legacy records that LACK the field.
+    """
+
+    def test_append_history_tags_session_key(self, store):
+        """An explicit ``session_key`` lands verbatim in the on-disk record;
+        omitting it defaults to the back-compat unified key; a hand-written
+        LEGACY record lacking the field is read back fine (no KeyError) and
+        treated as ``unified:default`` by readers.
+        """
+        store.append_history("for user 7", session_key="telegram:7")
+        store.append_history("no key given")  # default
+
+        entries = store._read_entries()
+        assert entries[0]["content"] == "for user 7"
+        assert entries[0]["session_key"] == "telegram:7"
+        assert entries[1]["content"] == "no key given"
+        # Default when no key is supplied is the unified back-compat key.
+        assert entries[1]["session_key"] == "unified:default"
+
+        # A legacy record physically lacking session_key must round-trip and
+        # readers must treat it as the unified key (NEVER raise KeyError).
+        store.history_file.write_text(
+            '{"cursor": 1, "timestamp": "2026-04-01 10:00", "content": "legacy"}\n',
+            encoding="utf-8",
+        )
+        legacy = store._read_entries()
+        assert legacy[0]["content"] == "legacy"
+        assert "session_key" not in legacy[0]
+        # Reader contract: .get(...,"unified:default") — no KeyError.
+        assert legacy[0].get("session_key", "unified:default") == "unified:default"
+        # read_unprocessed_history must still surface the legacy record.
+        unproc = store.read_unprocessed_history(since_cursor=0)
+        assert len(unproc) == 1
+        assert unproc[0].get("session_key", "unified:default") == "unified:default"
+
+    def test_session_key_round_trips_through_compaction(self, store):
+        """``compact_history`` (which rewrites the file via ``_write_entries``)
+        must preserve the ``session_key`` field and not choke on legacy
+        records that lack it.
+        """
+        store.max_history_entries = 2
+        store.append_history("a", session_key="telegram:1")
+        store.append_history("b", session_key="telegram:2")
+        store.append_history("c")  # default unified
+        store.compact_history()
+
+        entries = store._read_entries()
+        assert len(entries) == 2
+        assert entries[0]["content"] == "b"
+        assert entries[0]["session_key"] == "telegram:2"
+        assert entries[1]["content"] == "c"
+        assert entries[1]["session_key"] == "unified:default"
+
+    def test_raw_archive_threads_session_key(self, store):
+        """``raw_archive`` forwards its ``session_key`` to the appended
+        record; default stays the unified key (safe back-compat).
+        """
+        store.raw_archive(
+            [{"role": "user", "content": "hi", "timestamp": "2026-04-01 10:00"}],
+            session_key="discord:42",
+        )
+        entries = store._read_entries()
+        assert entries[0]["session_key"] == "discord:42"
+        assert "[RAW]" in entries[0]["content"]
+
+        store2 = MemoryStore(store.workspace.parent / "ws2")
+        store2.raw_archive(
+            [{"role": "user", "content": "hi", "timestamp": "2026-04-01 10:00"}],
+        )
+        e2 = store2._read_entries()
+        assert e2[0]["session_key"] == "unified:default"

@@ -321,7 +321,13 @@ class MemoryStore:
 
     # -- history.jsonl — append-only, JSONL format ---------------------------
 
-    def append_history(self, entry: str, *, max_chars: int | None = None) -> int:
+    def append_history(
+        self,
+        entry: str,
+        *,
+        max_chars: int | None = None,
+        session_key: str | None = None,
+    ) -> int:
         """Append *entry* to history.jsonl and return its auto-incrementing cursor.
 
         Entries are passed through `strip_think` to drop template-level leaks
@@ -335,6 +341,20 @@ class MemoryStore:
         applied as a final safety net: individual callers should cap their own
         content more tightly; this default only exists to catch unintentional
         large writes (e.g. an LLM echoing its input back as a "summary").
+
+        Task 7.2: *session_key* tags the record with the consolidated
+        session's EFFECTIVE key so Dream can route each user's entries into
+        THAT user's per-user wiki vault (``vault_slug(session_key)``).
+        ``None`` (the default, used when the caller genuinely has no session
+        in scope) is persisted as the back-compat unified key
+        ``"unified:default"``, which ``vault_slug`` maps to the single
+        ``unified_default`` vault — identical to pre-7.2 behavior. LEGACY
+        records on disk that physically LACK this field are still valid
+        everywhere: ALL readers MUST use
+        ``entry.get("session_key", "unified:default")`` (never indexing), so
+        an untagged legacy record also routes to the unified vault. The field
+        is INERT when the wiki is off (the Consolidator/context path keys off
+        content/timestamp/cursor only) — wiki-off behavior is unchanged.
         """
         limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
         cursor = self._next_cursor()
@@ -357,7 +377,12 @@ class MemoryStore:
                 "persisting empty content to avoid re-polluting context",
                 cursor,
             )
-        record = {"cursor": cursor, "timestamp": ts, "content": content}
+        record = {
+            "cursor": cursor,
+            "timestamp": ts,
+            "content": content,
+            "session_key": session_key or "unified:default",
+        }
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         self._cursor_file.write_text(str(cursor), encoding="utf-8")
@@ -503,13 +528,25 @@ class MemoryStore:
             )
         return "\n".join(lines)
 
-    def raw_archive(self, messages: list[dict], *, max_chars: int | None = None) -> None:
-        """Fallback: dump raw messages to history.jsonl without LLM summarization."""
+    def raw_archive(
+        self,
+        messages: list[dict],
+        *,
+        max_chars: int | None = None,
+        session_key: str | None = None,
+    ) -> None:
+        """Fallback: dump raw messages to history.jsonl without LLM summarization.
+
+        Task 7.2: *session_key* is threaded into the appended record so the
+        raw breadcrumb routes to the SAME per-user vault the consolidated
+        session would. ``None`` → unified (safe back-compat).
+        """
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
         formatted = truncate_text(self._format_messages(messages), limit)
         self.append_history(
             f"[RAW] {len(messages)} messages\n"
-            f"{formatted}"
+            f"{formatted}",
+            session_key=session_key,
         )
         logger.warning(
             "Memory consolidation degraded: raw-archived {} messages", len(messages)
@@ -663,7 +700,10 @@ class Consolidator:
             len(chunk),
             replay_max_messages,
         )
-        summary = await self.archive(chunk)
+        # Task 7.2: thread the EFFECTIVE session key (session.key — unified
+        # or channel:chat_id) so Dream routes this user's consolidated
+        # memory into THAT user's per-user vault.
+        summary = await self.archive(chunk, session_key=session.key)
         session.last_consolidated = end_idx
         self.sessions.save(session)
         return summary
@@ -730,10 +770,21 @@ class Consolidator:
         except Exception:
             return truncate_text(text, budget * 4)
 
-    async def archive(self, messages: list[dict]) -> str | None:
+    async def archive(
+        self, messages: list[dict], *, session_key: str | None = None
+    ) -> str | None:
         """Summarize messages via LLM and append to history.jsonl.
 
         Returns the summary text on success, None if nothing to archive.
+
+        Task 7.2: *session_key* is the EFFECTIVE key of the session being
+        consolidated (``session.key``: ``"unified:default"`` under
+        ``unified_session``, else ``channel:chat_id``). It is threaded into
+        the appended history record (both the LLM-summary path and the
+        ``raw_archive`` degraded fallback) so Dream routes this user's
+        consolidated memory into THAT user's per-user wiki vault. ``None``
+        (a caller with no session in scope) → unified (safe back-compat);
+        consolidation logic itself is UNCHANGED.
         """
         if not messages:
             return None
@@ -758,11 +809,15 @@ class Consolidator:
             if response.finish_reason == "error":
                 raise RuntimeError(f"LLM returned error: {response.content}")
             summary = response.content or "[no summary]"
-            self.store.append_history(summary, max_chars=_ARCHIVE_SUMMARY_MAX_CHARS)
+            self.store.append_history(
+                summary,
+                max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
+                session_key=session_key,
+            )
             return summary
         except Exception:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
-            self.store.raw_archive(messages)
+            self.store.raw_archive(messages, session_key=session_key)
             return None
 
     async def maybe_consolidate_by_tokens(
@@ -845,7 +900,9 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                summary = await self.archive(chunk)
+                # Task 7.2: thread the EFFECTIVE session key for per-user
+                # vault routing (see _consolidate_replay_overflow).
+                summary = await self.archive(chunk, session_key=session.key)
                 # Advance the cursor either way: on success the chunk was
                 # summarized; on failure archive() already raw-archived it as
                 # a breadcrumb. Re-archiving the same chunk on the next call
@@ -1211,32 +1268,39 @@ class Dream:
     def _vaults_for_batch(self, batch: list[dict[str, Any]]) -> list[str]:
         """Vault slugs the wiki Ingest+Lint pass should run for this batch.
 
-        For now: the single back-compat unified vault. ``vault_slug(
-        "unified:default")`` is computed (not hardcoded) so it stays in
-        lockstep with the slug the ``wiki_note`` tool / lock use; it equals
-        the literal ``"unified_default"``.
+        IMPLEMENTED in Task 7.2 (per-user routing): group ``batch`` entries
+        by ``vault_slug(entry.get("session_key", "unified:default"))`` and
+        return the SORTED distinct slug list (deterministic — no dict-order
+        leakage; the Dream call site iterates this list and feeds each slug
+        ONLY its own ``session_key`` slice of ``batch``). ``vault_slug`` is
+        applied (not hardcoded) so a slug stays in lockstep with the slug the
+        ``wiki_note`` tool / per-vault lock use.
 
-        TODO(Task 7.2): per-user routing -- group ``batch`` by entry
-        ``session_key`` via ``vault_slug`` and return one slug per distinct
-        user instead of the single unified slug. This is a TWO-SITE change:
-        7.2 must ALSO rewrite the call site in ``Dream.run()`` so each vault
-        receives ONLY its own ``session_key`` slice of ``batch`` -- today the
-        WHOLE ``batch`` is passed to ``run_ingest`` for the single unified
-        vault, which would cross-bleed every user's entries once this returns
-        more than one slug.
+        Collapse behavior (back-compat, BY CONSTRUCTION):
 
-        NOTE(Task 7.2 — SEPARATE from the Ingest batch-slicing above):
-        7.2 MUST also keep the ``slug == unified`` gate on
-        ``legacy_workspace`` at the ``Dream.run()`` wiki-block call site
-        (added in the 7.1 review-fix). ``migrate_legacy`` reads the SINGLE
-        GLOBAL ``memory/MEMORY.md`` + root ``USER.md`` — running it for a
-        per-user slug fans that global blob (incl. another user's ``USER.md``
+        * ``unified_session=True`` → every entry's ``session_key`` is
+          ``"unified:default"`` → one slug ``vault_slug("unified:default")``
+          == ``"unified_default"`` → exactly the pre-7.2 single-vault path.
+        * LEGACY records physically lacking ``session_key`` → ``.get(...,
+          "unified:default")`` → also the unified slug (never a KeyError).
+        * Mixed real per-user keys → one slug per distinct user, sorted.
+
+        NOTE(Task 7.2 — SEPARATE from the Ingest batch-slicing): the
+        ``slug == unified`` gate on ``legacy_workspace`` at the
+        ``Dream.run()`` wiki-block call site (added in the 7.1 review-fix)
+        MUST be kept. ``migrate_legacy`` reads the SINGLE GLOBAL
+        ``memory/MEMORY.md`` + root ``USER.md`` — running it for a per-user
+        slug fans that global blob (incl. another user's ``USER.md``
         profile) into every vault, a PERMANENT cross-user contamination the
         per-vault ``.migrated`` marker makes stick. This is a DISTINCT issue
-        from the Ingest cross-bleed: the batch-slicing fix above does NOT
-        cover migration fan-out. Do not remove the gate.
+        from the Ingest cross-bleed: the batch-slicing fix does NOT cover
+        migration fan-out. Do not remove the gate (now LIVE, not simulated).
         """
-        return [vault_slug("unified:default")]
+        slugs = {
+            vault_slug(entry.get("session_key", "unified:default"))
+            for entry in batch
+        }
+        return sorted(slugs)
 
     async def run(self) -> bool:
         """Process unprocessed history entries. Returns True if work was done."""
@@ -1422,13 +1486,13 @@ class Dream:
                     # whatever USER.md profile is on disk, possibly another
                     # user's — into THAT user's vault: silent, PERMANENT
                     # cross-user contamination (the per-vault .migrated marker
-                    # makes it stick). Today _vaults_for_batch returns only
-                    # [unified_default] so this gate is BEHAVIOR-IDENTICAL (the
-                    # unified vault still migrates exactly as in Task 7.1); it
-                    # exists so Task 7.2's per-user routing is safe-by-
-                    # construction. DO NOT remove this `slug == unified` gate
-                    # when 7.2 lands — see migrate_legacy's docstring warning
-                    # and the _vaults_for_batch TODO note.
+                    # makes it stick). Task 7.2 made per-user routing LIVE
+                    # (_vaults_for_batch now returns one slug per distinct
+                    # user); the gate keeps migration UNIFIED-ONLY so the
+                    # global blob is NEVER fanned into a per-user vault. DO
+                    # NOT remove this `slug == unified` gate — see
+                    # migrate_legacy's docstring warning and the
+                    # _vaults_for_batch NOTE.
                     unified = vault_slug("unified:default")
                     for slug in self._vaults_for_batch(batch):
                         vault = Vault(self.store.workspace / "memory" / "users" / slug)
@@ -1443,13 +1507,25 @@ class Dream:
                         vault.ensure_initialized(
                             self.store.workspace if slug == unified else None
                         )
+                        # Task 7.2: feed Ingest ONLY this slug's slice of the
+                        # batch (deterministic filter, same back-compat key
+                        # default as _vaults_for_batch) — NOT the whole batch.
+                        # Passing the full batch would cross-bleed every
+                        # user's history into every per-user vault.
+                        slug_batch = [
+                            e for e in batch
+                            if vault_slug(
+                                e.get("session_key", "unified:default")
+                            ) == slug
+                        ]
                         # Same lock key the wiki_note tool takes
                         # (get_vault_lock(vault_slug(session_key))) so Dream-side
                         # Ingest/Lint and the agent-side wiki_note tool never
-                        # write one user's vault concurrently (design H2).
+                        # write one user's vault concurrently (design H2). Each
+                        # user's vault locks INDEPENDENTLY (per-slug lock).
                         async with get_vault_lock(slug):
                             await run_ingest(
-                                vault, batch, self.provider, self.model,
+                                vault, slug_batch, self.provider, self.model,
                                 render_template,
                             )
                             run_lint(vault, _date.today())
