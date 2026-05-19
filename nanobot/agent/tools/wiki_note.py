@@ -488,6 +488,8 @@ class WikiNoteTool(_FsTool, ContextAware):
             except OSError as e:
                 return f"Error: {e}"
 
+        # Task 3: signal the post-turn cheap MOC rebuild (Task 4). Outside the
+        # lock and success-only by design — never on a partial/failed write.
         mark_vault_dirty(vault_slug(self._session_key()))
         return f"Appended to {path}"
 
@@ -765,5 +767,7 @@ class WikiNoteTool(_FsTool, ContextAware):
                     f"the index: {e}"
                 )
 
+        # Task 3: signal the post-turn cheap MOC rebuild (Task 4). Outside the
+        # lock and success-only by design — never on a partial/failed write.
         mark_vault_dirty(vault_slug(self._session_key()))
         return f"Created page {type}/{safe_slug}.md"
