@@ -1265,24 +1265,50 @@ class Dream:
             result += "\n"
         return result
 
+    @staticmethod
+    def _entry_slug(entry: dict[str, Any]) -> str:
+        """Vault slug for ONE history record (C1 — null-safe, write-aligned).
+
+        ``entry.get("session_key") or "unified:default"`` collapses ALL of:
+
+        * ABSENT ``session_key`` (legacy record physically lacking the field),
+        * JSON ``null`` → Python ``None`` (external / legacy / hand-edited /
+          malformed writers — the class the codebase defends against),
+        * empty string ``""``,
+
+        to the unified key, then applies ``vault_slug``. This MIRRORS
+        ``append_history``'s write side (``session_key or "unified:default"``)
+        so the read side is consistent with the write side and NEVER raises
+        ``AttributeError`` on ``vault_slug(None)`` (``None.replace`` would
+        crash). Used by BOTH ``_vaults_for_batch`` (grouping) AND the
+        ``Dream.run()`` per-slug slice (filtering) so grouping and slicing
+        can never diverge.
+        """
+        return vault_slug(entry.get("session_key") or "unified:default")
+
     def _vaults_for_batch(self, batch: list[dict[str, Any]]) -> list[str]:
         """Vault slugs the wiki Ingest+Lint pass should run for this batch.
 
         IMPLEMENTED in Task 7.2 (per-user routing): group ``batch`` entries
-        by ``vault_slug(entry.get("session_key", "unified:default"))`` and
-        return the SORTED distinct slug list (deterministic — no dict-order
-        leakage; the Dream call site iterates this list and feeds each slug
-        ONLY its own ``session_key`` slice of ``batch``). ``vault_slug`` is
-        applied (not hardcoded) so a slug stays in lockstep with the slug the
-        ``wiki_note`` tool / per-vault lock use.
+        by ``_entry_slug`` (``vault_slug`` of
+        ``entry.get("session_key") or "unified:default"``) and return the
+        SORTED distinct slug list (deterministic — no dict-order leakage; the
+        Dream call site iterates this list and feeds each slug ONLY its own
+        ``session_key`` slice of ``batch`` via the SAME ``_entry_slug``).
+        ``vault_slug`` is applied (not hardcoded) so a slug stays in lockstep
+        with the slug the ``wiki_note`` tool / per-vault lock use.
 
-        Collapse behavior (back-compat, BY CONSTRUCTION):
+        Collapse behavior (back-compat, BY CONSTRUCTION) — NEVER raises:
 
         * ``unified_session=True`` → every entry's ``session_key`` is
           ``"unified:default"`` → one slug ``vault_slug("unified:default")``
           == ``"unified_default"`` → exactly the pre-7.2 single-vault path.
-        * LEGACY records physically lacking ``session_key`` → ``.get(...,
-          "unified:default")`` → also the unified slug (never a KeyError).
+        * ``session_key`` ABSENT (legacy untagged record), JSON ``None``
+          (``null`` from an external/legacy/hand-edited/malformed writer), OR
+          empty ``""`` → ALL collapse to the unified slug (write-side
+          aligned; ``vault_slug(None)`` is NEVER reached → no
+          ``AttributeError`` that would skip the entire wiki pass for every
+          user this cycle, C1).
         * Mixed real per-user keys → one slug per distinct user, sorted.
 
         NOTE(Task 7.2 — SEPARATE from the Ingest batch-slicing): the
@@ -1296,11 +1322,7 @@ class Dream:
         from the Ingest cross-bleed: the batch-slicing fix does NOT cover
         migration fan-out. Do not remove the gate (now LIVE, not simulated).
         """
-        slugs = {
-            vault_slug(entry.get("session_key", "unified:default"))
-            for entry in batch
-        }
-        return sorted(slugs)
+        return sorted({self._entry_slug(entry) for entry in batch})
 
     async def run(self) -> bool:
         """Process unprocessed history entries. Returns True if work was done."""
@@ -1476,62 +1498,79 @@ class Dream:
             # `wiki_enabled` False (default) this is a true no-op -> Dream is
             # byte-identical to v0.2.0 (TestDreamWikiDisabledGolden enforces this).
             if self.wiki_enabled:
-                try:
-                    # C1 (review follow-up): legacy migration is gated to the
-                    # UNIFIED vault ONLY. migrate_legacy reads the SINGLE
-                    # GLOBAL workspace/memory/MEMORY.md + workspace/USER.md
-                    # (there is exactly ONE such pair for the whole workspace,
-                    # NOT one per user). Passing legacy_workspace for a
-                    # per-user slug would import that global blob — including
-                    # whatever USER.md profile is on disk, possibly another
-                    # user's — into THAT user's vault: silent, PERMANENT
-                    # cross-user contamination (the per-vault .migrated marker
-                    # makes it stick). Task 7.2 made per-user routing LIVE
-                    # (_vaults_for_batch now returns one slug per distinct
-                    # user); the gate keeps migration UNIFIED-ONLY so the
-                    # global blob is NEVER fanned into a per-user vault. DO
-                    # NOT remove this `slug == unified` gate — see
-                    # migrate_legacy's docstring warning and the
-                    # _vaults_for_batch NOTE.
-                    unified = vault_slug("unified:default")
-                    for slug in self._vaults_for_batch(batch):
-                        vault = Vault(self.store.workspace / "memory" / "users" / slug)
-                        # Task 7.1: pass the workspace so the FIRST wiki-enabled
-                        # cycle one-shot-migrates the LEGACY global
-                        # memory/MEMORY.md + root USER.md into the UNIFIED
-                        # vault (gated by migrate_legacy's own .migrated
-                        # marker), then run_lint below builds the MOC — closing
-                        # the 6.1 enable-ordering window. Per-user vaults pass
-                        # None: they MUST NOT import the global blob (C1).
-                        # Wiki-off never reaches here.
+                # C1 (review follow-up): legacy migration is gated to the
+                # UNIFIED vault ONLY. migrate_legacy reads the SINGLE GLOBAL
+                # workspace/memory/MEMORY.md + workspace/USER.md (there is
+                # exactly ONE such pair for the whole workspace, NOT one per
+                # user). Passing legacy_workspace for a per-user slug would
+                # import that global blob — including whatever USER.md profile
+                # is on disk, possibly another user's — into THAT user's
+                # vault: silent, PERMANENT cross-user contamination (the
+                # per-vault .migrated marker makes it stick). Task 7.2 made
+                # per-user routing LIVE (_vaults_for_batch returns one slug
+                # per distinct user); the gate keeps migration UNIFIED-ONLY so
+                # the global blob is NEVER fanned into a per-user vault. DO NOT
+                # remove this `slug == unified` gate — see migrate_legacy's
+                # docstring warning and the _vaults_for_batch NOTE.
+                #
+                # I1 (review follow-up): per-slug isolation. The try/except is
+                # now INSIDE the `for slug` loop so a transient/corrupt-vault
+                # failure for ONE user (run_ingest/run_lint/Vault raising) is
+                # logged WITH its slug and SWALLOWED for THAT slug ONLY — the
+                # remaining users still ingest this cycle. The old batch-global
+                # try wrapped the WHOLE loop: one bad vault aborted every user
+                # sorted after it while the cursor had ALREADY advanced (above)
+                # → unrecoverable for them, defeating 7.2's per-user
+                # independence. _vaults_for_batch itself is now null-safe (C1
+                # _entry_slug) so the grouping call cannot raise. The legacy
+                # path / cursor advance / compact / git / Phase 1-2 all ran
+                # BEFORE this block and are UNCHANGED; per-iteration isolation
+                # (not un-advancing the cursor) is the correct mitigation —
+                # the raw history.jsonl still retains the failed slug's batch.
+                unified = vault_slug("unified:default")
+                for slug in self._vaults_for_batch(batch):
+                    try:
+                        vault = Vault(
+                            self.store.workspace / "memory" / "users" / slug
+                        )
+                        # Task 7.1: pass the workspace so the FIRST
+                        # wiki-enabled cycle one-shot-migrates the LEGACY
+                        # global memory/MEMORY.md + root USER.md into the
+                        # UNIFIED vault (gated by migrate_legacy's own
+                        # .migrated marker), then run_lint below builds the
+                        # MOC — closing the 6.1 enable-ordering window.
+                        # Per-user vaults pass None: they MUST NOT import the
+                        # global blob (C1). This C1 7.1 gate stays
+                        # per-iteration verbatim. Wiki-off never reaches here.
                         vault.ensure_initialized(
                             self.store.workspace if slug == unified else None
                         )
                         # Task 7.2: feed Ingest ONLY this slug's slice of the
-                        # batch (deterministic filter, same back-compat key
-                        # default as _vaults_for_batch) — NOT the whole batch.
-                        # Passing the full batch would cross-bleed every
-                        # user's history into every per-user vault.
+                        # batch via the SAME _entry_slug used for grouping
+                        # (C1 — null-safe; grouping and slicing can never
+                        # diverge) — NOT the whole batch. Passing the full
+                        # batch would cross-bleed every user's history into
+                        # every per-user vault.
                         slug_batch = [
-                            e for e in batch
-                            if vault_slug(
-                                e.get("session_key", "unified:default")
-                            ) == slug
+                            e for e in batch if self._entry_slug(e) == slug
                         ]
                         # Same lock key the wiki_note tool takes
-                        # (get_vault_lock(vault_slug(session_key))) so Dream-side
-                        # Ingest/Lint and the agent-side wiki_note tool never
-                        # write one user's vault concurrently (design H2). Each
-                        # user's vault locks INDEPENDENTLY (per-slug lock).
+                        # (get_vault_lock(vault_slug(session_key))) so
+                        # Dream-side Ingest/Lint and the agent-side wiki_note
+                        # tool never write one user's vault concurrently
+                        # (design H2). Each user's vault locks INDEPENDENTLY
+                        # (per-slug lock).
                         async with get_vault_lock(slug):
                             await run_ingest(
                                 vault, slug_batch, self.provider, self.model,
                                 render_template,
                             )
                             run_lint(vault, _date.today())
-                except Exception:
-                    logger.exception(
-                        "wiki ingest/lint failed; legacy memory path intact"
-                    )
+                    except Exception:
+                        logger.exception(
+                            "wiki ingest/lint failed for vault {}; other "
+                            "vaults + legacy path intact",
+                            slug,
+                        )
 
             return True

@@ -679,6 +679,156 @@ class TestMultiUserVaultIsolation:
             assert "unified line" not in dump
 
 
+# --- Task 7.2 review follow-up: C1 (null-safe slug) + I1 (per-user isolation)
+
+
+class TestNullSessionKeyRouting:
+    """C1: a record with ``"session_key": null`` (JSON null — reachable via
+    external/legacy/hand-edited/malformed writers) must route to the unified
+    vault, NOT crash ``vault_slug(None)`` and skip the ENTIRE wiki pass for
+    every user that cycle (cursor already advanced → unrecoverable).
+    """
+
+    def test_vaults_for_batch_null_session_key_routes_to_unified_not_crash(
+        self, dream,
+    ):
+        """``_vaults_for_batch`` with a JSON-null ``session_key`` must return
+        ``unified_default`` (NOT raise ``AttributeError`` on
+        ``None.replace``)."""
+        batch = [
+            {"cursor": 1, "timestamp": "t", "content": "x", "session_key": None},
+            {"cursor": 2, "timestamp": "t", "content": "y", "session_key": "telegram:1"},
+        ]
+        # Must NOT raise; must group the null record under the unified slug.
+        assert dream._vaults_for_batch(batch) == ["telegram_1", "unified_default"]
+
+    async def test_null_session_key_routes_to_unified_not_crash(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """End-to-end: a batch mixing a ``session_key: null`` record and a
+        ``telegram:1`` record → BOTH ingested (null→unified_default vault,
+        telegram:1→telegram_1 vault). No ``AttributeError``; the wiki pass
+        is NOT skipped for everyone.
+
+        On CURRENT code ``vault_slug(None)`` raises ``AttributeError`` inside
+        ``_vaults_for_batch`` (called before the per-slug loop, inside the
+        batch-global try) → the whole wiki Ingest+Lint is skipped for EVERY
+        user this cycle while the cursor has already advanced.
+        """
+        dream.wiki_enabled = True
+
+        # Hand-write a JSON-null session_key record + a real per-user one.
+        store.history_file.write_text(
+            '{"cursor": 1, "timestamp": "2026-04-01 10:00", "content": '
+            '"null keyed line", "session_key": null}\n'
+            '{"cursor": 2, "timestamp": "2026-04-01 10:01", "content": '
+            '"tg one line", "session_key": "telegram:1"}\n',
+            encoding="utf-8",
+        )
+
+        _content_echo_provider(mock_provider)
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+        assert store.get_last_dream_cursor() == 2
+
+        users = store.workspace / "memory" / "users"
+        # null → unified_default vault.
+        unified_dump = users / "unified_default" / "wiki" / "concepts" / "dump.md"
+        assert unified_dump.is_file(), (
+            "null session_key was NOT routed to unified_default — the wiki "
+            "pass was skipped for everyone (C1)"
+        )
+        assert "null keyed line" in unified_dump.read_text(encoding="utf-8")
+
+        # telegram:1 → its own per-user vault, also ingested (not skipped).
+        tg_dump = users / "telegram_1" / "wiki" / "concepts" / "dump.md"
+        assert tg_dump.is_file(), (
+            "telegram:1 was NOT ingested — one null record skipped ALL "
+            "users' wiki pass this cycle (C1)"
+        )
+        assert "tg one line" in tg_dump.read_text(encoding="utf-8")
+
+
+class TestPerUserIngestFailureIsolation:
+    """I1: a per-slug ``run_ingest``/``run_lint`` failure must skip ONLY that
+    slug, not abort every later user's consolidation. The batch-global
+    try/except defeated 7.2's per-user isolation (cursor already advanced →
+    unrecoverable for the skipped users).
+    """
+
+    async def test_one_user_ingest_failure_isolated(
+        self, dream, mock_provider, mock_runner, store, monkeypatch,
+    ):
+        """``run_ingest`` raises ONLY for the ``telegram_2`` vault. After
+        ``dream.run()``: ``telegram_1``'s vault HAS its ingested page (NOT
+        aborted by user-2's failure), user-2's failure is logged WITH its
+        slug, the legacy path/cursor still advanced, no exception escapes.
+
+        On CURRENT code one bad vault aborts the whole `for slug` loop (the
+        try/except wraps the entire loop), so the user sorted after the
+        failing one is lost while the cursor has already advanced.
+        """
+        dream.wiki_enabled = True
+
+        store.append_history("alpha for one", session_key="telegram:1")
+        store.append_history("beta for two", session_key="telegram:2")
+
+        # Phase 1 (legacy) gets the first provider call (plain analysis).
+        # Ingest's provider calls echo the history slice into a PAGE body.
+        _content_echo_provider(mock_provider)
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        real_run_ingest = memory_mod.run_ingest
+
+        async def _selective_ingest(vault, *a, **k):
+            # vault is a Vault whose root path ends with the slug dir.
+            if vault.root.name == "telegram_2":
+                raise RuntimeError("user-2 vault corrupt page")
+            return await real_run_ingest(vault, *a, **k)
+
+        monkeypatch.setattr(
+            memory_mod, "run_ingest", AsyncMock(side_effect=_selective_ingest),
+        )
+
+        captured: list[str] = []
+        sink_id = logger.add(lambda m: captured.append(str(m)), level="ERROR")
+        try:
+            result = await dream.run()
+        finally:
+            logger.remove(sink_id)
+
+        # Legacy path entirely intact + cursor advanced (unchanged by I1).
+        assert result is True
+        assert store.get_last_dream_cursor() == 2
+
+        users = store.workspace / "memory" / "users"
+
+        # user-1 ingested DESPITE user-2's failure (the isolation 7.2 promises).
+        v1_dump = users / "telegram_1" / "wiki" / "concepts" / "dump.md"
+        assert v1_dump.is_file(), (
+            "telegram_1 was NOT ingested — user-2's failure aborted the "
+            "whole loop (I1: per-user isolation broken)"
+        )
+        assert "alpha for one" in v1_dump.read_text(encoding="utf-8")
+
+        # user-2's failure was logged WITH its slug, and swallowed (no raise).
+        assert any("telegram_2" in m for m in captured), (
+            "the failing vault slug was not logged"
+        )
+        assert any("wiki ingest/lint failed" in m for m in captured)
+
+        # user-2's page is absent (its ingest raised) — only that slug lost.
+        assert not (
+            users / "telegram_2" / "wiki" / "concepts" / "dump.md"
+        ).exists()
+
+
 # --- Concurrency guard (Task 4.6) ------------------------------------------
 
 
