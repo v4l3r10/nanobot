@@ -316,7 +316,7 @@ These commands now cover the wiki as well as the legacy memory files, because `G
 
 A successful `wiki_note` create or append now triggers a deterministic, LLM-free post-turn regeneration of that user's `_index.md` files and root `MEMORY.md` MOC. Durable facts therefore land in the always-injected MOC the very next turn, without waiting for the 2h Dream. The heavy Dream pass — Ingest plus curation (Karpathy checks, dedup, decay) — is unchanged and still runs on its normal cadence as the quality pass; the post-turn refresh only keeps the navigation fresh, it does not move, merge, or decay pages. Both the post-turn refresh and the underlying `wiki_note` tool are gated by `dream.wiki_enabled` (the `wikiEnabled` key under `agents.defaults.dream`): with the wiki off, behavior is byte-identical to stock nanobot.
 
-To actually get the agent to write durable facts, deploy the AGENTS.md directive in [`wiki-agents-directive.md`](./wiki-agents-directive.md); see [`wiki-moc-decouple-design.md`](./wiki-moc-decouple-design.md) for the full design. When `dream.wiki_enabled` is true the `memory` skill automatically presents this wiki-aware capture/recall guidance (no workspace `AGENTS.md` edit needed); when false, the legacy memory skill is shown unchanged.
+To actually get the agent to write durable facts, the capture/recall directive must be active. When `dream.wiki_enabled` is true the `memory` skill automatically presents this wiki-aware guidance — no workspace `AGENTS.md` edit needed; when false, the legacy memory skill is shown unchanged. See [`wiki-agents-directive.md`](./wiki-agents-directive.md) for operator details and [`wiki-moc-decouple-design.md`](./wiki-moc-decouple-design.md) for the full design.
 
 ## In Practice
 
