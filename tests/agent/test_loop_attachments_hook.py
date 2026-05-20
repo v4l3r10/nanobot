@@ -10,12 +10,12 @@ with the Dream-side reconciler from Task 4). Behaviour contract:
 * gated by existence of the unified vault's ``wiki_dir`` — the
   reconciler will catch up on the next Dream sweep;
 * exceptions are logged and swallowed — must never break dispatch;
-* ``run()`` calls it via ``asyncio.create_task`` so the dispatch path
-  is never blocked.
+* ``run()`` schedules it via ``self._schedule_background`` so the
+  dispatch path is never blocked and the task is drained on shutdown.
 
 We test the helper method ``_eager_attachment_ingest`` directly (the
 full-loop ``run()`` fixture is heavier than necessary; the integration
-point is one line — ``asyncio.create_task(self._eager_attachment_ingest(msg))``
+point is one line — ``self._schedule_background(self._eager_attachment_ingest(msg))``
 — and the unit-level coverage of the helper plus an integration test
 that drives ``run()`` for a single tick give the same guarantees with
 much less setup).
@@ -336,11 +336,11 @@ async def test_eager_hook_msg_id_matches_reconciler(
 @pytest.mark.asyncio
 async def test_run_schedules_eager_hook_as_task(tmp_path: Path) -> None:
     """The integration leg: a single tick of ``run()`` that consumes an
-    ``InboundMessage`` with ``media`` must spawn the eager hook as a task
-    (``asyncio.create_task``), NOT ``await`` it inline. We stub the helper
-    to record the call and check that ``run()`` returned to its loop body
-    without waiting on it (the helper is allowed to be still pending after
-    a single bus consume).
+    ``InboundMessage`` with ``media`` must spawn the eager hook as a
+    tracked background task (via ``self._schedule_background``), NOT
+    ``await`` it inline. We stub the helper to record the call and check
+    that ``run()`` returned to its loop body without waiting on it (the
+    helper is allowed to be still pending after a single bus consume).
     """
     loop = _make_loop(tmp_path, wiki_enabled=True)
 
