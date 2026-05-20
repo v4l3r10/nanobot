@@ -49,14 +49,28 @@ def _iter_peer_files(peer_root: Path) -> Iterator[_DiscoveredAttachment]:
     prefix). The bronzo-v0.2.0 base prunes empty subdirs, so every subdir
     we see should contain at least one file. Dot-prefixed subdirs / files
     are skipped (hidden / future markers).
+
+    Transient OSError on a per-entry check skips that entry; the next
+    cycle catches up.
     """
     if not peer_root.is_dir():
         return
-    for msg_dir in sorted(peer_root.iterdir()):
-        if not msg_dir.is_dir() or msg_dir.name.startswith("."):
+    try:
+        msg_dirs = sorted(peer_root.iterdir())
+    except OSError:
+        return
+    for msg_dir in msg_dirs:
+        try:
+            if not msg_dir.is_dir() or msg_dir.name.startswith("."):
+                continue
+            files = sorted(msg_dir.iterdir())
+        except OSError:
             continue
-        for f in sorted(msg_dir.iterdir()):
-            if not f.is_file() or f.name.startswith("."):
+        for f in files:
+            try:
+                if not f.is_file() or f.name.startswith("."):
+                    continue
+            except OSError:
                 continue
             yield _DiscoveredAttachment(path=f, channel="peer", msg_id=msg_dir.name)
 
@@ -64,11 +78,22 @@ def _iter_peer_files(peer_root: Path) -> Iterator[_DiscoveredAttachment]:
 def _iter_flat_files(directory: Path, channel: str) -> Iterator[_DiscoveredAttachment]:
     """Walk a flat directory of files (Telegram-style layout). Subdirs
     and dot-prefixed files are skipped. ``msg_id`` defaults to the file
-    stem since flat layouts have no embedded msg_id structure."""
+    stem since flat layouts have no embedded msg_id structure.
+
+    Transient OSError on a per-entry check skips that entry; the next
+    cycle catches up.
+    """
     if not directory.is_dir():
         return
-    for f in sorted(directory.iterdir()):
-        if not f.is_file() or f.name.startswith("."):
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return
+    for f in entries:
+        try:
+            if not f.is_file() or f.name.startswith("."):
+                continue
+        except OSError:
             continue
         yield _DiscoveredAttachment(path=f, channel=channel, msg_id=f.stem)
 
@@ -96,7 +121,7 @@ def _default_sources() -> list[_Source]:
          get_workspace_path() / "peer",
          _iter_peer_files),
         ("telegram",
-         get_media_dir("telegram"),
+         get_media_dir() / "telegram",
          lambda root: _iter_flat_files(root, channel="telegram")),
     ]
 
