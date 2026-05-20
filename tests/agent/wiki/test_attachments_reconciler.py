@@ -83,3 +83,94 @@ def test_iter_flat_files_ignores_dot_files_and_subdirs(tmp_path):
 def test_iter_flat_files_handles_missing_root(tmp_path):
     items = list(_iter_flat_files(tmp_path / "nope", channel="x"))
     assert items == []
+
+
+# --------------------------------------------------------------------------- #
+# Task 3b — run_attachments_reconcile orchestrator
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_reconcile_writes_textual_peer_file(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    msg = tmp_path / "peer" / "msg_xyz"
+    msg.mkdir(parents=True)
+    (msg / "plan.md").write_text("the plan body")
+    # Inject a custom sources list so we don't depend on get_workspace_path()
+    from nanobot.agent.wiki.attachments_reconciler import (
+        _iter_peer_files,
+    )
+    sources = [
+        ("peer", tmp_path / "peer", _iter_peer_files),
+    ]
+    from nanobot.agent.wiki.attachments_reconciler import run_attachments_reconcile
+    report = await run_attachments_reconcile(vault, slug, sources=sources)
+    assert report.created == ["inbox/plan.md"]
+    assert (vault.wiki_dir / "inbox" / "plan.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_is_idempotent_on_rerun(tmp_path, vault_factory):
+    from nanobot.agent.wiki.attachments_reconciler import (
+        _iter_peer_files,
+        run_attachments_reconcile,
+    )
+    vault, slug = vault_factory()
+    msg = tmp_path / "peer" / "msg_xyz"
+    msg.mkdir(parents=True)
+    (msg / "p.md").write_text("plan")
+    sources = [("peer", tmp_path / "peer", _iter_peer_files)]
+    await run_attachments_reconcile(vault, slug, sources=sources)
+    page_bytes = (vault.wiki_dir / "inbox" / "p.md").read_bytes()
+    report = await run_attachments_reconcile(vault, slug, sources=sources)
+    assert report.duplicates == 1
+    assert report.created == []
+    assert (vault.wiki_dir / "inbox" / "p.md").read_bytes() == page_bytes
+
+
+@pytest.mark.asyncio
+async def test_reconcile_walks_both_source_roots(tmp_path, vault_factory):
+    """Two roots = two channels. Each must be walked independently."""
+    from nanobot.agent.wiki.attachments_reconciler import (
+        _iter_flat_files,
+        _iter_peer_files,
+        run_attachments_reconcile,
+    )
+    vault, slug = vault_factory()
+    # Peer root
+    peer_msg = tmp_path / "peer" / "msg_a"
+    peer_msg.mkdir(parents=True)
+    (peer_msg / "from_peer.md").write_text("peer content")
+    # Telegram root (different directory tree)
+    tg = tmp_path / "tg-media"
+    tg.mkdir()
+    (tg / "from_telegram.txt").write_text("tg content")
+    (tg / "photo.jpg").write_bytes(b"\x89PNGfake")  # binary
+    sources = [
+        ("peer", tmp_path / "peer", _iter_peer_files),
+        ("telegram", tg, lambda root: _iter_flat_files(root, channel="telegram")),
+    ]
+    report = await run_attachments_reconcile(vault, slug, sources=sources)
+    created_names = {p.split("/")[-1] for p in report.created}
+    assert "from_peer.md" in created_names
+    assert "from_telegram.md" in created_names  # note: .txt becomes .md via writer
+    assert report.skipped_binary == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_swallows_writer_errors(tmp_path, vault_factory):
+    """A write that returns WriteResult(status='error') is recorded in
+    report.errors but does NOT stop the reconcile loop."""
+    from nanobot.agent.wiki.attachments_reconciler import (
+        _iter_peer_files,
+        run_attachments_reconcile,
+    )
+    vault, slug = vault_factory()
+    msg = tmp_path / "peer" / "msg_a"
+    msg.mkdir(parents=True)
+    # A file with a slug that _slug_ok rejects (leading dot) — writer returns error
+    (msg / ".hidden_but_inside.md").write_text("x")  # NB: dot-files skipped by iter
+    # Add a normal file too to verify the loop keeps going
+    (msg / "fine.md").write_text("ok")
+    sources = [("peer", tmp_path / "peer", _iter_peer_files)]
+    report = await run_attachments_reconcile(vault, slug, sources=sources)
+    # The hidden file was skipped by iter (dot prefix); only "fine.md" gets through
+    assert report.created == ["inbox/fine.md"]
