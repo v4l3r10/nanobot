@@ -143,3 +143,59 @@ def test_body_clamped_at_8000(tmp_path, vault_factory):
     assert r.status == "created"
     txt = (vault.wiki_dir / "inbox" / "big.md").read_text(encoding="utf-8")
     assert len(txt) < 9000  # body clamped + frontmatter + source header < 9000
+
+
+# --------------------------------------------------------------------------- #
+# Task 2d — Manifest read/write + sha256 dedup
+# --------------------------------------------------------------------------- #
+def test_manifest_records_created(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    src = tmp_path / "doc.md"
+    src.write_text("hello")
+    write_attachment_page(vault, slug, src, "peer", "m-1", allowed_roots=[tmp_path])
+    manifest = vault.wiki_dir / ".ingested_attachments.json"
+    assert manifest.exists()
+    import json
+    data = json.loads(manifest.read_text())
+    assert data["version"] == 1
+    assert len(data["entries"]) == 1
+    e = data["entries"][0]
+    assert e["channel"] == "peer"
+    assert e["msg_id"] == "m-1"
+    assert e["status"] == "ingested"
+    assert e["page"] == "inbox/doc.md"
+    assert len(e["sha256"]) == 64
+
+
+def test_same_bytes_different_path_is_duplicate(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    a = tmp_path / "a.md"
+    a.write_text("identical bytes")
+    write_attachment_page(vault, slug, a, "peer", "m-1", allowed_roots=[tmp_path])
+    b = tmp_path / "b.md"
+    b.write_text("identical bytes")
+    r = write_attachment_page(vault, slug, b, "peer", "m-2", allowed_roots=[tmp_path])
+    assert r.status == "duplicate"
+    assert not (vault.wiki_dir / "inbox" / "b.md").exists()
+
+
+def test_rerun_same_file_is_noop(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    src = tmp_path / "doc.md"
+    src.write_text("hello")
+    write_attachment_page(vault, slug, src, "peer", "m-1", allowed_roots=[tmp_path])
+    page_bytes_1 = (vault.wiki_dir / "inbox" / "doc.md").read_bytes()
+    r = write_attachment_page(vault, slug, src, "peer", "m-1", allowed_roots=[tmp_path])
+    assert r.status == "duplicate"
+    page_bytes_2 = (vault.wiki_dir / "inbox" / "doc.md").read_bytes()
+    assert page_bytes_1 == page_bytes_2
+
+
+def test_binary_recorded_in_manifest(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    src = tmp_path / "img.png"
+    src.write_bytes(b"\x89PNGfake")
+    write_attachment_page(vault, slug, src, "peer", "m-1", allowed_roots=[tmp_path])
+    import json
+    data = json.loads((vault.wiki_dir / ".ingested_attachments.json").read_text())
+    assert any(e["status"] == "skipped_binary" for e in data["entries"])
