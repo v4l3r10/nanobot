@@ -70,7 +70,7 @@ serialized via `serialize_page` + `atomic_write_text`.
 - Output routing in v1: every page lands at `inbox/<slug>.md` in the
   **unified** vault. Per-sender fan-out is deferred (needs sender->slug
   metadata not yet standardized across channels).
-- Page body always starts with a `Source: {channel}/{msg_id} - {ts}` header
+- Page body always starts with a `Source: {channel}/{msg_id} · {ts}` header
   so provenance is preserved on append.
 
 The function is sync on purpose: it has no awaitable I/O and is called from
