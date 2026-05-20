@@ -166,6 +166,11 @@ def write_attachment_page(
     from both async (loop.py hook) and sync (Dream-side reconciler when
     called inside an existing async context) call sites consistently.
 
+    ``slug`` is a parameter purely to name the per-vault lock the caller is
+    contractually obliged to be holding — it is NOT used inside this body.
+    We don't assert the lock is held (sync inspection of ``asyncio.Lock`` is
+    fiddly and not worth the complexity); the contract is documentary.
+
     ``allowed_roots`` is the list of containment roots — typically
     ``[get_workspace_path(), get_media_dir()]`` so files under either the
     workspace (peer) or the data dir (telegram, future channels) are
@@ -251,7 +256,7 @@ def write_attachment_page(
             page = parse_page(target.read_text(encoding="utf-8"))
         except (ValueError, OSError) as e:
             return WriteResult(status="error", reason=f"parse existing: {e}")
-        if _body_already_present(page.body, body):
+        if _body_already_present(page.body, clamped):
             # Defense-in-depth: sha256 missed (different framing) but the
             # body is already there. Still record the manifest entry so a
             # rerun goes through the cheap sha gate next time.
