@@ -92,3 +92,54 @@ def test_missing_file(tmp_path, vault_factory):
         vault, slug, tmp_path / "nope.md", "test", "m1", allowed_roots=[tmp_path]
     )
     assert r.status == "error"
+
+
+# --------------------------------------------------------------------------- #
+# Task 2c — Textual create + APPEND fallback + body clamp
+# --------------------------------------------------------------------------- #
+def test_create_new_inbox_page(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    src = tmp_path / "plan.md"
+    src.write_text("# Plan\n\nFirst line of the plan body.\n")
+    r = write_attachment_page(
+        vault, slug, src, "peer", "m-123", allowed_roots=[tmp_path]
+    )
+    assert r.status == "created"
+    assert r.page_rel == "inbox/plan.md"
+    page_file = vault.wiki_dir / "inbox" / "plan.md"
+    assert page_file.exists()
+    txt = page_file.read_text(encoding="utf-8")
+    assert "type: inbox" in txt
+    assert "status: hot" in txt
+    assert "- peer" in txt    # tags
+    assert "- m-123" in txt
+    assert "Source: peer/m-123" in txt
+    assert "First line of the plan body." in txt
+
+
+def test_collision_appends(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    src = tmp_path / "plan.md"
+    src.write_text("first body")
+    write_attachment_page(vault, slug, src, "peer", "m-1", allowed_roots=[tmp_path])
+    # Second file, same slug, different content:
+    src.write_text("second body completely different")
+    r = write_attachment_page(
+        vault, slug, src, "peer", "m-2", allowed_roots=[tmp_path]
+    )
+    assert r.status == "appended"
+    txt = (vault.wiki_dir / "inbox" / "plan.md").read_text(encoding="utf-8")
+    assert "first body" in txt
+    assert "second body" in txt
+
+
+def test_body_clamped_at_8000(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    src = tmp_path / "big.md"
+    src.write_text("X" * 20_000)
+    r = write_attachment_page(
+        vault, slug, src, "test", "m-1", allowed_roots=[tmp_path]
+    )
+    assert r.status == "created"
+    txt = (vault.wiki_dir / "inbox" / "big.md").read_text(encoding="utf-8")
+    assert len(txt) < 9000  # body clamped + frontmatter + source header < 9000

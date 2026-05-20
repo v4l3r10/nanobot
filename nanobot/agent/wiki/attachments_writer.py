@@ -18,13 +18,22 @@ ingest pipeline on these invariants (C1/C2 in ingest.py).
 """
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
 from loguru import logger
 
 from nanobot.agent.tools.path_utils import is_under
+from nanobot.agent.wiki.ingest import (
+    _MAX_BODY_CHARS,
+    _body_already_present,
+    _safe_slug,
+    _slug_ok,
+)
+from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.vault import Vault
+from nanobot.utils.atomic import atomic_write_text
 
 __all__ = ["WriteResult", "classify_extension", "write_attachment_page"]
 
@@ -89,4 +98,59 @@ def write_attachment_page(
     if classify_extension(resolved_src.suffix) == "binary":
         # Manifest recording for binaries happens in Task 2d alongside textual.
         return WriteResult(status="skipped_binary")
-    raise NotImplementedError("textual path: Task 2c")
+
+    raw_slug = resolved_src.stem
+    slug_safe = _safe_slug(raw_slug)
+    if not _slug_ok(raw_slug, slug_safe):
+        return WriteResult(status="error", reason=f"invalid slug: {raw_slug!r}")
+
+    if not vault.schema.is_known_type("inbox"):
+        return WriteResult(status="error", reason="vault schema lacks 'inbox' type")
+
+    try:
+        text = resolved_src.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return WriteResult(status="error", reason=f"read: {e}")
+
+    clamped = text if len(text) <= _MAX_BODY_CHARS else text[:_MAX_BODY_CHARS]
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    body = f"Source: {channel}/{msg_id} · {ts}\n\n{clamped}"
+
+    target = vault.page_path("inbox", slug_safe).resolve()
+    if not is_under(target, vault.wiki_dir):
+        return WriteResult(status="error", reason="target escapes vault")
+
+    today = datetime.date.today().isoformat()
+    rel = f"inbox/{slug_safe}.md"
+
+    if target.exists():
+        try:
+            page = parse_page(target.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as e:
+            return WriteResult(status="error", reason=f"parse existing: {e}")
+        if _body_already_present(page.body, body):
+            return WriteResult(status="duplicate", page_rel=rel)
+        prefix = page.body.rstrip("\n")
+        page.body = f"{prefix}\n\n{body}" if prefix else body
+        page.updated = today
+        page.last_touched = today
+        for t in (channel, msg_id):
+            if t not in page.tags:
+                page.tags.append(t)
+        atomic_write_text(target, serialize_page(page))
+        return WriteResult(status="appended", page_rel=rel)
+
+    page = Page(
+        type="inbox",
+        title=(resolved_src.stem[:120] or slug_safe),
+        status="hot",
+        created=today,
+        updated=today,
+        last_touched=today,
+        tags=[channel, msg_id],
+        links_out=[],
+        pinned=None,
+        body=body,
+    )
+    atomic_write_text(target, serialize_page(page))
+    return WriteResult(status="created", page_rel=rel)
