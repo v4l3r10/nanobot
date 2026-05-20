@@ -17,6 +17,10 @@ from typing import Callable, Iterator
 
 from loguru import logger
 
+from nanobot.agent.wiki.attachments_writer import write_attachment_page
+from nanobot.agent.wiki.vault import Vault
+from nanobot.config.paths import get_media_dir, get_workspace_path
+
 __all__ = ["ReconcileReport", "run_attachments_reconcile"]
 
 
@@ -67,11 +71,6 @@ def _iter_flat_files(directory: Path, channel: str) -> Iterator[_DiscoveredAttac
         if not f.is_file() or f.name.startswith("."):
             continue
         yield _DiscoveredAttachment(path=f, channel=channel, msg_id=f.stem)
-
-
-from nanobot.agent.wiki.attachments_writer import write_attachment_page
-from nanobot.agent.wiki.vault import Vault
-from nanobot.config.paths import get_media_dir, get_workspace_path
 
 
 # Type alias for the source factory: takes a root Path, returns an iterator
