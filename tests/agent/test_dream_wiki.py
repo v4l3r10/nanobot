@@ -1079,3 +1079,160 @@ class TestDreamConcurrencyGuard:
 
         assert first is True
         assert second is True
+
+
+# --- Task 4 (attachments-ingest): Dream loop runs the reconciler ------------
+
+
+class TestDreamRunsAttachmentsReconciler:
+    """Task 4: the Dream cycle invokes ``run_attachments_reconcile`` for the
+    unified vault BEFORE ``run_ingest`` / ``run_lint``, inside the per-slug
+    ``get_vault_lock(slug)`` block. This catches attachments that arrived
+    out-of-band (no history entry mentioning them) and turns them into
+    ``inbox/*`` pages before Ingest sees the vault state.
+    """
+
+    async def test_dream_picks_up_workspace_peer_attachment(
+        self, dream, mock_provider, mock_runner, store, monkeypatch,
+    ):
+        """A .md file dropped into ``workspace/peer/msg_<id>/`` becomes a
+        wiki ``inbox/<stem>.md`` page after the next Dream cycle, with NO
+        history entry mentioning it (model never saw it). Regression for
+        the gap that motivated this whole feature.
+        """
+        dream.wiki_enabled = True
+
+        # Redirect default sources to the test workspace so the reconciler
+        # walks tmp_path/peer instead of the real ~/.nanobot/workspace/peer.
+        monkeypatch.setattr(
+            "nanobot.agent.wiki.attachments_reconciler.get_workspace_path",
+            lambda: store.workspace,
+        )
+        monkeypatch.setattr(
+            "nanobot.agent.wiki.attachments_reconciler.get_media_dir",
+            lambda: store.workspace / "media",
+        )
+
+        # Drop a .md file with NO accompanying history entry. The model
+        # never saw this — only the reconciler can pick it up.
+        msg_dir = store.workspace / "peer" / "msg_aaa"
+        msg_dir.mkdir(parents=True)
+        (msg_dir / "drop.md").write_text("hello drop", encoding="utf-8")
+
+        # The Dream cycle still needs history to do work (otherwise the
+        # whole block is skipped). Add unrelated history.
+        store.append_history("unrelated event 1")
+
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok",
+                          "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+
+        inbox_page = (
+            store.workspace / "memory" / "users" / "unified_default"
+            / "wiki" / "inbox" / "drop.md"
+        )
+        assert inbox_page.is_file(), (
+            "reconciler did NOT write inbox/drop.md — Dream loop is not "
+            "wiring run_attachments_reconcile before run_ingest"
+        )
+        assert "hello drop" in inbox_page.read_text(encoding="utf-8")
+
+    async def test_reconciler_failure_does_not_skip_ingest_or_lint(
+        self, dream, mock_provider, mock_runner, store, monkeypatch,
+    ):
+        """A reconciler crash for the unified slug must be swallowed by an
+        INNER try/except so ``run_ingest``/``run_lint`` for that same slug
+        still run (the outer per-slug try/except would otherwise skip
+        them too).
+        """
+        dream.wiki_enabled = True
+
+        async def _boom(*a, **k):
+            raise RuntimeError("reconciler exploded")
+
+        monkeypatch.setattr(
+            memory_mod, "run_attachments_reconcile", AsyncMock(side_effect=_boom),
+        )
+
+        store.append_history("event 1")
+
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok",
+                          "detail": "memory/MEMORY.md"}],
+        ))
+
+        captured: list[str] = []
+        sink_id = logger.add(lambda m: captured.append(str(m)), level="ERROR")
+        try:
+            result = await dream.run()
+        finally:
+            logger.remove(sink_id)
+
+        assert result is True
+        # Reconciler failure was logged but did NOT skip Ingest: the
+        # canned _INGEST_OUTPUT created people/alice.md in the unified
+        # vault. If the failure had escaped to the outer per-slug
+        # try/except, Ingest would have been skipped and alice.md would
+        # not exist.
+        alice = (
+            store.workspace / "memory" / "users" / "unified_default"
+            / "wiki" / "people" / "alice.md"
+        )
+        assert alice.is_file(), (
+            "reconciler failure caused run_ingest to be skipped — "
+            "inner try/except is missing"
+        )
+        assert any("attachments reconcile failed" in m for m in captured), (
+            "reconciler failure was not logged"
+        )
+
+    async def test_reconciler_only_runs_for_unified_slug(
+        self, dream, mock_provider, mock_runner, store, monkeypatch,
+    ):
+        """v1 routing constraint: the reconciler walks raw files with no
+        sender info, so it MUST only run for ``slug == unified_default``.
+        Per-user slugs must NOT trigger a reconciler call.
+        """
+        dream.wiki_enabled = True
+
+        store.append_history("alpha", session_key="telegram:1")
+        store.append_history("beta", session_key="unified:default")
+
+        recon_calls: list[str] = []
+
+        async def _recording(vault, slug, *a, **k):
+            recon_calls.append(slug)
+            from nanobot.agent.wiki.attachments_reconciler import ReconcileReport
+            return ReconcileReport()
+
+        monkeypatch.setattr(
+            memory_mod, "run_attachments_reconcile",
+            AsyncMock(side_effect=_recording),
+        )
+
+        _content_echo_provider(mock_provider)
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok",
+                          "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+
+        # Reconciler must have been called for unified_default ONLY, not
+        # for telegram_1 (which has no sender-aware routing yet).
+        assert recon_calls == ["unified_default"], (
+            f"reconciler called for unexpected slugs: {recon_calls!r}"
+        )
