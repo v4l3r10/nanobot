@@ -32,3 +32,14 @@ def test_validate_page_frontmatter_missing_field():
 def test_rejects_schema_without_types():
     with pytest.raises(ValueError):
         load_schema("```yaml\nmoc_max_lines: 10\n```")
+
+
+def test_inbox_type_in_bundled_schema():
+    """The bundled SCHEMA.md must declare an 'inbox' type with a 30-day cold."""
+    from pathlib import Path
+    from nanobot.agent.wiki.schema import load_schema
+    bundled = Path(__file__).parents[3] / "nanobot" / "templates" / "memory" / "wiki" / "SCHEMA.md"
+    schema = load_schema(bundled.read_text(encoding="utf-8"))
+    assert schema.is_known_type("inbox")
+    assert schema.folder("inbox") == "inbox"
+    assert schema.cold_after_days("inbox") == 30
