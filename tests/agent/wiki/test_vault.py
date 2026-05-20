@@ -180,6 +180,15 @@ def test_ensure_initialized_does_not_overwrite_existing_schema(tmp_path):
         "type", "title", "status", "created", "updated", "last_touched",
     ]
 
+    # Byte-level "nothing else changed" check: the post-upgrade text minus
+    # the single inserted inbox line must equal the original schema text.
+    from nanobot.agent.wiki.vault import _INBOX_SCHEMA_LINE
+    final = (v.wiki_dir / "SCHEMA.md").read_text(encoding="utf-8")
+    # The helper inserts the inbox line with a trailing newline.
+    inserted = _INBOX_SCHEMA_LINE
+    assert inserted in final
+    assert final.replace(inserted, "", 1) == custom
+
 
 def test_ensure_initialized_upgrades_old_schema_to_include_inbox(tmp_path):
     """Vaults created before the inbox type was added must be upgraded
