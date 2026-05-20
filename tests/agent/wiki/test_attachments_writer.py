@@ -133,6 +133,11 @@ def test_collision_appends(tmp_path, vault_factory):
     txt = (vault.wiki_dir / "inbox" / "plan.md").read_text(encoding="utf-8")
     assert "first body" in txt
     assert "second body" in txt
+    # Manifest must record BOTH writes (M9): otherwise reruns lose the trail.
+    data = json.loads((vault.wiki_dir / ".ingested_attachments.json").read_text())
+    assert len(data["entries"]) == 2
+    msg_ids = {e["msg_id"] for e in data["entries"]}
+    assert msg_ids == {"m-1", "m-2"}
 
 
 def test_body_clamped_at_8000(tmp_path, vault_factory):
@@ -214,6 +219,54 @@ def test_manifest_entry_carries_path_size_ingested_at(tmp_path, vault_factory):
     assert e["size"] == len(b"hello world")
     # ISO-8601 UTC: YYYY-MM-DDTHH:MM:SSZ (20 chars)
     assert "T" in e["ingested_at"] and e["ingested_at"].endswith("Z")
+
+
+def test_idempotent_across_second_boundary_after_manifest_loss(
+    tmp_path, vault_factory, monkeypatch
+):
+    """If the manifest is lost between two writes of the same file at
+    different second-of-day timestamps, the second write must STILL detect
+    the body is already present (C2 byte-stability claim). Otherwise the
+    page body grows on every manifest-loss + rerun."""
+    vault, slug = vault_factory()
+    src = tmp_path / "doc.md"
+    src.write_text("steady content that should NEVER duplicate")
+    write_attachment_page(vault, slug, src, "peer", "m-1", allowed_roots=[tmp_path])
+    page_bytes_1 = (vault.wiki_dir / "inbox" / "doc.md").read_bytes()
+
+    # Simulate manifest loss
+    (vault.wiki_dir / ".ingested_attachments.json").unlink()
+
+    # Re-write at a different timestamp (force the clock forward).
+    # attachments_writer does ``import datetime`` and calls
+    # ``datetime.datetime.now(tz).strftime(...)``, so we patch the module's
+    # bound ``datetime`` attribute with a stand-in whose ``.datetime.now``
+    # returns a fixed future time.
+    import datetime as _dt
+
+    real_datetime_cls = _dt.datetime
+
+    class _FrozenLater(real_datetime_cls):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime_cls(2099, 1, 1, 12, 0, 0, tzinfo=tz)
+
+    class _FakeDatetimeModule:
+        datetime = _FrozenLater
+        timezone = _dt.timezone
+        date = _dt.date
+
+    monkeypatch.setattr(
+        "nanobot.agent.wiki.attachments_writer.datetime", _FakeDatetimeModule
+    )
+
+    r = write_attachment_page(
+        vault, slug, src, "peer", "m-1", allowed_roots=[tmp_path]
+    )
+    assert r.status == "duplicate", f"expected duplicate, got {r}"
+    # The page must NOT have grown.
+    page_bytes_2 = (vault.wiki_dir / "inbox" / "doc.md").read_bytes()
+    assert page_bytes_1 == page_bytes_2, "page body grew on manifest-loss rerun"
 
 
 # --------------------------------------------------------------------------- #
