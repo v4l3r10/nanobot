@@ -153,8 +153,11 @@ def test_ensure_initialized_with_none_legacy_is_byte_identical(tmp_path):
 
 
 def test_ensure_initialized_does_not_overwrite_existing_schema(tmp_path):
-    """An existing per-vault SCHEMA.md is preserved verbatim (never clobbered
-    by the bundled master)."""
+    """An existing per-vault SCHEMA.md is preserved (never clobbered by the
+    bundled master). The Task-6 one-shot upgrade may APPEND an ``inbox`` type
+    line if missing, but user customizations on other types and other YAML
+    keys (``moc_max_lines``, ``required_frontmatter``) are preserved verbatim.
+    """
     v = _make_vault(tmp_path, with_schema=False, with_pages=False, with_cold=False)
     v.wiki_dir.mkdir(parents=True, exist_ok=True)
     custom = (
@@ -167,6 +170,95 @@ def test_ensure_initialized_does_not_overwrite_existing_schema(tmp_path):
 
     v.ensure_initialized()
 
-    assert (v.wiki_dir / "SCHEMA.md").read_text(encoding="utf-8") == custom
-    # The custom schema is what resolves (cached property reads per-vault first).
-    assert Vault(v.root).schema.cold_after_days("people") == 7
+    # The custom schema is preserved: the user's cold_after_days for people
+    # and the custom moc_max_lines are untouched (cached property reads
+    # per-vault first).
+    schema = Vault(v.root).schema
+    assert schema.cold_after_days("people") == 7
+    assert schema.moc_max_lines == 42
+    assert schema.required_frontmatter == [
+        "type", "title", "status", "created", "updated", "last_touched",
+    ]
+
+
+def test_ensure_initialized_upgrades_old_schema_to_include_inbox(tmp_path):
+    """Vaults created before the inbox type was added must be upgraded
+    in-place when ensure_initialized runs. The upgrade must preserve other
+    user-customized parts of SCHEMA.md."""
+    vault_root = tmp_path / "v"
+    vault_root.mkdir()
+    wiki = vault_root / "wiki"
+    wiki.mkdir()
+    # Pre-Task-0 schema: only `people` type, custom cold value, custom moc_max_lines.
+    (wiki / "SCHEMA.md").write_text(
+        "# Wiki Schema\n"
+        "```yaml\n"
+        "types:\n"
+        "  people: { folder: people, cold_after_days: 200 }\n"
+        "required_frontmatter: [type, title, status]\n"
+        "moc_max_lines: 99\n"
+        "```\n"
+    )
+    from nanobot.agent.wiki.vault import Vault
+    vault = Vault(vault_root)
+    vault.ensure_initialized(None)
+    # After upgrade:
+    assert vault.schema.is_known_type("inbox")
+    assert vault.schema.folder("inbox") == "inbox"
+    assert vault.schema.cold_after_days("inbox") == 30
+    # Pre-existing custom values preserved:
+    assert vault.schema.is_known_type("people")
+    assert vault.schema.cold_after_days("people") == 200
+    assert vault.schema.moc_max_lines == 99
+    assert vault.schema.required_frontmatter == ["type", "title", "status"]
+
+
+def test_ensure_initialized_upgrade_is_idempotent(tmp_path):
+    """Running ensure_initialized twice must not double-add the inbox type
+    or otherwise mutate the schema file content beyond the first run."""
+    vault_root = tmp_path / "v"
+    vault_root.mkdir()
+    wiki = vault_root / "wiki"
+    wiki.mkdir()
+    (wiki / "SCHEMA.md").write_text(
+        "# Wiki Schema\n"
+        "```yaml\n"
+        "types:\n"
+        "  people: { folder: people, cold_after_days: 200 }\n"
+        "```\n"
+    )
+    from nanobot.agent.wiki.vault import Vault
+    vault = Vault(vault_root)
+    vault.ensure_initialized(None)
+    bytes_after_first = (wiki / "SCHEMA.md").read_bytes()
+    # Second call must be a true no-op
+    vault2 = Vault(vault_root)
+    vault2.ensure_initialized(None)
+    bytes_after_second = (wiki / "SCHEMA.md").read_bytes()
+    assert bytes_after_first == bytes_after_second, "second ensure_initialized mutated the schema"
+    # inbox should still be exactly once
+    text = (wiki / "SCHEMA.md").read_text(encoding="utf-8")
+    assert text.count("inbox:") == 1
+
+
+def test_ensure_initialized_modern_schema_unchanged(tmp_path):
+    """A schema that ALREADY has the inbox type (modern bundled) is not
+    rewritten — the upgrade is gated on absence of the inbox type."""
+    vault_root = tmp_path / "v"
+    vault_root.mkdir()
+    wiki = vault_root / "wiki"
+    wiki.mkdir()
+    schema_text = (
+        "# Wiki Schema\n"
+        "```yaml\n"
+        "types:\n"
+        "  people: { folder: people, cold_after_days: 180 }\n"
+        "  inbox:  { folder: inbox,  cold_after_days: 30 }\n"
+        "```\n"
+    )
+    (wiki / "SCHEMA.md").write_text(schema_text)
+    bytes_before = (wiki / "SCHEMA.md").read_bytes()
+    from nanobot.agent.wiki.vault import Vault
+    Vault(vault_root).ensure_initialized(None)
+    bytes_after = (wiki / "SCHEMA.md").read_bytes()
+    assert bytes_before == bytes_after
