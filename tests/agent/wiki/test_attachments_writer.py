@@ -201,6 +201,21 @@ def test_binary_recorded_in_manifest(tmp_path, vault_factory):
     assert any(e["status"] == "skipped_binary" for e in data["entries"])
 
 
+def test_manifest_entry_carries_path_size_ingested_at(tmp_path, vault_factory):
+    """Manifest must record provenance fields the spec mandates: path
+    (forensic trace), size (sanity), ingested_at (ordering)."""
+    vault, slug = vault_factory()
+    src = tmp_path / "doc.md"
+    src.write_text("hello world")
+    write_attachment_page(vault, slug, src, "peer", "m-1", allowed_roots=[tmp_path])
+    data = json.loads((vault.wiki_dir / ".ingested_attachments.json").read_text())
+    e = data["entries"][0]
+    assert e["path"] == str(src.resolve())
+    assert e["size"] == len(b"hello world")
+    # ISO-8601 UTC: YYYY-MM-DDTHH:MM:SSZ (20 chars)
+    assert "T" in e["ingested_at"] and e["ingested_at"].endswith("Z")
+
+
 # --------------------------------------------------------------------------- #
 # Task 2e — Concurrency contract: per-vault lock serializes manifest writes
 # --------------------------------------------------------------------------- #

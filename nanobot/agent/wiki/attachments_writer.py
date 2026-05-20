@@ -133,12 +133,18 @@ def _append_entry(
     msg_id: str,
     status: str,
     page: str | None,
+    path: str,
+    size: int,
+    ingested_at: str,
 ) -> None:
     entry: dict[str, Any] = {
         "sha256": sha,
         "channel": channel,
         "msg_id": msg_id,
         "status": status,
+        "path": path,
+        "size": size,
+        "ingested_at": ingested_at,
     }
     if page is not None:
         entry["page"] = page
@@ -192,6 +198,16 @@ def write_attachment_page(
             page_rel=existing.get("page"),
         )
 
+    # Compute provenance fields once — reused across all manifest writes and
+    # the page body's ``Source:`` header so they stay consistent for a single
+    # ingest call.
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        src_size = resolved_src.stat().st_size
+    except OSError as e:
+        return WriteResult(status="error", reason=f"stat: {e}")
+    src_abs = str(resolved_src)
+
     if classify_extension(resolved_src.suffix) == "binary":
         _append_entry(
             manifest,
@@ -200,6 +216,9 @@ def write_attachment_page(
             msg_id=msg_id,
             status="skipped_binary",
             page=None,
+            path=src_abs,
+            size=src_size,
+            ingested_at=ts,
         )
         _save_manifest(vault, manifest)
         return WriteResult(status="skipped_binary")
@@ -218,7 +237,6 @@ def write_attachment_page(
         return WriteResult(status="error", reason=f"read: {e}")
 
     clamped = text if len(text) <= _MAX_BODY_CHARS else text[:_MAX_BODY_CHARS]
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     body = f"Source: {channel}/{msg_id} · {ts}\n\n{clamped}"
 
     target = vault.page_path("inbox", slug_safe).resolve()
@@ -244,6 +262,9 @@ def write_attachment_page(
                 msg_id=msg_id,
                 status="ingested",
                 page=rel,
+                path=src_abs,
+                size=src_size,
+                ingested_at=ts,
             )
             _save_manifest(vault, manifest)
             return WriteResult(status="duplicate", page_rel=rel)
@@ -262,6 +283,9 @@ def write_attachment_page(
             msg_id=msg_id,
             status="ingested",
             page=rel,
+            path=src_abs,
+            size=src_size,
+            ingested_at=ts,
         )
         _save_manifest(vault, manifest)
         return WriteResult(status="appended", page_rel=rel)
@@ -286,6 +310,9 @@ def write_attachment_page(
         msg_id=msg_id,
         status="ingested",
         page=rel,
+        path=src_abs,
+        size=src_size,
+        ingested_at=ts,
     )
     _save_manifest(vault, manifest)
     return WriteResult(status="created", page_rel=rel)
