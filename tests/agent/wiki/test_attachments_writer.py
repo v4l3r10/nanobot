@@ -11,6 +11,7 @@ import pytest
 from nanobot.agent.wiki.attachments_writer import (
     WriteResult,
     classify_extension,
+    write_attachment_page,
     _TEXTUAL_EXTS,
 )
 
@@ -60,3 +61,34 @@ def test_writeresult_shape():
     assert r.status == "created"
     assert r.page_rel == "inbox/x.md"
     assert r.reason is None
+
+
+# --------------------------------------------------------------------------- #
+# Task 2b — Containment + binary skip + missing file
+# --------------------------------------------------------------------------- #
+def test_binary_skipped(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    f = tmp_path / "x.png"
+    f.write_bytes(b"\x89PNG")
+    r = write_attachment_page(vault, slug, f, "test", "m1", allowed_roots=[tmp_path])
+    assert r.status == "skipped_binary"
+    assert r.page_rel is None
+
+
+def test_escape_workspace_rejected(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    outside = tmp_path.parent / "evil.md"
+    outside.write_text("evil")
+    r = write_attachment_page(
+        vault, slug, outside, "test", "m1", allowed_roots=[tmp_path]
+    )
+    assert r.status == "error"
+    assert "escape" in (r.reason or "")
+
+
+def test_missing_file(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    r = write_attachment_page(
+        vault, slug, tmp_path / "nope.md", "test", "m1", allowed_roots=[tmp_path]
+    )
+    assert r.status == "error"
