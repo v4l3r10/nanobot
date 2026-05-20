@@ -19,8 +19,11 @@ ingest pipeline on these invariants (C1/C2 in ingest.py).
 from __future__ import annotations
 
 import datetime
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -66,6 +69,82 @@ def classify_extension(ext: str) -> str:
     return "textual" if ext.lower() in _TEXTUAL_EXTS else "binary"
 
 
+# --------------------------------------------------------------------------- #
+# Manifest — per-vault dedup ledger keyed by sha256(content).
+#
+# Lives at ``vault.wiki_dir / ".ingested_attachments.json"`` so it is
+# isolated per user and migrates naturally with the wiki tree. The dot
+# prefix keeps Lint's ``rglob("*.md")`` from ever seeing it.
+# --------------------------------------------------------------------------- #
+_MANIFEST_NAME = ".ingested_attachments.json"
+
+
+def _sha256_of(path: Path) -> str:
+    """Streaming sha256 of ``path``'s bytes (chunked, no full read)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _manifest_path(vault: Vault) -> Path:
+    return vault.wiki_dir / _MANIFEST_NAME
+
+
+def _load_manifest(vault: Vault) -> dict[str, Any]:
+    """Load the manifest, returning a fresh empty one on missing/corrupt."""
+    path = _manifest_path(vault)
+    if not path.exists():
+        return {"version": 1, "entries": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or "entries" not in data:
+            raise ValueError("malformed manifest")
+        if not isinstance(data.get("entries"), list):
+            raise ValueError("malformed manifest entries")
+        # Normalise version if missing/old.
+        data.setdefault("version", 1)
+        return data
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        logger.warning("attachments manifest corrupt ({}); starting fresh", e)
+        return {"version": 1, "entries": []}
+
+
+def _save_manifest(vault: Vault, data: dict[str, Any]) -> None:
+    atomic_write_text(
+        _manifest_path(vault),
+        json.dumps(data, indent=2, ensure_ascii=False),
+    )
+
+
+def _sha256_in_manifest(data: dict[str, Any], sha: str) -> dict[str, Any] | None:
+    for entry in data.get("entries", []):
+        if entry.get("sha256") == sha:
+            return entry
+    return None
+
+
+def _append_entry(
+    data: dict[str, Any],
+    *,
+    sha: str,
+    channel: str,
+    msg_id: str,
+    status: str,
+    page: str | None,
+) -> None:
+    entry: dict[str, Any] = {
+        "sha256": sha,
+        "channel": channel,
+        "msg_id": msg_id,
+        "status": status,
+    }
+    if page is not None:
+        entry["page"] = page
+    data.setdefault("entries", []).append(entry)
+
+
 def write_attachment_page(
     vault: Vault,
     slug: str,
@@ -95,8 +174,34 @@ def write_attachment_page(
         return WriteResult(status="error", reason="path escapes allowed_roots")
     if not resolved_src.is_file():
         return WriteResult(status="error", reason="not a regular file")
+
+    # Manifest is the cheap first dedup gate, keyed on sha256(content).
+    # We load once at the top and save once at the bottom (with a single
+    # mutation in between).
+    manifest = _load_manifest(vault)
+    try:
+        sha = _sha256_of(resolved_src)
+    except OSError as e:
+        return WriteResult(status="error", reason=f"sha256: {e}")
+    existing = _sha256_in_manifest(manifest, sha)
+    if existing is not None:
+        # Same bytes already ingested (or skipped) — no read of file body,
+        # no manifest update, byte-stable rerun.
+        return WriteResult(
+            status="duplicate",
+            page_rel=existing.get("page"),
+        )
+
     if classify_extension(resolved_src.suffix) == "binary":
-        # Manifest recording for binaries happens in Task 2d alongside textual.
+        _append_entry(
+            manifest,
+            sha=sha,
+            channel=channel,
+            msg_id=msg_id,
+            status="skipped_binary",
+            page=None,
+        )
+        _save_manifest(vault, manifest)
         return WriteResult(status="skipped_binary")
 
     raw_slug = resolved_src.stem
@@ -129,6 +234,18 @@ def write_attachment_page(
         except (ValueError, OSError) as e:
             return WriteResult(status="error", reason=f"parse existing: {e}")
         if _body_already_present(page.body, body):
+            # Defense-in-depth: sha256 missed (different framing) but the
+            # body is already there. Still record the manifest entry so a
+            # rerun goes through the cheap sha gate next time.
+            _append_entry(
+                manifest,
+                sha=sha,
+                channel=channel,
+                msg_id=msg_id,
+                status="ingested",
+                page=rel,
+            )
+            _save_manifest(vault, manifest)
             return WriteResult(status="duplicate", page_rel=rel)
         prefix = page.body.rstrip("\n")
         page.body = f"{prefix}\n\n{body}" if prefix else body
@@ -138,6 +255,15 @@ def write_attachment_page(
             if t not in page.tags:
                 page.tags.append(t)
         atomic_write_text(target, serialize_page(page))
+        _append_entry(
+            manifest,
+            sha=sha,
+            channel=channel,
+            msg_id=msg_id,
+            status="ingested",
+            page=rel,
+        )
+        _save_manifest(vault, manifest)
         return WriteResult(status="appended", page_rel=rel)
 
     page = Page(
@@ -153,4 +279,13 @@ def write_attachment_page(
         body=body,
     )
     atomic_write_text(target, serialize_page(page))
+    _append_entry(
+        manifest,
+        sha=sha,
+        channel=channel,
+        msg_id=msg_id,
+        status="ingested",
+        page=rel,
+    )
+    _save_manifest(vault, manifest)
     return WriteResult(status="created", page_rel=rel)
