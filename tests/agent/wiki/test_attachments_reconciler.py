@@ -155,6 +155,36 @@ async def test_reconcile_walks_both_source_roots(tmp_path, vault_factory):
 
 
 @pytest.mark.asyncio
+async def test_default_sources_production_path_smoke(tmp_path, vault_factory, monkeypatch):
+    """The default sources registry must remain valid (signature parity,
+    no missing deps). Regression test for `get_workspace_path` /
+    `get_media_dir` rename or signature change."""
+    from nanobot.agent.wiki.attachments_reconciler import run_attachments_reconcile
+
+    vault, slug = vault_factory()
+    # Redirect default sources to our tmp_path so we don't touch real
+    # user data; create a peer file there so we have something to ingest.
+    monkeypatch.setattr(
+        "nanobot.agent.wiki.attachments_reconciler.get_workspace_path",
+        lambda: tmp_path,
+    )
+    monkeypatch.setattr(
+        "nanobot.agent.wiki.attachments_reconciler.get_media_dir",
+        lambda: tmp_path / "media",
+    )
+    msg = tmp_path / "peer" / "msg_smoke"
+    msg.mkdir(parents=True)
+    (msg / "smoke.md").write_text("smoke content")
+    # No sources= kwarg → exercises _default_sources()
+    report = await run_attachments_reconcile(vault, slug)
+    assert "inbox/smoke.md" in report.created
+    # Fix 1 invariant: _default_sources() must NOT create the telegram
+    # subdir as a side effect (get_media_dir() / "telegram" is just a
+    # Path join, no ensure_dir).
+    assert not (tmp_path / "media" / "telegram").exists()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_swallows_writer_errors(tmp_path, vault_factory):
     """A write that returns WriteResult(status='error') is recorded in
     report.errors but does NOT stop the reconcile loop."""
