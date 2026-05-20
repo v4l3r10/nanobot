@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from nanobot.agent.wiki.attachments_reconciler import (
-    ReconcileReport,
     _iter_flat_files,
     _iter_peer_files,
 )
