@@ -887,7 +887,7 @@ class AgentLoop:
             # failed. The ``if msg.media:`` short-circuit keeps the common
             # plain-text path zero-cost (no task creation).
             if msg.media:
-                asyncio.create_task(self._eager_attachment_ingest(msg))
+                self._schedule_background(self._eager_attachment_ingest(msg))
 
             raw = msg.content.strip()
             if self.commands.is_priority(raw):
