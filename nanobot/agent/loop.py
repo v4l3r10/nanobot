@@ -908,7 +908,8 @@ class AgentLoop:
             # Gated internally by ``self.context.wiki_enabled``. Captures
             # ``msg.media`` paths the moment a channel publishes them, so the
             # model doesn't have to "decide" to call wiki_note. The Dream
-            # reconciler (memory.py: run_attachments_reconcile) is the
+            # reconciler (attachments_reconciler.run_attachments_reconcile,
+            # invoked from memory.py) is the
             # catch-up sweep for files arrived out-of-band or when this hook
             # failed. The ``if msg.media:`` short-circuit keeps the common
             # plain-text path zero-cost (no task creation).
@@ -1162,24 +1163,42 @@ class AgentLoop:
             return
         slug = vault_slug(UNIFIED_SESSION_KEY)
         try:
-            vault = Vault(Path(self.workspace) / "memory" / "users" / slug)
+            vault = Vault(vault_dir(Path(self.workspace), UNIFIED_SESSION_KEY))
             if not vault.wiki_dir.exists():
                 # Vault not yet initialized — Dream's ensure_initialized will
                 # set it up and the reconciler will pick these files up.
                 return
             allowed_roots = [get_workspace_path(), get_media_dir()]
-            msg_id = str(int(msg.timestamp.timestamp()))
             async with get_vault_lock(slug):
                 for raw in media:
                     p = Path(raw)
                     if not p.is_file():
                         continue
-                    write_attachment_page(
+                    # Eager hook msg_id: align with reconciler conventions so
+                    # the same file discovered by either path produces the
+                    # same `Source:` header.
+                    # - peer layout: <workspace>/peer/<msg_subdir>/<file>
+                    #   -> msg_id = <msg_subdir>
+                    # - flat layout: <data>/media/<channel>/<file>
+                    #   -> msg_id = <file stem>
+                    # Heuristic: if the parent directory looks like a
+                    # per-message subdir (i.e. parent's parent's name ==
+                    # msg.channel), use parent.name; else stem.
+                    if p.parent.parent.name == msg.channel:
+                        file_msg_id = p.parent.name
+                    else:
+                        file_msg_id = p.stem
+                    result = write_attachment_page(
                         vault, slug, p,
                         channel=msg.channel,
-                        msg_id=msg_id,
+                        msg_id=file_msg_id,
                         allowed_roots=allowed_roots,
                     )
+                    if result.status == "error":
+                        logger.warning(
+                            "eager attachment write error for {}: {}",
+                            p, result.reason,
+                        )
         except Exception:
             logger.exception("eager attachment ingest failed (non-fatal)")
 

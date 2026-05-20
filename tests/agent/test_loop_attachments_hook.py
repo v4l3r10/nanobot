@@ -259,6 +259,77 @@ async def test_eager_hook_skips_missing_source_files(tmp_path: Path) -> None:
     assert not inbox.exists() or not list(inbox.iterdir())
 
 
+# --- helper: msg_id heuristic aligns with reconciler conventions ------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "layout,channel,expected_msg_id",
+    [
+        # Flat telegram layout: <tmp>/media/telegram/<stem>.txt
+        # parent.parent.name == "media" != channel "telegram" -> use stem.
+        ("flat_telegram", "telegram", "snippet"),
+        # Peer layout: <tmp>/peer/<msg_subdir>/<stem>.md
+        # parent.parent.name == "peer" == channel "peer" -> use parent.name.
+        ("peer", "peer", "msg_xyz"),
+    ],
+)
+async def test_eager_hook_msg_id_matches_reconciler(
+    tmp_path: Path,
+    _scope_allowed_roots: None,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+    channel: str,
+    expected_msg_id: str,
+) -> None:
+    """The eager hook MUST derive ``msg_id`` from the path layout in the
+    same way the Dream reconciler does, so the ``Source:`` header is
+    identical for a file rediscovered by either path."""
+    loop = _make_loop(tmp_path, wiki_enabled=True)
+    _init_unified_vault(tmp_path)
+
+    if layout == "flat_telegram":
+        media_file = tmp_path / "media" / "telegram" / "snippet.txt"
+    else:
+        media_file = tmp_path / "peer" / "msg_xyz" / "plan.md"
+    media_file.parent.mkdir(parents=True, exist_ok=True)
+    media_file.write_text("payload-" + layout, encoding="utf-8")
+
+    captured: dict[str, object] = {}
+    import nanobot.agent.loop as loop_mod
+    real_writer = loop_mod.write_attachment_page
+
+    def _capturing(*args, **kwargs):
+        captured["msg_id"] = kwargs.get("msg_id")
+        captured["channel"] = kwargs.get("channel")
+        return real_writer(*args, **kwargs)
+
+    monkeypatch.setattr(loop_mod, "write_attachment_page", _capturing)
+
+    msg = InboundMessage(
+        channel=channel,
+        sender_id="u",
+        chat_id="c",
+        content="x",
+        media=[str(media_file)],
+    )
+
+    await loop._eager_attachment_ingest(msg)
+
+    assert captured["msg_id"] == expected_msg_id
+    assert captured["channel"] == channel
+
+    # The Source: header in the written page must reflect the derived msg_id.
+    page = (
+        tmp_path / "memory" / "users" / vault_slug("unified:default")
+        / "wiki" / "inbox" / f"{media_file.stem}.md"
+    )
+    assert page.exists()
+    assert f"Source: {channel}/{expected_msg_id}" in page.read_text(
+        encoding="utf-8"
+    )
+
+
 # --- integration: run() schedules the hook as a task (fire-and-forget) -----
 
 
