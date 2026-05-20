@@ -70,7 +70,6 @@ from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
 from nanobot.utils.vault_lock import get_vault_lock
 
-
 # --------------------------------------------------------------------------- #
 # Helpers — mirror the loop fixture in test_loop_attachments_hook.py + the
 # vault-init helper in test_attachments_reconciler.py.
