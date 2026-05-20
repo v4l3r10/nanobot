@@ -4,6 +4,8 @@ Dream-side reconciler.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -12,8 +14,8 @@ from nanobot.agent.wiki.attachments_writer import (
     WriteResult,
     classify_extension,
     write_attachment_page,
-    _TEXTUAL_EXTS,
 )
+from nanobot.utils.vault_lock import get_vault_lock
 
 
 # --------------------------------------------------------------------------- #
@@ -155,7 +157,6 @@ def test_manifest_records_created(tmp_path, vault_factory):
     write_attachment_page(vault, slug, src, "peer", "m-1", allowed_roots=[tmp_path])
     manifest = vault.wiki_dir / ".ingested_attachments.json"
     assert manifest.exists()
-    import json
     data = json.loads(manifest.read_text())
     assert data["version"] == 1
     assert len(data["entries"]) == 1
@@ -196,6 +197,31 @@ def test_binary_recorded_in_manifest(tmp_path, vault_factory):
     src = tmp_path / "img.png"
     src.write_bytes(b"\x89PNGfake")
     write_attachment_page(vault, slug, src, "peer", "m-1", allowed_roots=[tmp_path])
-    import json
     data = json.loads((vault.wiki_dir / ".ingested_attachments.json").read_text())
     assert any(e["status"] == "skipped_binary" for e in data["entries"])
+
+
+# --------------------------------------------------------------------------- #
+# Task 2e — Concurrency contract: per-vault lock serializes manifest writes
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_concurrent_writes_serialize(tmp_path, vault_factory):
+    vault, slug = vault_factory()
+    a = tmp_path / "a.md"
+    a.write_text("AAA")
+    b = tmp_path / "b.md"
+    b.write_text("BBB")
+
+    async def do_write(p, m):
+        async with get_vault_lock(slug):
+            return write_attachment_page(
+                vault, slug, p, "test", m, allowed_roots=[tmp_path]
+            )
+
+    results = await asyncio.gather(do_write(a, "m-a"), do_write(b, "m-b"))
+    assert all(r.status == "created" for r in results)
+    data = json.loads(
+        (vault.wiki_dir / ".ingested_attachments.json").read_text()
+    )
+    msgs = {e["msg_id"] for e in data["entries"]}
+    assert msgs == {"m-a", "m-b"}
