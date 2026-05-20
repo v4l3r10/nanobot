@@ -61,19 +61,30 @@ _INBOX_ENTRY_RE = re.compile(r"^\s+inbox:\s*\{", re.MULTILINE)
 _TOP_LEVEL_KEY_RE = re.compile(r"^\w+:")
 
 
-def _upgrade_schema_if_needed(schema_path: Path) -> bool:
-    """One-shot in-place upgrade: append an ``inbox`` type entry to an old
-    SCHEMA.md that lacks it. Preserves all other user content (comments,
-    column alignment, custom ``cold_after_days`` values, ``moc_max_lines``,
-    ``required_frontmatter``). Returns ``True`` if the file was modified,
-    ``False`` if no change was needed.
+def _ensure_inbox_type(schema_path: Path) -> bool:
+    r"""One-shot in-place upgrade: append an 'inbox' type to an old
+    SCHEMA.md that lacks it. Returns True if the file was modified.
 
-    Idempotent: a schema that already contains an ``inbox:`` *type entry*
-    (an indented key opening with ``{``) short-circuits without writing.
-    The match is intentionally restricted to lines that look like real
-    type entries, so a stray ``inbox`` mention in a comment or as a
-    non-type key (e.g. ``inbox:`` at column 0) does not falsely suppress
-    the upgrade.
+    Idempotent: a schema that already contains an indented ``inbox:`` key
+    in inline flow-style short-circuits without writing.
+
+    Preserves all other user content via string-level insertion (no YAML
+    round-trip, so comments and column alignment survive).
+
+    Limitations — these schemas are NOT upgraded; the attachment writer
+    will return an `error` status and the operator must add `inbox`
+    manually:
+
+    * Block-style type definitions (multi-line key/value mappings under
+      ``types:``). The helper looks for inline flow-style ``{ ... }``
+      entries only.
+    * SCHEMA.md authored with ``~~~yaml`` instead of the bundled ``\`\`\`yaml``
+      fence.
+    * Malformed schemas (no yaml fence, no ``types:`` block, no inline
+      type entries) — same conservative no-op behavior.
+
+    The vast majority of vaults — those bootstrapped from the bundled
+    master — match the inline format and upgrade cleanly.
     """
     text = schema_path.read_text(encoding="utf-8")
     if _INBOX_ENTRY_RE.search(text):
@@ -173,7 +184,7 @@ class Vault:
         # rejecting every eager-hook write against an old vault.
         # Idempotent: a cheap regex probe inside the helper makes the
         # second (and every subsequent) call a no-op.
-        _upgrade_schema_if_needed(schema_path)
+        _ensure_inbox_type(schema_path)
         if legacy_workspace is not None:
             from nanobot.agent.wiki.migrate import migrate_legacy
 
