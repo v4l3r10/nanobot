@@ -140,7 +140,8 @@ class AgentDefaults(Base):
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
     bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
-    unified_session: bool = False  # Share one session across all channels (single-user multi-device)
+    unified_session: bool = False  # Share one session across all channels (single-user multi-device). Legacy: implies unified_memory.
+    unified_memory: bool = False  # CV2: share memory/wiki across users while keeping per-user chat sessions. Adatto a multi-utente in contesto fiduciario (famiglia, piccolo team).
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
     session_ttl_minutes: int = Field(
         default=0,
@@ -160,6 +161,20 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+
+    @model_validator(mode="after")
+    def _check_memory_session_flags(self) -> "AgentDefaults":
+        # CV2: unified_session is the legacy flag and IMPLIES unified_memory.
+        # Setting both true is harmless but ambiguous — emit a warning so
+        # operators converging on multi-user shared-memory setups can drop
+        # unified_session and keep only unified_memory.
+        if self.unified_session and self.unified_memory:
+            import logging
+            logging.getLogger(__name__).warning(
+                "AgentDefaults: unified_session=true implies unified_memory; "
+                "set only unified_memory=true for multi-user shared-memory setups."
+            )
+        return self
 
 
 class AgentsConfig(Base):
