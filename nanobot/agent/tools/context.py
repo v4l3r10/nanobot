@@ -18,6 +18,7 @@ class RequestContext:
     chat_id: str
     message_id: str | None = None
     session_key: str | None = None
+    memory_key: str | None = None  # CV2: distinct vault/memory key when unified_memory=true; defaults to session_key semantics in resolution sites
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

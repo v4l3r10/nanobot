@@ -115,6 +115,7 @@ _PEER_WS_VIOLATION_VAR: ContextVar[bool] = ContextVar(
 class TurnContext:
     msg: InboundMessage
     session_key: str
+    memory_key: str  # CV2: distinct from session_key when unified_memory=true (shared vault) — defaults to session_key elsewhere
     state: TurnState
     turn_id: str
     session: Session | None = None
@@ -213,6 +214,7 @@ class AgentLoop:
         max_messages: int = 120,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
+        unified_memory: bool = False,
         wiki_enabled: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
@@ -309,6 +311,7 @@ class AgentLoop:
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
         )
         self._unified_session = unified_session
+        self._unified_memory = unified_memory
         self._max_messages = max_messages if max_messages > 0 else 120
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -327,6 +330,15 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        # CV2: resolver maps a Session → its memory/vault key. When
+        # unified_memory (or legacy unified_session) is on, every session
+        # collapses onto UNIFIED_SESSION_KEY for vault lookups, decoupling
+        # chat history (session.key, per-channel) from memory (shared).
+        def _memory_key_for(sess: Session) -> str:
+            if self._unified_memory or self._unified_session:
+                return UNIFIED_SESSION_KEY
+            return sess.key
+
         self.consolidator = Consolidator(
             store=self.context.memory,
             provider=provider,
@@ -337,6 +349,7 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
+            memory_key_resolver=_memory_key_for,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
@@ -403,6 +416,7 @@ class AgentLoop:
             channels_config=config.channels,
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
+            unified_memory=defaults.unified_memory,
             wiki_enabled=defaults.dream.wiki_enabled,
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
@@ -536,6 +550,7 @@ class AgentLoop:
         self, channel: str, chat_id: str,
         message_id: str | None = None, metadata: dict | None = None,
         session_key: str | None = None,
+        memory_key: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         from nanobot.agent.tools.context import ContextAware
@@ -547,11 +562,22 @@ class AgentLoop:
         else:
             effective_key = f"{channel}:{chat_id}"
 
+        # CV2: memory_key derivation. Explicit arg wins; else unified_memory
+        # or legacy unified_session collapses to UNIFIED_SESSION_KEY; else
+        # per-chat (== effective_key) — back-compat with pre-CV2 behaviour.
+        if memory_key is not None:
+            effective_memory_key = memory_key
+        elif self._unified_memory or self._unified_session:
+            effective_memory_key = UNIFIED_SESSION_KEY
+        else:
+            effective_memory_key = effective_key
+
         request_ctx = RequestContext(
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
             session_key=effective_key,
+            memory_key=effective_memory_key,
             metadata=dict(metadata or {}),
         )
 
@@ -629,6 +655,10 @@ class AgentLoop:
         # falling back to the msg-derived effective key. When the wiki is off
         # ContextBuilder ignores this entirely (verbatim original path).
         effective_key = session.key or self._effective_session_key(msg)
+        # CV2: vault read uses memory_key (may differ from session.key when
+        # unified_memory=true). Threaded through build_messages →
+        # build_system_prompt → vault_dir.
+        memory_key = self._effective_memory_key(msg, effective_key)
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -642,6 +672,7 @@ class AgentLoop:
             runtime_state=self,
             inbound_message=msg,
             session_key=effective_key,
+            memory_key=memory_key,
         )
 
     async def _dispatch_command_inline(
@@ -677,6 +708,27 @@ class AgentLoop:
         if self._unified_session and not msg.session_key_override:
             return UNIFIED_SESSION_KEY
         return msg.session_key
+
+    def _effective_memory_key(self, msg: InboundMessage, session_key: str) -> str:
+        """Return the memory/vault key for this turn.
+
+        CV2: distinct from ``_effective_session_key``. While *session_key*
+        drives chat history, locks, and follow-up routing, *memory_key*
+        drives which wiki vault / MEMORY.md / history.jsonl the consolidator
+        and wiki tools read and write.
+
+        Resolution order:
+        1. explicit ``memory_key_override`` on the inbound message
+        2. ``unified_memory=True`` or legacy ``unified_session=True``
+           → ``UNIFIED_SESSION_KEY`` (single shared vault)
+        3. fallback → ``session_key`` (pre-CV2 behaviour: 1:1 with session)
+        """
+        override = getattr(msg, "memory_key_override", None)
+        if override:
+            return override
+        if self._unified_memory or self._unified_session:
+            return UNIFIED_SESSION_KEY
+        return session_key
 
     def _replay_token_budget(self) -> int:
         """Derive a token budget for session history replay from the context window."""
@@ -971,8 +1023,14 @@ class AgentLoop:
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
         session_key = self._effective_session_key(msg)
+        memory_key = self._effective_memory_key(msg, session_key)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
+        if memory_key != session_key and not getattr(msg, "memory_key_override", None):
+            # Carry the resolved memory_key on the message so downstream
+            # consumers (subagents, mid-turn injection) don't need to
+            # re-derive it from the loop's flags.
+            msg = dataclasses.replace(msg, memory_key_override=memory_key)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
 
@@ -1264,9 +1322,11 @@ class AgentLoop:
         if is_subagent and self._persist_subagent_followup(session, msg):
             logger.debug("Subagent result persisted for session {}", key)
             self.sessions.save(session)
+        # CV2: memory_key may diverge from session key when unified_memory=true.
+        sys_memory_key = self._effective_memory_key(msg, key)
         self._set_tool_context(
             channel, chat_id, msg.metadata.get("message_id"),
-            msg.metadata, session_key=key,
+            msg.metadata, session_key=key, memory_key=sys_memory_key,
         )
         _hist_kwargs: dict[str, Any] = {
             "max_messages": self._max_messages,
@@ -1333,6 +1393,7 @@ class AgentLoop:
         self,
         msg: InboundMessage,
         session_key: str | None = None,
+        memory_key: str | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
@@ -1353,10 +1414,12 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         t0 = time.time()
+        mem_key = memory_key or self._effective_memory_key(msg, key)
         ctx = TurnContext(
             msg=msg,
             session=None,
             session_key=key,
+            memory_key=mem_key,
             state=TurnState.RESTORE,
             turn_id=f"{key}:{time.time_ns()}",
             turn_wall_started_at=t0,
@@ -1566,6 +1629,7 @@ class AgentLoop:
             ctx.msg.metadata.get("message_id"),
             ctx.msg.metadata,
             session_key=ctx.session_key,
+            memory_key=ctx.memory_key,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):

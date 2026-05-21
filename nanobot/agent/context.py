@@ -100,6 +100,7 @@ class ContextBuilder:
         session_summary: str | None = None,
         workspace: Path | None = None,
         session_key: str | None = None,
+        memory_key: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills.
 
@@ -110,17 +111,26 @@ class ContextBuilder:
         ``self.wiki_enabled`` is True. When the wiki is off, or no
         ``session_key`` is available, the original (pre-6.1) code path runs
         verbatim so the prompt is byte-identical to a stock install.
+
+        ``memory_key`` (CV2): explicit vault-key for wiki reads. When provided,
+        overrides ``session_key`` for vault resolution. When ``None``, falls
+        back to ``session_key`` (pre-CV2 behaviour). Used by callers that
+        want per-user chat sessions with a shared memory vault
+        (``unified_memory=true``).
         """
         root = workspace or self.workspace
+        # CV2: vault_key resolution — memory_key wins, session_key fallback.
+        # Pre-CV2 callers (memory_key=None) keep byte-identical behaviour.
+        vault_key = memory_key or session_key
         # Single source of truth for "the wiki read path is fully activated
         # for this call" (M3). The read block below and every wiki branch are
         # gated on this ONE predicate so they can never diverge: a falsy but
         # non-None key (e.g. "") would otherwise skip the read yet take the
         # wiki branch, leaving the user with NEITHER vault memory/profile NOR
-        # the global fallback. bool(session_key) is False for both None and
+        # the global fallback. bool(vault_key) is False for both None and
         # "" -> safe wiki-off fallback in both cases. The wiki-off path stays
         # byte-identical (this predicate only ever suppresses the wiki block).
-        wiki_active = self.wiki_enabled and bool(session_key)
+        wiki_active = self.wiki_enabled and bool(vault_key)
 
         # Resolve the per-user vault MOC iff the wiki read path is fully
         # activated for this call. Anything missing -> wiki_moc stays None and
@@ -128,7 +138,7 @@ class ContextBuilder:
         wiki_moc: str | None = None
         vault_user: str | None = None
         if wiki_active:
-            vroot = vault_dir(root, session_key)
+            vroot = vault_dir(root, vault_key)
             with suppress(OSError):
                 moc_path = vroot / "MEMORY.md"
                 if moc_path.is_file():
@@ -334,6 +344,7 @@ class ContextBuilder:
         inbound_message: Any | None = None,
         skip_runtime_lines: bool = False,
         session_key: str | None = None,
+        memory_key: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call.
 
@@ -341,6 +352,10 @@ class ContextBuilder:
         so the wiki read path can resolve the caller's per-user vault. None
         (the default, and the consolidator token-probe case) keeps the
         verbatim wiki-off behaviour.
+
+        ``memory_key`` (CV2): when provided, overrides ``session_key`` for
+        vault resolution inside :meth:`build_system_prompt`. Threaded
+        unchanged; back-compat by default (``None`` → use session_key).
         """
         root = workspace or self.workspace
         extra = [
@@ -376,6 +391,7 @@ class ContextBuilder:
                     session_summary=session_summary,
                     workspace=root,
                     session_key=session_key,
+                    memory_key=memory_key,
                 ),
             },
             *history,

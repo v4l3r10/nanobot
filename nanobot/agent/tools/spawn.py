@@ -38,6 +38,10 @@ class SpawnTool(Tool, ContextAware):
         self._origin_channel: ContextVar[str] = ContextVar("spawn_origin_channel", default="cli")
         self._origin_chat_id: ContextVar[str] = ContextVar("spawn_origin_chat_id", default="direct")
         self._session_key: ContextVar[str] = ContextVar("spawn_session_key", default="cli:direct")
+        # CV2: per-request memory/vault key. Default mirrors session_key for
+        # back-compat; when ContextBuilder sets a distinct memory_key
+        # (unified_memory=true), subagents inherit it via set_context below.
+        self._memory_key: ContextVar[str | None] = ContextVar("spawn_memory_key", default=None)
         self._origin_message_id: ContextVar[str | None] = ContextVar(
             "spawn_origin_message_id",
             default=None,
@@ -52,6 +56,9 @@ class SpawnTool(Tool, ContextAware):
         self._origin_channel.set(ctx.channel)
         self._origin_chat_id.set(ctx.chat_id)
         self._session_key.set(ctx.session_key or f"{ctx.channel}:{ctx.chat_id}")
+        # CV2: capture memory_key so spawned subagents inherit the parent's
+        # vault. Pre-CV2 callers pass None → falls back to session_key in spawn().
+        self._memory_key.set(ctx.memory_key)
         self._origin_message_id.set(ctx.message_id)
 
     @property
@@ -90,6 +97,7 @@ class SpawnTool(Tool, ContextAware):
             origin_channel=self._origin_channel.get(),
             origin_chat_id=self._origin_chat_id.get(),
             session_key=self._session_key.get(),
+            memory_key=self._memory_key.get(),
             origin_message_id=self._origin_message_id.get(),
             temperature=temperature,
             workspace_scope=current_workspace_scope(),
