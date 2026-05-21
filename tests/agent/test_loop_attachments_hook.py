@@ -7,8 +7,10 @@ with the Dream-side reconciler from Task 4). Behaviour contract:
 
 * gated by ``self.context.wiki_enabled`` — strict no-op when off;
 * gated by non-empty ``msg.media`` — strict no-op for plain text;
-* gated by existence of the unified vault's ``wiki_dir`` — the
-  reconciler will catch up on the next Dream sweep;
+* the unified vault is initialized (and its SCHEMA.md upgraded with
+  the ``inbox`` type if missing) before the first write, so pre-existing
+  vaults from before this feature shipped don't fail with "vault schema
+  lacks 'inbox' type" until the next Dream sweep;
 * exceptions are logged and swallowed — must never break dispatch;
 * ``run()`` schedules it via ``self._schedule_background`` so the
   dispatch path is never blocked and the task is drained on shutdown.
@@ -159,19 +161,22 @@ async def test_eager_hook_strict_noop_when_wiki_disabled(tmp_path: Path) -> None
     assert not (tmp_path / "memory" / "users").exists()
 
 
-# --- helper: wiki_dir not yet initialized -> no-op (reconciler catches up) --
+# --- helper: vault is initialized on demand if missing ----------------------
 
 
 @pytest.mark.asyncio
-async def test_eager_hook_noop_when_vault_uninitialized(tmp_path: Path) -> None:
+async def test_eager_hook_initializes_vault_if_missing(
+    tmp_path: Path, _scope_allowed_roots: None
+) -> None:
     """First turn after wiki was just enabled: the unified vault's ``wiki_dir``
-    doesn't exist yet. The hook must NOT call ensure_initialized (that's
-    Dream's job) and must NOT write — the next reconciler sweep handles it."""
+    doesn't exist yet. The hook calls ``ensure_initialized()`` under the lock
+    (same pattern as ``_refresh_vault_moc``) so the very first attachment is
+    written, not deferred to Dream."""
     loop = _make_loop(tmp_path, wiki_enabled=True)
     # Deliberately NOT initialising the vault.
 
     media_file = tmp_path / "snippet.txt"
-    media_file.write_text("uninit", encoding="utf-8")
+    media_file.write_text("first content", encoding="utf-8")
     msg = InboundMessage(
         channel="telegram", sender_id="u", chat_id="c", content="x",
         media=[str(media_file)],
@@ -179,8 +184,70 @@ async def test_eager_hook_noop_when_vault_uninitialized(tmp_path: Path) -> None:
 
     await loop._eager_attachment_ingest(msg)
 
-    # No vault dir was created by the hook.
-    assert not (tmp_path / "memory" / "users").exists()
+    page = (
+        tmp_path / "memory" / "users" / vault_slug("unified:default")
+        / "wiki" / "inbox" / "snippet.md"
+    )
+    assert page.exists()
+    assert "first content" in page.read_text(encoding="utf-8")
+
+
+# --- helper: pre-existing vault with old schema -> upgrade + write ----------
+
+
+@pytest.mark.asyncio
+async def test_eager_hook_upgrades_pre_existing_schema_lacking_inbox(
+    tmp_path: Path, _scope_allowed_roots: None
+) -> None:
+    """Regression: production warning observed 2026-05-21 — the eager hook
+    was opening pre-existing vaults without calling ``ensure_initialized()``,
+    so vaults whose SCHEMA.md predates this feature failed every write with
+    'vault schema lacks inbox type' until the next Dream sweep.
+
+    Reproduce the deployed shape: vault dir exists, SCHEMA.md is the OLD
+    4-type bundled form (no ``inbox``). The hook must upgrade the schema
+    via ``_ensure_inbox_type`` (called by ``ensure_initialized``) before
+    the first write."""
+    loop = _make_loop(tmp_path, wiki_enabled=True)
+    slug = vault_slug("unified:default")
+    vault = Vault(tmp_path / "memory" / "users" / slug)
+    vault.wiki_dir.mkdir(parents=True, exist_ok=True)
+    legacy_schema = (
+        "# Wiki Schema\n"
+        "```yaml\n"
+        "types:\n"
+        "  people:    { folder: people,    cold_after_days: 180 }\n"
+        "  projects:  { folder: projects,  cold_after_days: 90 }\n"
+        "  concepts:  { folder: concepts,  cold_after_days: 365 }\n"
+        "  decisions: { folder: decisions, cold_after_days: null }\n"
+        "required_frontmatter: [type, title, status, created, updated, last_touched]\n"
+        "moc_max_lines: 120\n"
+        "```\n"
+    )
+    schema_path = vault.wiki_dir / "SCHEMA.md"
+    schema_path.write_text(legacy_schema, encoding="utf-8")
+
+    media_file = tmp_path / "media" / "telegram" / "AgADdiIAAusacFA.md"
+    media_file.parent.mkdir(parents=True, exist_ok=True)
+    media_file.write_text("real content", encoding="utf-8")
+    msg = InboundMessage(
+        channel="telegram", sender_id="u", chat_id="c", content="here",
+        media=[str(media_file)],
+    )
+
+    await loop._eager_attachment_ingest(msg)
+
+    # Schema was upgraded in place.
+    upgraded = schema_path.read_text(encoding="utf-8")
+    assert "inbox:" in upgraded
+    assert "{ folder: inbox" in upgraded
+    # Old types preserved byte-identically (only the inbox line was added).
+    for old_type in ("people:", "projects:", "concepts:", "decisions:"):
+        assert old_type in upgraded
+    # The page was written.
+    page = vault.wiki_dir / "inbox" / "AgADdiIAAusacFA.md"
+    assert page.exists()
+    assert "real content" in page.read_text(encoding="utf-8")
 
 
 # --- helper: exceptions logged + swallowed ----------------------------------
