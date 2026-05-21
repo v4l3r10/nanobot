@@ -18,6 +18,7 @@ from loguru import logger
 
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.wiki.attachments_reconciler import run_attachments_reconcile
 from nanobot.agent.wiki.ingest import run_ingest
 from nanobot.agent.wiki.lint import run_lint
 from nanobot.agent.wiki.paths import vault_slug
@@ -1509,6 +1510,28 @@ class Dream:
                         # (design H2). Each user's vault locks INDEPENDENTLY
                         # (per-slug lock).
                         async with get_vault_lock(slug):
+                            # Task 4 (attachments-ingest): walk workspace/peer/
+                            # and media/telegram/ and write any new textual
+                            # attachments as inbox/* pages. Idempotent via
+                            # per-vault sha256 manifest. The eager hook in
+                            # AgentLoop (Task 5) has already handled fresh
+                            # deliveries; this catches files that arrived
+                            # out-of-band or while the eager hook was down.
+                            # v1 routing: unified slug only (the reconciler
+                            # walks raw files without sender info; per-user
+                            # fan-out requires sidecar metadata deferred to a
+                            # follow-up). The inner try/except keeps a
+                            # reconciler failure from also skipping Ingest /
+                            # Lint for this slug.
+                            if slug == unified:
+                                try:
+                                    await run_attachments_reconcile(vault, slug)
+                                except Exception:
+                                    logger.exception(
+                                        "attachments reconcile failed for vault "
+                                        "{} (non-fatal — Ingest+Lint proceed)",
+                                        slug,
+                                    )
                             await run_ingest(
                                 vault, slug_batch, self.provider, self.model,
                                 render_template,

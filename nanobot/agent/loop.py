@@ -27,6 +27,7 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.wiki.attachments_writer import write_attachment_page
 from nanobot.agent.wiki.lint import rebuild_indexes_and_moc
 from nanobot.agent.wiki.moc_refresh import take_dirty
 from nanobot.agent.wiki.paths import vault_dir, vault_slug
@@ -34,6 +35,7 @@ from nanobot.agent.wiki.vault import Vault
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.config.paths import get_media_dir, get_workspace_path
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
@@ -875,6 +877,18 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
+            # Eager wiki ingest: fire-and-forget. Never blocks dispatch.
+            # Gated internally by ``self.context.wiki_enabled``. Captures
+            # ``msg.media`` paths the moment a channel publishes them, so the
+            # model doesn't have to "decide" to call wiki_note. The Dream
+            # reconciler (attachments_reconciler.run_attachments_reconcile,
+            # invoked from memory.py) is the
+            # catch-up sweep for files arrived out-of-band or when this hook
+            # failed. The ``if msg.media:`` short-circuit keeps the common
+            # plain-text path zero-cost (no task creation).
+            if msg.media:
+                self._schedule_background(self._eager_attachment_ingest(msg))
+
             raw = msg.content.strip()
             if self.commands.is_priority(raw):
                 await self._dispatch_command_inline(
@@ -1097,6 +1111,79 @@ class AgentLoop:
         task = asyncio.create_task(coro)
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
+
+    async def _eager_attachment_ingest(self, msg: InboundMessage) -> None:
+        """Best-effort: write any files in ``msg.media`` to the wiki as
+        ``inbox`` pages. Scheduled fire-and-forget from :meth:`run`; any
+        exception is logged and swallowed — this MUST NEVER interfere with
+        the agent's message-dispatch path.
+
+        Gated by ``self.context.wiki_enabled`` (the same master switch the
+        Dream cycle and the post-turn MOC refresh use). In v1 every
+        attachment is routed to the **unified** vault (slug
+        ``vault_slug("unified:default")``), symmetric with the Task-4
+        reconciler — per-sender routing arrives once sender→slug metadata
+        is standardized across channels.
+
+        The unified vault's per-slug lock is held for the duration of the
+        writes, sharing serialization with ``wiki_note``, ``run_ingest``,
+        ``run_lint`` and ``_refresh_vault_moc``. ``allowed_roots`` pins the
+        writer's containment check to the workspace + media-dir roots
+        (see :mod:`nanobot.agent.wiki.attachments_writer`).
+
+        Pre-flight invariants — strict no-op when ANY of these holds:
+
+        * ``wiki_enabled`` is off (the master switch);
+        * ``msg.media`` is empty or contains no usable string paths;
+        * the unified vault's ``wiki_dir`` does not exist yet (the wiki was
+          just enabled and Dream hasn't run ``ensure_initialized`` yet —
+          the reconciler will pick the files up on the next sweep).
+        """
+        if not self.context.wiki_enabled:
+            return
+        media = [p for p in (msg.media or []) if isinstance(p, str) and p]
+        if not media:
+            return
+        slug = vault_slug(UNIFIED_SESSION_KEY)
+        try:
+            vault = Vault(vault_dir(Path(self.workspace), UNIFIED_SESSION_KEY))
+            if not vault.wiki_dir.exists():
+                # Vault not yet initialized — Dream's ensure_initialized will
+                # set it up and the reconciler will pick these files up.
+                return
+            allowed_roots = [get_workspace_path(), get_media_dir()]
+            async with get_vault_lock(slug):
+                for raw in media:
+                    p = Path(raw)
+                    if not p.is_file():
+                        continue
+                    # Eager hook msg_id: align with reconciler conventions so
+                    # the same file discovered by either path produces the
+                    # same `Source:` header.
+                    # - peer layout: <workspace>/peer/<msg_subdir>/<file>
+                    #   -> msg_id = <msg_subdir>
+                    # - flat layout: <data>/media/<channel>/<file>
+                    #   -> msg_id = <file stem>
+                    # Heuristic: if the parent directory looks like a
+                    # per-message subdir (i.e. parent's parent's name ==
+                    # msg.channel), use parent.name; else stem.
+                    if p.parent.parent.name == msg.channel:
+                        file_msg_id = p.parent.name
+                    else:
+                        file_msg_id = p.stem
+                    result = write_attachment_page(
+                        vault, slug, p,
+                        channel=msg.channel,
+                        msg_id=file_msg_id,
+                        allowed_roots=allowed_roots,
+                    )
+                    if result.status == "error":
+                        logger.warning(
+                            "eager attachment write error for {}: {}",
+                            p, result.reason,
+                        )
+        except Exception:
+            logger.exception("eager attachment ingest failed (non-fatal)")
 
     async def _refresh_vault_moc(self, session_key: str) -> None:
         """Post-turn: regenerate this vault's _index.md + root MEMORY.md

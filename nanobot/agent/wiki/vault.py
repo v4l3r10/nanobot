@@ -19,6 +19,7 @@ hardcoded ``__file__`` arithmetic, keeping the two in lockstep.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from functools import cached_property
 from pathlib import Path
@@ -40,6 +41,83 @@ _NON_PAGE_NAMES = {"SCHEMA.md", "_index.md"}
 
 # Path component marking the cold archive subtree.
 _COLD_COMPONENT = ".cold"
+
+# Task 6: the line appended by the one-shot inbox-type upgrade. Format
+# (column alignment, inline flow-style mapping) matches the bundled
+# SCHEMA.md so a diff against the master after upgrade is line-for-line
+# clean for the inbox row.
+_INBOX_SCHEMA_LINE = (
+    "  inbox:     { folder: inbox,     cold_after_days: 30 }\n"
+)
+
+# A *type-entry* line inside the ``types:`` mapping: an indented YAML key
+# whose value opens with ``{`` (inline flow-style mapping, the bundled
+# convention). Used both as the idempotence probe ("does an inbox type
+# entry already exist?") and to find the LAST type entry to insert after.
+_TYPE_ENTRY_RE = re.compile(r"^\s+\w+:\s*\{")
+_INBOX_ENTRY_RE = re.compile(r"^\s+inbox:\s*\{", re.MULTILINE)
+# A *top-level* YAML key at column 0 (e.g. ``required_frontmatter:``,
+# ``moc_max_lines:``) -- marks the end of the indented ``types:`` block.
+_TOP_LEVEL_KEY_RE = re.compile(r"^\w+:")
+
+
+def _ensure_inbox_type(schema_path: Path) -> bool:
+    r"""One-shot in-place upgrade: append an 'inbox' type to an old
+    SCHEMA.md that lacks it. Returns True if the file was modified.
+
+    Idempotent: a schema that already contains an indented ``inbox:`` key
+    in inline flow-style short-circuits without writing.
+
+    Preserves all other user content via string-level insertion (no YAML
+    round-trip, so comments and column alignment survive).
+
+    Limitations — these schemas are NOT upgraded; the attachment writer
+    will return an `error` status and the operator must add `inbox`
+    manually:
+
+    * Block-style type definitions (multi-line key/value mappings under
+      ``types:``). The helper looks for inline flow-style ``{ ... }``
+      entries only.
+    * SCHEMA.md authored with ``~~~yaml`` instead of the bundled ``\`\`\`yaml``
+      fence.
+    * Malformed schemas (no yaml fence, no ``types:`` block, no inline
+      type entries) — same conservative no-op behavior.
+
+    The vast majority of vaults — those bootstrapped from the bundled
+    master — match the inline format and upgrade cleanly.
+    """
+    text = schema_path.read_text(encoding="utf-8")
+    if _INBOX_ENTRY_RE.search(text):
+        return False
+    lines = text.splitlines(keepends=True)
+    in_yaml = False
+    in_types = False
+    last_type_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not in_yaml:
+            if stripped == "```yaml":
+                in_yaml = True
+            continue
+        if stripped == "```":
+            break  # closing fence -- end of YAML block
+        if not in_types:
+            if stripped == "types:":
+                in_types = True
+            continue
+        # Inside the ``types:`` block: a type entry vs. another top-level key.
+        if _TYPE_ENTRY_RE.match(line):
+            last_type_idx = i
+        elif _TOP_LEVEL_KEY_RE.match(line):
+            # A top-level YAML key at column 0 closes the types: block.
+            in_types = False
+    if last_type_idx is None:
+        # Malformed or unrecognised layout -- leave it to the parser to
+        # complain at load time rather than corrupt the file here.
+        return False
+    new_lines = lines[: last_type_idx + 1] + [_INBOX_SCHEMA_LINE] + lines[last_type_idx + 1 :]
+    atomic_write_text(schema_path, "".join(new_lines))
+    return True
 
 
 class Vault:
@@ -100,6 +178,13 @@ class Vault:
                 schema_path,
                 _BUNDLED_SCHEMA.read_text(encoding="utf-8"),
             )
+        # Task 6: one-shot upgrade for pre-existing vaults -- append the
+        # ``inbox`` type entry if missing so the attachment writer's
+        # admission gate ("vault schema lacks 'inbox' type") stops
+        # rejecting every eager-hook write against an old vault.
+        # Idempotent: a cheap regex probe inside the helper makes the
+        # second (and every subsequent) call a no-op.
+        _ensure_inbox_type(schema_path)
         if legacy_workspace is not None:
             from nanobot.agent.wiki.migrate import migrate_legacy
 
