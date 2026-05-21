@@ -63,6 +63,7 @@ async def test_spawn_tool_keeps_task_local_context() -> None:
             origin_channel: str,
             origin_chat_id: str,
             session_key: str,
+            memory_key: str | None = None,
             origin_message_id: str | None = None,
         ) -> str:
             seen.append((origin_channel, origin_chat_id, session_key))
@@ -175,6 +176,7 @@ async def test_spawn_tool_basic_set_context_and_execute() -> None:
             origin_channel,
             origin_chat_id,
             session_key,
+            memory_key=None,
             origin_message_id=None,
         ):
             seen.append((origin_channel, origin_chat_id, session_key))
@@ -207,6 +209,7 @@ async def test_spawn_tool_default_values_without_set_context() -> None:
             origin_channel,
             origin_chat_id,
             session_key,
+            memory_key=None,
             origin_message_id=None,
         ):
             seen.append((origin_channel, origin_chat_id, session_key))
