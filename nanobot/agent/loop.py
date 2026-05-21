@@ -87,15 +87,37 @@ class StateTraceEntry:
     error: str | None = None
 
 
-# Set by _run_agent_loop when a turn hit a workspace/SSRF boundary, read by
-# _assemble_outbound to break peer error-loops. A ContextVar (not a tuple/ctx
-# field) so _run_agent_loop's return signature stays 5-tuple — keeping it
-# stable for the upstream tests that unpack it directly — and so concurrent
-# turns on different asyncio tasks never see each other's value. Mirrors the
+# Set by _run_agent_loop when a turn ENDS in a stuck workspace/SSRF boundary
+# state (each violation arms the flag; a subsequent successful tool event
+# clears it — see _compute_peer_violation_active). Read by _assemble_outbound
+# to break peer error-loops. A ContextVar (not a tuple/ctx field) so
+# _run_agent_loop's return signature stays 5-tuple — keeping it stable for the
+# upstream tests that unpack it directly — and so concurrent turns on
+# different asyncio tasks never see each other's value. Mirrors the
 # PeerSayTool._sent_in_turn ContextVar pattern already used in this codebase.
 _PEER_WS_VIOLATION_VAR: ContextVar[bool] = ContextVar(
     "peer_workspace_violation", default=False,
 )
+
+
+def _compute_peer_violation_active(tool_events: list[dict[str, Any]]) -> bool:
+    """True iff the turn ended stuck in a workspace/SSRF boundary state.
+
+    Walks tool_events from the runner: each event whose `detail` starts with
+    "workspace_violation" or "ssrf_violation" arms the flag; each subsequent
+    event with `status == "ok"` clears it. The final value is what the
+    ContextVar holds. Keyed off the runner's structured event taxonomy
+    (_classify_violation writes those detail prefixes) — never inspects LLM
+    output text.
+    """
+    violation_active = False
+    for ev in tool_events:
+        detail = (ev.get("detail") or "")
+        if detail.startswith(("workspace_violation", "ssrf_violation")):
+            violation_active = True
+        elif violation_active and ev.get("status") == "ok":
+            violation_active = False
+    return violation_active
 
 
 @dataclass
@@ -892,23 +914,10 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        # Did this turn end in a stuck workspace/SSRF boundary state? Keyed
-        # off the runner's structured event taxonomy (_classify_violation
-        # writes detail prefixes "workspace_violation: ",
-        # "workspace_violation_escalated: ", "ssrf_violation: ") — not LLM
-        # output text. Each violation arms the flag; a subsequent successful
-        # tool event (status == "ok") clears it (the agent recovered). The
-        # flag's final value is consumed by _assemble_outbound to break peer
-        # error-loops while letting recovered turns through (v0.2.0 no
-        # longer exposes stop_reason == "workspace_violation").
-        violation_active = False
-        for ev in result.tool_events:
-            detail = (ev.get("detail") or "")
-            if detail.startswith(("workspace_violation", "ssrf_violation")):
-                violation_active = True
-            elif violation_active and ev.get("status") == "ok":
-                violation_active = False
-        _PEER_WS_VIOLATION_VAR.set(violation_active)
+        # Stash the recovery-aware violation state for _assemble_outbound to
+        # break peer error-loops while letting recovered turns through
+        # (v0.2.0 no longer exposes stop_reason == "workspace_violation").
+        _PEER_WS_VIOLATION_VAR.set(_compute_peer_violation_active(result.tool_events))
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 
     async def run(self) -> None:

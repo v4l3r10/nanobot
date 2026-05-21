@@ -12,31 +12,19 @@ recovered with relative paths, read 8 files, wrote a wiki note, and
 produced a 3675-char positive review as final_content. The set-once flag
 (pre-CV4) dropped that legitimate response.
 
-These tests target the flag-setter logic that lives inline at
-loop.py:849-852. They build synthetic tool_events lists and assert the
-resulting ContextVar state.
+These tests pin the public-ish helper `_compute_peer_violation_active`
+in `nanobot.agent.loop` (the production setter calls it directly) plus
+the ContextVar wiring invariants.
 """
 
 from __future__ import annotations
 
 import asyncio
 
-from nanobot.agent.loop import _PEER_WS_VIOLATION_VAR
-
-
-# Helper: drive the same logic that loop.py:849-852 runs. Keeping it here
-# as a thin test fixture means we don't have to import a private symbol;
-# if the production code's shape changes (e.g. extracted to a helper),
-# update both call sites together.
-def _compute_violation_active(tool_events: list[dict[str, str]]) -> bool:
-    violation_active = False
-    for ev in tool_events:
-        detail = (ev.get("detail") or "")
-        if detail.startswith(("workspace_violation", "ssrf_violation")):
-            violation_active = True
-        elif violation_active and ev.get("status") == "ok":
-            violation_active = False
-    return violation_active
+from nanobot.agent.loop import (
+    _PEER_WS_VIOLATION_VAR,
+    _compute_peer_violation_active,
+)
 
 
 def _ok(name: str = "exec") -> dict[str, str]:
@@ -53,50 +41,50 @@ def _error(name: str = "read", reason: str = "file not found") -> dict[str, str]
 
 class TestFlagLogic:
     def test_no_events_flag_false(self):
-        assert _compute_violation_active([]) is False
+        assert _compute_peer_violation_active([]) is False
 
     def test_only_ok_events_flag_false(self):
-        assert _compute_violation_active([_ok(), _ok(), _ok()]) is False
+        assert _compute_peer_violation_active([_ok(), _ok(), _ok()]) is False
 
     def test_single_violation_no_recovery_flag_true(self):
-        assert _compute_violation_active([_violation()]) is True
+        assert _compute_peer_violation_active([_violation()]) is True
 
     def test_violation_then_ok_flag_false(self):
         # The 2026-05-21 Umanio regression case in its minimal form.
-        assert _compute_violation_active([_violation(), _ok()]) is False
+        assert _compute_peer_violation_active([_violation(), _ok()]) is False
 
     def test_multiple_violations_then_ok_flag_false(self):
         events = [_violation(), _violation(), _ok(), _ok()]
-        assert _compute_violation_active(events) is False
+        assert _compute_peer_violation_active(events) is False
 
     def test_only_violations_flag_true(self):
         events = [_violation(), _violation(), _violation()]
-        assert _compute_violation_active(events) is True
+        assert _compute_peer_violation_active(events) is True
 
     def test_recovery_then_re_violation_flag_true(self):
         # Agent recovered, then tripped another policy boundary at end of turn.
         # Conservative choice: end-of-turn state wins, suppress.
         events = [_violation(), _ok(), _violation()]
-        assert _compute_violation_active(events) is True
+        assert _compute_peer_violation_active(events) is True
 
     def test_recovery_then_unrelated_error_flag_false(self):
         # Non-violation error after a successful recovery does NOT re-arm.
         # The agent is operating; the failure is honest local error, not
         # a policy-loop narrative.
         events = [_violation(), _ok(), _error()]
-        assert _compute_violation_active(events) is False
+        assert _compute_peer_violation_active(events) is False
 
     def test_ssrf_violation_treated_same_as_workspace(self):
-        assert _compute_violation_active([_violation(kind="ssrf_violation")]) is True
-        assert _compute_violation_active([_violation(kind="ssrf_violation"), _ok()]) is False
+        assert _compute_peer_violation_active([_violation(kind="ssrf_violation")]) is True
+        assert _compute_peer_violation_active([_violation(kind="ssrf_violation"), _ok()]) is False
 
     def test_workspace_violation_escalated_prefix_arms_flag(self):
         ev = {"name": "exec", "status": "error", "detail": "workspace_violation_escalated: repeated"}
-        assert _compute_violation_active([ev]) is True
+        assert _compute_peer_violation_active([ev]) is True
 
     def test_missing_detail_is_safe(self):
         ev = {"name": "exec", "status": "error"}
-        assert _compute_violation_active([ev]) is False
+        assert _compute_peer_violation_active([ev]) is False
 
     def test_real_umanio_shape_2026_05_21(self):
         # Approximation of the actual incident: two absolute-path exec
@@ -116,7 +104,7 @@ class TestFlagLogic:
             _ok(name="read"),
             _ok(name="wiki_write"),
         ]
-        assert _compute_violation_active(events) is False
+        assert _compute_peer_violation_active(events) is False
 
 
 # --------------------------------------------------------------------------
@@ -142,9 +130,9 @@ class TestContextVarWiring:
             _PEER_WS_VIOLATION_VAR.reset(token)
 
     def test_concurrent_tasks_isolated(self):
-        # Pins the ContextVar invariant already implied by the comment at
-        # loop.py:91-98: concurrent turns on different asyncio tasks must
-        # not see each other's flag.
+        # Pins the ContextVar invariant already implied by the
+        # _PEER_WS_VIOLATION_VAR declaration comment: concurrent turns on
+        # different asyncio tasks must not see each other's flag.
         async def run():
             async def setter(value: bool, observed: list[bool]):
                 _PEER_WS_VIOLATION_VAR.set(value)
