@@ -139,12 +139,23 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        memory_key: str | None = None,
         origin_message_id: str | None = None,
     ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+        """Spawn a subagent to execute a task in the background.
+
+        CV2: ``memory_key`` is the parent's vault key. Subagents inherit it
+        so any wiki read/write they perform lands in the same vault as the
+        parent (back-compat default: equals session_key when None).
+        """
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
-        origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
+        origin = {
+            "channel": origin_channel,
+            "chat_id": origin_chat_id,
+            "session_key": session_key,
+            "memory_key": memory_key,
+        }
 
         status = SubagentStatus(
             task_id=task_id,
@@ -199,6 +210,9 @@ class SubagentManager:
             ]
 
             sess_key = origin.get("session_key")
+            # CV2: inherit parent's memory/vault key; fallback to sess_key for
+            # back-compat when the parent didn't carry one.
+            mem_key = origin.get("memory_key") or sess_key
             llm_timeout = (
                 self._llm_wall_timeout_for_session(sess_key)
                 if self._llm_wall_timeout_for_session
@@ -216,6 +230,7 @@ class SubagentManager:
                 fail_on_tool_error=True,
                 checkpoint_callback=_on_checkpoint,
                 session_key=sess_key,
+                memory_key=mem_key,
                 llm_timeout_s=llm_timeout,
             ))
             status.phase = "done"

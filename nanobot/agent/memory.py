@@ -586,6 +586,7 @@ class Consolidator:
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
         consolidation_ratio: float = 0.5,
+        memory_key_resolver: Callable[["Session"], str] | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -596,9 +597,23 @@ class Consolidator:
         self.consolidation_ratio = consolidation_ratio
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        # CV2: optional resolver mapping Session → vault/memory key.
+        # When None (pre-CV2), every callsite that consolidates uses
+        # ``session.key`` verbatim — back-compat. When provided (typically
+        # by AgentLoop), the resolver collapses to UNIFIED_SESSION_KEY
+        # under ``unified_memory=true`` so per-user chat sessions can share
+        # a single memory vault.
+        self._memory_key_resolver = memory_key_resolver
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
+
+    def _resolve_memory_key(self, session: "Session") -> str:
+        """CV2: return the memory/vault key for *session*, falling back to
+        ``session.key`` when no resolver is configured (pre-CV2 behaviour)."""
+        if self._memory_key_resolver is not None:
+            return self._memory_key_resolver(session)
+        return session.key
 
     def set_provider(
         self,
@@ -704,7 +719,9 @@ class Consolidator:
         # Task 7.2: thread the EFFECTIVE session key (session.key — unified
         # or channel:chat_id) so Dream routes this user's consolidated
         # memory into THAT user's per-user vault.
-        summary = await self.archive(chunk, session_key=session.key)
+        # CV2: under unified_memory=true the resolver collapses to
+        # UNIFIED_SESSION_KEY so the shared vault receives consolidation.
+        summary = await self.archive(chunk, session_key=self._resolve_memory_key(session))
         session.last_consolidated = end_idx
         self.sessions.save(session)
         return summary
@@ -744,6 +761,7 @@ class Consolidator:
             session_summary=summary,
             session_metadata=session.metadata,
             session_key=session.key,
+            memory_key=self._resolve_memory_key(session),  # CV2
         )
         return estimate_prompt_tokens_chain(
             self.provider,
@@ -896,7 +914,9 @@ class Consolidator:
                 )
                 # Task 7.2: thread the EFFECTIVE session key for per-user
                 # vault routing (see _consolidate_replay_overflow).
-                summary = await self.archive(chunk, session_key=session.key)
+                # CV2: resolver collapses to UNIFIED_SESSION_KEY under
+                # unified_memory=true (shared vault).
+                summary = await self.archive(chunk, session_key=self._resolve_memory_key(session))
                 # Advance the cursor either way: on success the chunk was
                 # summarized; on failure archive() already raw-archived it as
                 # a breadcrumb. Re-archiving the same chunk on the next call

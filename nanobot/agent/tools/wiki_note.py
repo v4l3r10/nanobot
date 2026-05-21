@@ -256,7 +256,14 @@ class WikiNoteTool(_FsTool, ContextAware):
         return _FsTool.create.__func__(cls, ctx)
 
     def set_context(self, ctx: RequestContext) -> None:
-        self._session_key_var.set(ctx.session_key or f"{ctx.channel}:{ctx.chat_id}")
+        # CV2: prefer memory_key (vault routing) over session_key (chat
+        # routing). Back-compat: when memory_key is None (pre-CV2 callers),
+        # behaviour is identical to the original.
+        # Note: this ContextVar is named _session_key_var for historical
+        # reasons but semantically holds the *vault* key — rename rimandato
+        # a una PR di pulizia successiva (vedi UNIFIED_MEMORY_PLAN.md §10).
+        vault_key = ctx.memory_key or ctx.session_key or f"{ctx.channel}:{ctx.chat_id}"
+        self._session_key_var.set(vault_key)
 
     def _session_key(self) -> str:
         return self._session_key_var.get()
