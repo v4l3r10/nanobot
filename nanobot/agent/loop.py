@@ -1151,10 +1151,14 @@ class AgentLoop:
         Pre-flight invariants — strict no-op when ANY of these holds:
 
         * ``wiki_enabled`` is off (the master switch);
-        * ``msg.media`` is empty or contains no usable string paths;
-        * the unified vault's ``wiki_dir`` does not exist yet (the wiki was
-          just enabled and Dream hasn't run ``ensure_initialized`` yet —
-          the reconciler will pick the files up on the next sweep).
+        * ``msg.media`` is empty or contains no usable string paths.
+
+        ``vault.ensure_initialized()`` runs inside the per-vault lock (no
+        ``legacy_workspace`` — isolation, same as :meth:`_refresh_vault_moc`)
+        so that vaults created before this feature shipped get their
+        SCHEMA.md upgraded with the ``inbox`` type before the first write;
+        otherwise every eager write would fail with "vault schema lacks
+        'inbox' type" until the next Dream sweep.
         """
         if not self.context.wiki_enabled:
             return
@@ -1164,12 +1168,9 @@ class AgentLoop:
         slug = vault_slug(UNIFIED_SESSION_KEY)
         try:
             vault = Vault(vault_dir(Path(self.workspace), UNIFIED_SESSION_KEY))
-            if not vault.wiki_dir.exists():
-                # Vault not yet initialized — Dream's ensure_initialized will
-                # set it up and the reconciler will pick these files up.
-                return
             allowed_roots = [get_workspace_path(), get_media_dir()]
             async with get_vault_lock(slug):
+                vault.ensure_initialized()  # NO legacy_workspace (isolation)
                 for raw in media:
                     p = Path(raw)
                     if not p.is_file():
