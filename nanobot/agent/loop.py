@@ -892,16 +892,23 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        # Did this turn hit a workspace/SSRF boundary? Keyed off the runner's
-        # own structured event taxonomy (_classify_violation writes detail
-        # prefixes "workspace_violation: ", "workspace_violation_escalated: ",
-        # "ssrf_violation: ") — not LLM output text. Consumed by
-        # _assemble_outbound to break peer error-loops (v0.2.0 no longer
-        # exposes stop_reason == "workspace_violation").
-        _PEER_WS_VIOLATION_VAR.set(any(
-            (ev.get("detail") or "").startswith(("workspace_violation", "ssrf_violation"))
-            for ev in result.tool_events
-        ))
+        # Did this turn end in a stuck workspace/SSRF boundary state? Keyed
+        # off the runner's structured event taxonomy (_classify_violation
+        # writes detail prefixes "workspace_violation: ",
+        # "workspace_violation_escalated: ", "ssrf_violation: ") — not LLM
+        # output text. Each violation arms the flag; a subsequent successful
+        # tool event (status == "ok") clears it (the agent recovered). The
+        # flag's final value is consumed by _assemble_outbound to break peer
+        # error-loops while letting recovered turns through (v0.2.0 no
+        # longer exposes stop_reason == "workspace_violation").
+        violation_active = False
+        for ev in result.tool_events:
+            detail = (ev.get("detail") or "")
+            if detail.startswith(("workspace_violation", "ssrf_violation")):
+                violation_active = True
+            elif violation_active and ev.get("status") == "ok":
+                violation_active = False
+        _PEER_WS_VIOLATION_VAR.set(violation_active)
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 
     async def run(self) -> None:
