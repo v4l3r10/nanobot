@@ -19,6 +19,10 @@ from nanobot.utils.atomic import atomic_write_text
 
 _MANIFEST = "manifest.json"
 _VECTORS = "vectors.npy"
+# Manifest layout tag. Bump this whenever the on-disk format changes: load()
+# treats any other value (incl. a pre-multichunk manifest with no layout key) as
+# stale and forces a clean rebuild — that IS the migration mechanism.
+_LAYOUT = "chunk-v1"
 
 
 def body_hash(text: str) -> str:
@@ -26,7 +30,13 @@ def body_hash(text: str) -> str:
 
 
 class EmbeddingStore:
-    """Persists [N, dim] float32 doc vectors + a content-hash manifest."""
+    """Persists [N_chunks, dim] float32 chunk vectors + a page-grouped manifest.
+
+    Layout ``chunk-v1``: ``vectors.npy`` holds one row per CHUNK; the manifest
+    holds one entry per PAGE — ``{slug, sha256, chunks}`` — and a page's chunk
+    rows are contiguous in manifest order, so offsets are a prefix-sum over the
+    ``chunks`` counts (no explicit row indices stored).
+    """
 
     def __init__(self, wiki_dir: Path, model: str, dim: int) -> None:
         self.dir = Path(wiki_dir) / ".embeddings"
@@ -41,6 +51,10 @@ class EmbeddingStore:
             manifest = json.loads(mpath.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             return {}, None
+        # Layout guard: a pre-multichunk manifest (no/old layout) is stale → the
+        # caller rebuilds from scratch next Dream. This replaces a migration.
+        if manifest.get("layout") != _LAYOUT:
+            return {}, None
         # Model/dim identity guard: stale vectors of the wrong shape are useless.
         if manifest.get("model") != self.model or manifest.get("dim") != self.dim:
             return {}, None
@@ -48,10 +62,12 @@ class EmbeddingStore:
             vectors = np.load(vpath)
         except (ValueError, OSError):
             return {}, None
-        # Shape guard: row count must match the manifest, and the column count
-        # must match the configured dim. A partial overwrite that left a
-        # wrong-shaped array on disk is treated as corrupt → full rebuild.
-        if vectors.ndim != 2 or vectors.shape[0] != len(manifest.get("entries", [])):
+        # Shape guard: total chunk-row count must equal the sum of the per-page
+        # chunk counts, and the column count must match the configured dim. A
+        # partial overwrite that left a wrong-shaped array on disk is treated as
+        # corrupt → full rebuild.
+        total_chunks = sum(int(e.get("chunks", 0)) for e in manifest.get("entries", []))
+        if vectors.ndim != 2 or vectors.shape[0] != total_chunks:
             return {}, None
         if vectors.shape[1] != self.dim:
             return {}, None
@@ -63,13 +79,17 @@ class EmbeddingStore:
         deleted = [rel for rel in prev if rel not in current]
         return new, deleted
 
-    def save(self, entries: list[tuple[str, str]], vectors: "np.ndarray") -> None:
+    def save(self, entries: list[tuple[str, str, int]], vectors: "np.ndarray") -> None:
+        """Persist chunk vectors + manifest. ``entries`` is page-grouped:
+        ``(slug, sha256, n_chunks)`` in the same order as the chunk blocks were
+        stacked into ``vectors`` ([N_chunks, dim])."""
         self.dir.mkdir(parents=True, exist_ok=True)
         manifest = {
             "model": self.model,
             "dim": self.dim,
-            "entries": [{"slug": rel, "sha256": h, "row": i}
-                        for i, (rel, h) in enumerate(entries)],
+            "layout": _LAYOUT,
+            "entries": [{"slug": rel, "sha256": h, "chunks": int(n)}
+                        for rel, h, n in entries],
         }
         # np.save appends ".npy" to any path not already ending in ".npy"
         # (true even when the path has a different extension like ".tmp"),
@@ -177,18 +197,18 @@ def _chunk_text(text: str) -> list[str]:
     return [text[i:i + _CHUNK_CHARS] for i in range(0, len(text), _CHUNK_CHARS)]
 
 
-def embed_texts(texts, model_name: str) -> "np.ndarray":
-    """Embed a list of strings → float32 [N, dim] ndarray. Requires fastembed.
+def embed_texts_chunked(texts, model_name: str) -> "list[np.ndarray]":
+    """Embed a list of strings → one ``[n_chunks, dim]`` float32 matrix each.
 
-    Long inputs are split into <=_CHUNK_CHARS windows, embedded in small
-    batches, and mean-pooled (then L2-normalized) into one vector per input, so
-    no content is dropped and per-pass attention memory stays bounded. A
-    single-chunk input is unchanged (mean of one already-unit vector = itself).
+    Each input is split into <=_CHUNK_CHARS windows (``_chunk_text``); all chunks
+    across all inputs are flattened into one stream so fastembed batches across
+    pages, then folded back per input via the recorded chunk counts. The chunk
+    vectors are returned AS THE MODEL EMITS THEM (Granite already L2-normalizes);
+    no pooling — that is the multichunk representation. Per-pass attention memory
+    stays bounded because only short chunks are ever embedded.
     """
     model = _get_model(model_name)
     texts = list(texts)
-    # Flatten every page's chunks into one stream so fastembed batches across
-    # pages, then fold back per page via the recorded chunk counts.
     flat_chunks: list[str] = []
     counts: list[int] = []
     for t in texts:
@@ -196,11 +216,28 @@ def embed_texts(texts, model_name: str) -> "np.ndarray":
         counts.append(len(cs))
         flat_chunks.extend(cs)
     vecs = np.array(list(model.embed(flat_chunks, batch_size=_EMBED_BATCH)), dtype="float32")
-    out = np.empty((len(texts), vecs.shape[1]), dtype="float32")
+    blocks: list[np.ndarray] = []
     pos = 0
-    for i, c in enumerate(counts):
-        pooled = vecs[pos:pos + c].mean(axis=0)
+    for c in counts:
+        blocks.append(vecs[pos:pos + c])
         pos += c
+    return blocks
+
+
+def embed_texts(texts, model_name: str) -> "np.ndarray":
+    """Embed a list of strings → float32 [N, dim] ndarray. Requires fastembed.
+
+    The mean-pool representation: one vector per input, built by L2-normalizing
+    the mean of that input's chunk vectors (``embed_texts_chunked``) so no
+    content is dropped and the result is unit-length. A single-chunk input is
+    unchanged (mean of one already-unit vector = itself). This is the legacy /
+    back-compat path; the dense tier now persists the multichunk blocks.
+    """
+    blocks = embed_texts_chunked(texts, model_name)
+    dim = blocks[0].shape[1] if blocks else 0
+    out = np.empty((len(blocks), dim), dtype="float32")
+    for i, block in enumerate(blocks):
+        pooled = block.mean(axis=0)
         # Granite emits L2-normalized vectors; the mean of unit vectors is NOT
         # unit-length, so renormalize to keep cosine == dot product downstream.
         norm = float(np.linalg.norm(pooled)) or 1.0
@@ -250,17 +287,66 @@ def cosine_ranking(query_vec, doc_vectors, rels) -> list[tuple[str, int]]:
     return [(rels[i], rank + 1) for rank, i in enumerate(order)]
 
 
-class DenseRanker:
-    """Holds persisted doc vectors + the model name; embeds queries on demand."""
+def chunk_max_ranking(query_vec, chunk_vectors, offsets, slugs) -> list[tuple[str, int]]:
+    """Rank pages by their BEST-matching chunk (max-pool multi-vector retrieval).
 
-    def __init__(self, rels: list[str], doc_vectors: "np.ndarray", model: str) -> None:
-        self.rels = rels
-        self.doc_vectors = doc_vectors
+    ``chunk_vectors`` is ``[N_chunks, dim]`` with each page's chunk rows stored
+    contiguously; ``offsets[i]`` is the start row of page ``i`` and ``slugs[i]``
+    its relpath (``len(offsets) == len(slugs) == N_pages``). Cosine of the query
+    vs every chunk, then a per-page segment-max (``np.maximum.reduceat`` over the
+    offsets) collapses to one score per page. Returns ``[(slug, rank), ...]``
+    1-based, best first, deterministic slug-asc tiebreak — the SAME shape as
+    ``cosine_ranking`` so RRF/``search`` are untouched. Zero-norm chunk vectors
+    are handled without dividing by zero."""
+    if chunk_vectors is None or len(slugs) == 0:
+        return []
+    q = query_vec.astype("float32")
+    qn = q / (float(np.linalg.norm(q)) or 1.0)
+    docs = chunk_vectors.astype("float32")
+    norms = np.linalg.norm(docs, axis=1)
+    norms[norms == 0] = 1.0
+    sims = (docs / norms[:, None]) @ qn                 # [N_chunks]
+    offs = np.asarray(offsets, dtype=np.intp)
+    page_sims = np.maximum.reduceat(sims, offs)         # [N_pages], best chunk/page
+    order = sorted(range(len(slugs)), key=lambda i: (-float(page_sims[i]), slugs[i]))
+    return [(slugs[i], rank + 1) for rank, i in enumerate(order)]
+
+
+class DenseRanker:
+    """Holds persisted per-chunk vectors + page offsets; embeds queries on demand.
+
+    The dense tier is multichunk: ``chunk_vectors`` is ``[N_chunks, dim]`` with
+    each page's rows contiguous, ``offsets``/``slugs`` are page-aligned (one entry
+    per page). ``rank`` embeds the query to a single vector and max-pools per page.
+    """
+
+    def __init__(self, slugs: list[str], offsets: list[int],
+                 chunk_vectors: "np.ndarray", model: str) -> None:
+        self.slugs = slugs
+        self.offsets = offsets
+        self.chunk_vectors = chunk_vectors
         self.model = model
 
     def rank(self, query: str) -> list[tuple[str, int]]:
         qv = embed_texts([query], self.model)[0]
-        return cosine_ranking(qv, self.doc_vectors, self.rels)
+        return chunk_max_ranking(qv, self.chunk_vectors, self.offsets, self.slugs)
+
+
+def _expand_pages(entries: list[dict]) -> tuple[list[str], list[int]]:
+    """Page-aligned (slugs, offsets) from chunk-v1 manifest entries.
+
+    ``offsets[i]`` is the first chunk row of page ``i`` — a prefix-sum over the
+    per-page ``chunks`` counts, valid because a page's chunk rows are stored
+    contiguously in manifest order.
+    """
+    slugs: list[str] = []
+    offsets: list[int] = []
+    off = 0
+    for e in entries:
+        slugs.append(e["slug"])
+        offsets.append(off)
+        off += int(e.get("chunks", 0))
+    return slugs, offsets
 
 
 def load_dense_ranker(wiki_dir: Path, model: str | None = None) -> "DenseRanker | None":
@@ -290,8 +376,8 @@ def load_dense_ranker(wiki_dir: Path, model: str | None = None) -> "DenseRanker 
     loaded, vectors = store.load()
     if vectors is None:
         return None
-    rels = [e["slug"] for e in loaded.get("entries", [])]
-    return DenseRanker(rels, vectors, use_model)
+    slugs, offsets = _expand_pages(loaded.get("entries", []))
+    return DenseRanker(slugs, offsets, vectors, use_model)
 
 
 def _doc_text(page) -> str:
@@ -317,13 +403,15 @@ def refresh_embeddings(vault, model: str) -> None:
 
         # Peek the existing manifest (no dim needed) to compute the delta and
         # decide whether any embedding work is required at all — so an
-        # up-to-date vault triggers neither a model load nor a write.
+        # up-to-date vault triggers neither a model load nor a write. A manifest
+        # with a DIFFERENT model OR an old layout is ignored here, so its pages
+        # all count as "new" → full rebuild into chunk-v1 (the migration path).
         mpath = Path(vault.wiki_dir) / ".embeddings" / _MANIFEST
         prev_manifest: dict = {}
         if mpath.is_file():
             try:
                 m = json.loads(mpath.read_text(encoding="utf-8"))
-                if m.get("model") == model:
+                if m.get("model") == model and m.get("layout") == _LAYOUT:
                     prev_manifest = m
             except (ValueError, OSError):
                 prev_manifest = {}
@@ -333,27 +421,35 @@ def refresh_embeddings(vault, model: str) -> None:
         if not new and not deleted:
             return
 
-        dim = prev_manifest.get("dim") or int(embed_texts(["x"], model).shape[1])
+        dim = prev_manifest.get("dim") or int(embed_texts_chunked(["x"], model)[0].shape[1])
         store = EmbeddingStore(vault.wiki_dir, model=model, dim=dim)
         _, old_vectors = store.load()
-        if old_vectors is None:
-            old_rows: dict = {}
-            to_embed = sorted(current)            # corrupt/missing → full rebuild
-        else:
-            old_rows = {e["slug"]: e["row"] for e in prev_manifest.get("entries", [])}
-            to_embed = [rel for rel in sorted(current) if prev.get(rel) != current[rel]]
+        # Old per-page chunk blocks, keyed by slug, for byte-identical reuse of
+        # unchanged pages. ``_expand_pages`` gives each page's [offset, +chunks).
+        old_blocks: dict = {}
+        if old_vectors is not None:
+            old_slugs, old_offsets = _expand_pages(prev_manifest.get("entries", []))
+            old_counts = {e["slug"]: int(e["chunks"]) for e in prev_manifest.get("entries", [])}
+            for slug, off in zip(old_slugs, old_offsets):
+                old_blocks[slug] = old_vectors[off:off + old_counts[slug]]
+        # A page is re-embedded iff its hash changed (or there is no reusable
+        # block for it); everything else reuses its old block.
+        to_embed = [rel for rel in sorted(current)
+                    if prev.get(rel) != current[rel] or rel not in old_blocks]
 
         embedded: dict = {}
         if to_embed:
-            mat = embed_texts([_doc_text(pages[rel]) for rel in to_embed], model)
-            embedded = {rel: mat[i] for i, rel in enumerate(to_embed)}
+            blocks = embed_texts_chunked([_doc_text(pages[rel]) for rel in to_embed], model)
+            embedded = {rel: blocks[i] for i, rel in enumerate(to_embed)}
 
+        # Rebuild the full matrix block-by-block in sorted-slug order so each
+        # page's chunk rows stay contiguous (offsets = prefix-sum over chunks).
         rows = []
         entries = []
         for rel in sorted(current):
-            vec = embedded[rel] if rel in embedded else old_vectors[old_rows[rel]]
-            rows.append(vec)
-            entries.append((rel, current[rel]))
+            block = embedded[rel] if rel in embedded else old_blocks[rel]
+            rows.append(block)
+            entries.append((rel, current[rel], block.shape[0]))
         matrix = np.vstack(rows).astype("float32") if rows else np.zeros((0, dim), "float32")
         store.save(entries=entries, vectors=matrix)
     except Exception:

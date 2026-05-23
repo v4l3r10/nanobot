@@ -1,8 +1,11 @@
 # Wiki Search — Multichunk (Multi-Vector, Chunk-Level) Dense Retrieval — Design
 
-**Status:** design validated (brainstorming closed, 2026-05-23). NOT scheduled
-for implementation — "design on paper" only; implement/skip to be decided later
-against the success metric below.
+**Status:** IMPLEMENTED (2026-05-23) in `nanobot/agent/wiki/embeddings.py`
+(+ `tests/agent/wiki/test_embeddings.py`), TDD. Dense-tier-internal: BM25, RRF,
+`search()`, and `_do_search` were not touched; the manifest moved to layout
+`chunk-v1` (old manifests are treated as stale → clean rebuild on the next
+Dream). The success metric below is now a *post-hoc* validation (measure the
+real-vault MRR/recall@k gain on the long tail), not a go/no-go gate.
 
 **Goal:** Evolve the dense tier from one mean-pooled vector per page to N vectors
 per page (one per chunk), matching queries against the **best chunk** (max-pool)
