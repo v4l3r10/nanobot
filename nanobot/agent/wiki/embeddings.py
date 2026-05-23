@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -77,3 +78,86 @@ class EmbeddingStore:
         os.replace(tmp, self.dir / _VECTORS)
         atomic_write_text(self.dir / _MANIFEST,
                           json.dumps(manifest, ensure_ascii=False, indent=2))
+
+
+def _import_text_embedding():
+    """Return fastembed's TextEmbedding class, or None if unavailable.
+
+    Isolated + monkeypatchable so the dense tier degrades gracefully (callers
+    fall back to BM25-only) when the optional ``nanobot[wiki-search]`` extra
+    is not installed.
+    """
+    try:
+        from fastembed import TextEmbedding
+    except Exception:
+        return None
+    return TextEmbedding
+
+
+@lru_cache(maxsize=2)
+def _get_model(model_name: str):
+    cls = _import_text_embedding()
+    if cls is None:
+        raise RuntimeError("fastembed is not installed")
+    return cls(model_name=model_name)
+
+
+def embed_texts(texts, model_name: str) -> "np.ndarray":
+    """Embed a list of strings → float32 [N, dim] ndarray. Requires fastembed."""
+    model = _get_model(model_name)
+    return np.array(list(model.embed(list(texts))), dtype="float32")
+
+
+def cosine_ranking(query_vec, doc_vectors, rels) -> list[tuple[str, int]]:
+    """Rank docs by cosine similarity to the query. Returns [(rel, rank), ...]
+    1-based, best first, deterministic relpath-asc tiebreak. Zero-norm vectors
+    are handled without dividing by zero."""
+    if doc_vectors is None or len(rels) == 0:
+        return []
+    q = query_vec.astype("float32")
+    qn = q / (float(np.linalg.norm(q)) or 1.0)
+    docs = doc_vectors.astype("float32")
+    norms = np.linalg.norm(docs, axis=1)
+    norms[norms == 0] = 1.0
+    sims = (docs / norms[:, None]) @ qn
+    order = sorted(range(len(rels)), key=lambda i: (-float(sims[i]), rels[i]))
+    return [(rels[i], rank + 1) for rank, i in enumerate(order)]
+
+
+class DenseRanker:
+    """Holds persisted doc vectors + the model name; embeds queries on demand."""
+
+    def __init__(self, rels: list[str], doc_vectors: "np.ndarray", model: str) -> None:
+        self.rels = rels
+        self.doc_vectors = doc_vectors
+        self.model = model
+
+    def rank(self, query: str) -> list[tuple[str, int]]:
+        qv = embed_texts([query], self.model)[0]
+        return cosine_ranking(qv, self.doc_vectors, self.rels)
+
+
+def load_dense_ranker(wiki_dir: Path, model: str) -> "DenseRanker | None":
+    """Build a DenseRanker from persisted vectors, or None to degrade to BM25.
+
+    Returns None when: fastembed is unavailable, no persisted vectors exist,
+    the manifest is unreadable, or the persisted vectors were built for a
+    DIFFERENT model (stale until the next Dream refresh re-embeds).
+    """
+    if _import_text_embedding() is None:
+        return None
+    mpath = Path(wiki_dir) / ".embeddings" / _MANIFEST
+    if not mpath.is_file():
+        return None
+    try:
+        manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    if manifest.get("model") != model:
+        return None
+    store = EmbeddingStore(Path(wiki_dir), model=model, dim=manifest.get("dim"))
+    loaded, vectors = store.load()
+    if vectors is None:
+        return None
+    rels = [e["slug"] for e in loaded.get("entries", [])]
+    return DenseRanker(rels, vectors, model)
