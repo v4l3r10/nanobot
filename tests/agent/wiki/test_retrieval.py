@@ -26,3 +26,12 @@ def test_bm25_ranks_exact_term_first():
 
 def test_bm25_empty_query_returns_empty():
     assert bm25_ranking({"a.md": "x"}, []) == []
+
+
+def test_bm25_ties_break_by_relpath_ascending():
+    # Identical bodies + identical query term → identical scores; the spec
+    # requires a deterministic relpath-ascending tiebreak.
+    corpus = {"b/p.md": "logistica", "a/p.md": "logistica", "c/p.md": "logistica"}
+    ranking = bm25_ranking(corpus, tokenize("logistica"))
+    assert [rel for rel, _ in ranking] == ["a/p.md", "b/p.md", "c/p.md"]
+    assert [rank for _, rank in ranking] == [1, 2, 3]
