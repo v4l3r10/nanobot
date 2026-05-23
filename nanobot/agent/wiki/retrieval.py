@@ -88,3 +88,47 @@ def rrf_fuse(
             scores[rel] = scores.get(rel, 0.0) + 1.0 / (k_rrf + rank)
     # Tie-break by relpath asc for determinism.
     return [rel for rel, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def _load_dense_ranker(vault, model):
+    """Lazily load the optional dense ranker; None when unavailable.
+
+    The import is INSIDE this function so importing this module never pulls
+    numpy/fastembed — the always-on lexical core stays dependency-free.
+    """
+    if not model:
+        return None
+    try:
+        from nanobot.agent.wiki.embeddings import load_dense_ranker
+    except Exception:
+        return None
+    try:
+        return load_dense_ranker(vault.wiki_dir, model)
+    except Exception:
+        return None
+
+
+def search(vault, query, k=20, model=None):
+    """Hybrid ranked search → ordered ``list[(relpath, Page)]`` (best first).
+
+    ``model`` None / dense unavailable → pure BM25 via the same RRF path.
+    The caller (``_do_search``) owns the empty-query and ``tag:`` branches;
+    ``search`` is only the keyword branch and returns ``[]`` for an empty query
+    or an empty vault.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    pages = {rel: page for rel, page in vault.iter_pages(include_cold=True)}
+    if not pages:
+        return []
+    corpus = {rel: f"{p.title}\n{p.body}" for rel, p in pages.items()}
+    rankings = [bm25_ranking(corpus, tokenize(q))]
+    dense = _load_dense_ranker(vault, model)
+    if dense is not None:
+        try:
+            rankings.append(dense.rank(q))
+        except Exception:
+            pass  # best-effort: a query-embed failure degrades to BM25 for this call
+    fused = rrf_fuse(rankings, k_rrf=60)
+    return [(rel, pages[rel]) for rel in fused[:k] if rel in pages]
