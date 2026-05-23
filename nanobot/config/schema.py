@@ -91,6 +91,17 @@ class DreamConfig(Base):
     # Master gate for the wiki-tree memory subsystem (Ingest/Lint + MOC context
     # injection). Default off so a stock install is byte-identical to v0.2.0.
     wiki_enabled: bool = False
+    # Optional dense semantic tier for wiki_note search. Requires the
+    # nanobot[wiki-search] extra (fastembed). Off by default — BM25 lexical
+    # search always works without it. When on, Dream embeds wiki pages and
+    # search fuses BM25 + cosine via RRF.
+    wiki_embeddings: bool = False
+    # fastembed model id for the dense tier. Configurable so 97M/107M/311M
+    # variants swap without code changes (dim is read from the model).
+    # NOTE: confirm this exact id against fastembed's supported-model registry
+    # when first enabling the extra; a wrong/absent id degrades gracefully to
+    # BM25-only (load fails → None).
+    wiki_embedding_model: str = "ibm-granite/granite-embedding-107m-multilingual"
     lint_cadence_h: int | None = Field(default=None, ge=1)  # None => use interval_h
 
     def build_schedule(self, timezone: str) -> CronSchedule:
