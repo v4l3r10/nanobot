@@ -464,6 +464,59 @@ class TestDreamWikiEnabled:
         assert alice.is_file()
 
 
+# --- Task 7: Dream-time embedding refresh (dense tier optional) -------------
+
+
+class TestDreamWikiEmbeddingsRefresh:
+    """With ``dream.wiki_embeddings = True`` but fastembed stubbed OFF, the
+    Dream cycle must complete normally: Ingest+Lint still run, NO ``.embeddings/``
+    dir is created (refresh_embeddings is a clean no-op without fastembed)."""
+
+    async def test_embeddings_refresh_noop_without_fastembed(
+        self, dream, mock_provider, mock_runner, store, monkeypatch,
+    ):
+        """Flag on, fastembed off → cycle completes, Ingest wrote alice.md,
+        and no embeddings artifacts exist. Mirrors
+        ::test_wiki_enabled_runs_ingest_and_lint_on_unified_vault."""
+        dream.wiki_enabled = True
+        dream.wiki_embeddings = True
+        # Stub fastembed off so refresh_embeddings is a no-op.
+        monkeypatch.setattr(
+            "nanobot.agent.wiki.embeddings._import_text_embedding", lambda: None,
+        )
+
+        store.append_history("event 1")
+        store.append_history("event 2")
+        assert store.get_last_dream_cursor() == 0
+
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+
+        # Cycle completes normally; legacy path intact.
+        assert result is True
+        assert store.get_last_dream_cursor() == 2
+        mock_runner.run.assert_called_once()
+
+        vault_root = store.workspace / "memory" / "users" / "unified_default"
+        # Ingest+Lint still happened (alice.md written and parseable).
+        alice = vault_root / "wiki" / "people" / "alice.md"
+        assert alice.is_file()
+        from nanobot.agent.wiki.vault import Vault
+        page = Vault(vault_root).read_page("people/alice.md")
+        assert page.type == "people"
+        assert "dark mode" in page.body
+
+        # No embeddings artifacts: refresh was a clean no-op without fastembed.
+        assert not (vault_root / "wiki" / ".embeddings").exists()
+
+
 # --- Task 7.2: per-user history routing + multi-user vault isolation --------
 
 

@@ -1561,6 +1561,11 @@ class Dream:
                                 render_template,
                             )
                             run_lint(vault, _date.today())
+                            if self.wiki_embeddings:
+                                from nanobot.agent.wiki.embeddings import (
+                                    refresh_embeddings,
+                                )
+                                refresh_embeddings(vault, self.wiki_embedding_model)
                     except Exception:
                         logger.exception(
                             "wiki ingest/lint failed for vault {}; other "

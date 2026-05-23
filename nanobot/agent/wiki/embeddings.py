@@ -13,6 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+from loguru import logger
 
 from nanobot.utils.atomic import atomic_write_text
 
@@ -161,3 +162,65 @@ def load_dense_ranker(wiki_dir: Path, model: str) -> "DenseRanker | None":
         return None
     rels = [e["slug"] for e in loaded.get("entries", [])]
     return DenseRanker(rels, vectors, model)
+
+
+def _doc_text(page) -> str:
+    return f"{page.title}\n{page.body}"
+
+
+def refresh_embeddings(vault, model: str) -> None:
+    """Re-embed new/changed wiki pages, drop deleted ones, persist. Best-effort.
+
+    Caller holds the per-vault Dream lock (serialized with ingest/lint and
+    wiki_note writes). No-op when fastembed is unavailable. Never raises — a
+    failure here must never break the Dream cycle.
+    """
+    if _import_text_embedding() is None:
+        return
+    try:
+        pages = {rel: page for rel, page in vault.iter_pages(include_cold=True)}
+        current = {rel: body_hash(_doc_text(page)) for rel, page in pages.items()}
+
+        # Peek the existing manifest (no dim needed) to compute the delta and
+        # decide whether any embedding work is required at all — so an
+        # up-to-date vault triggers neither a model load nor a write.
+        mpath = Path(vault.wiki_dir) / ".embeddings" / _MANIFEST
+        prev_manifest: dict = {}
+        if mpath.is_file():
+            try:
+                m = json.loads(mpath.read_text(encoding="utf-8"))
+                if m.get("model") == model:
+                    prev_manifest = m
+            except (ValueError, OSError):
+                prev_manifest = {}
+        prev = {e["slug"]: e["sha256"] for e in prev_manifest.get("entries", [])}
+        new = [rel for rel in current if prev.get(rel) != current[rel]]
+        deleted = [rel for rel in prev if rel not in current]
+        if not new and not deleted:
+            return
+
+        dim = prev_manifest.get("dim") or int(embed_texts(["x"], model).shape[1])
+        store = EmbeddingStore(vault.wiki_dir, model=model, dim=dim)
+        _, old_vectors = store.load()
+        if old_vectors is None:
+            old_rows: dict = {}
+            to_embed = sorted(current)            # corrupt/missing → full rebuild
+        else:
+            old_rows = {e["slug"]: e["row"] for e in prev_manifest.get("entries", [])}
+            to_embed = [rel for rel in sorted(current) if prev.get(rel) != current[rel]]
+
+        embedded: dict = {}
+        if to_embed:
+            mat = embed_texts([_doc_text(pages[rel]) for rel in to_embed], model)
+            embedded = {rel: mat[i] for i, rel in enumerate(to_embed)}
+
+        rows = []
+        entries = []
+        for rel in sorted(current):
+            vec = embedded[rel] if rel in embedded else old_vectors[old_rows[rel]]
+            rows.append(vec)
+            entries.append((rel, current[rel]))
+        matrix = np.vstack(rows).astype("float32") if rows else np.zeros((0, dim), "float32")
+        store.save(entries=entries, vectors=matrix)
+    except Exception:
+        logger.exception("wiki embedding refresh failed for {} (non-fatal)", vault.wiki_dir)
