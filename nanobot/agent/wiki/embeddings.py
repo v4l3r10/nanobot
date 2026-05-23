@@ -170,6 +170,10 @@ def load_dense_ranker(wiki_dir: Path, model: str | None = None) -> "DenseRanker 
 
 
 def _doc_text(page) -> str:
+    # Tags are intentionally excluded here: the dense tier embeds the page's
+    # semantic content (title + body). BM25 in retrieval.search() DOES include
+    # tags so a keyword query can still match a page by its tags — a different,
+    # complementary signal. Keep the two corpora deliberately distinct.
     return f"{page.title}\n{page.body}"
 
 

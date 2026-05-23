@@ -33,7 +33,8 @@ def tokenize(text: str) -> list[str]:
 
 
 def bm25_ranking(corpus: dict[str, str], query_tokens: list[str]) -> list[tuple[str, int]]:
-    """Okapi BM25 ranking. ``corpus`` maps relpath -> raw text (title+body).
+    """Okapi BM25 ranking. ``corpus`` maps relpath -> raw text (caller-defined;
+    ``search()`` uses title + tags + body).
 
     Returns ``[(relpath, rank), ...]`` 1-based, score>0 only, best first,
     ties broken by relpath asc for determinism.
