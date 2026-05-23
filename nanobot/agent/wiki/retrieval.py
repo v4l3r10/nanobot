@@ -69,3 +69,22 @@ def bm25_ranking(corpus: dict[str, str], query_tokens: list[str]) -> list[tuple[
             scores[rel] = s
     ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
     return [(rel, i + 1) for i, (rel, _) in enumerate(ordered)]
+
+
+def rrf_fuse(
+    rankings: list[list[tuple[str, int]]],
+    k_rrf: int = 60,
+    per_ranker_cap: int = 50,
+) -> list[str]:
+    """Reciprocal Rank Fusion over rank lists. Returns relpaths, best first.
+
+    Fuses on ranks (not raw scores) so an unbounded BM25 score and a bounded
+    cosine combine without normalization. Empty rankings contribute nothing,
+    so the same code degrades to single-ranker (or zero-ranker) cleanly.
+    """
+    scores: dict[str, float] = {}
+    for ranking in rankings:
+        for rel, rank in ranking[:per_ranker_cap]:
+            scores[rel] = scores.get(rel, 0.0) + 1.0 / (k_rrf + rank)
+    # Tie-break by relpath asc for determinism.
+    return [rel for rel, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))]
