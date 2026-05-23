@@ -60,6 +60,25 @@ def test_corrupt_manifest_returns_empty(tmp_path):
     assert st.load() == ({}, None)
 
 
+def test_corrupt_vectors_returns_empty(tmp_path):
+    # Manifest is valid but vectors.npy is binary garbage → np.load raises,
+    # caught, full rebuild.
+    st = _store(tmp_path)
+    st.save(entries=[("a.md", "h1")], vectors=np.zeros((1, 3), dtype="float32"))
+    (st.dir / "vectors.npy").write_bytes(b"not a numpy file")
+    assert st.load() == ({}, None)
+
+
+def test_wrong_column_count_returns_empty(tmp_path):
+    # Vectors with the wrong dim (cols) vs the configured dim → rebuild.
+    st = _store(tmp_path)
+    st.save(entries=[("a.md", "h1")], vectors=np.zeros((1, 3), dtype="float32"))
+    wrong = EmbeddingStore(tmp_path / "wiki", model="m", dim=3)
+    # overwrite vectors with a 1x5 array but keep the dim-3 manifest/identity
+    np.save(st.dir / "vectors.npy", np.zeros((1, 5), dtype="float32"))
+    assert wrong.load() == ({}, None)
+
+
 def test_misaligned_rows_returns_empty(tmp_path):
     # manifest says 2 entries but vectors.npy has 1 row → rebuild
     st = _store(tmp_path)
