@@ -1,4 +1,4 @@
-from nanobot.agent.wiki.retrieval import bm25_ranking, tokenize
+from nanobot.agent.wiki.retrieval import bm25_ranking, rrf_fuse, tokenize
 
 
 def test_tokenize_lowercases_splits_drops_stopwords():
@@ -35,3 +35,24 @@ def test_bm25_ties_break_by_relpath_ascending():
     ranking = bm25_ranking(corpus, tokenize("logistica"))
     assert [rel for rel, _ in ranking] == ["a/p.md", "b/p.md", "c/p.md"]
     assert [rank for _, rank in ranking] == [1, 2, 3]
+
+
+def test_rrf_fuses_two_rankings():
+    bm25 = [("a.md", 1), ("b.md", 2), ("c.md", 3)]
+    dense = [("c.md", 1), ("a.md", 2), ("d.md", 3)]
+    fused = rrf_fuse([bm25, dense], k_rrf=60)
+    # a.md appears high in both → should win; result is ordered list of relpaths
+    assert fused[0] == "a.md"
+    assert set(fused) == {"a.md", "b.md", "c.md", "d.md"}
+
+
+def test_rrf_degenerates_to_single_ranker():
+    bm25 = [("a.md", 1), ("b.md", 2)]
+    assert rrf_fuse([bm25, []], k_rrf=60) == ["a.md", "b.md"]
+    assert rrf_fuse([[]], k_rrf=60) == []
+
+
+def test_rrf_caps_each_input_before_fusing():
+    big = [(f"{i}.md", i + 1) for i in range(100)]
+    fused = rrf_fuse([big], k_rrf=60, per_ranker_cap=50)
+    assert len(fused) == 50
