@@ -95,11 +95,54 @@ def _import_text_embedding():
     return TextEmbedding
 
 
+# Granite R2 multilingual embedding models are NOT in fastembed's bundled
+# registry, but they publish ONNX weights, so we register them as custom models
+# on first use. Each uses CLS pooling + L2 normalization; map id -> embedding
+# dim (the only per-model parameter fastembed needs for registration).
+_GRANITE_CUSTOM_MODELS = {
+    "ibm-granite/granite-embedding-97m-multilingual-r2": 384,
+    "ibm-granite/granite-embedding-311m-multilingual-r2": 768,
+}
+
+
+def _ensure_custom_model_registered(cls, model_name: str) -> None:
+    """Register a known Granite R2 model with fastembed if it isn't built in.
+
+    Idempotent + best-effort: skips models already in fastembed's registry, and
+    swallows a re-register race or an ``add_custom_model`` API mismatch on the
+    installed fastembed version — the normal load path then decides (and raises
+    → graceful BM25-only) rather than crashing here.
+    """
+    dim = _GRANITE_CUSTOM_MODELS.get(model_name)
+    if dim is None:
+        return
+    try:
+        already = {m.get("model") for m in cls.list_supported_models()}
+    except Exception:
+        already = set()
+    if model_name in already:
+        return
+    try:
+        from fastembed.common.model_description import ModelSource, PoolingType
+
+        cls.add_custom_model(
+            model=model_name,
+            pooling=PoolingType.CLS,
+            normalization=True,
+            sources=ModelSource(hf=model_name),
+            dim=dim,
+            model_file="onnx/model.onnx",
+        )
+    except Exception:
+        logger.debug("could not register custom embedding model {}", model_name)
+
+
 @lru_cache(maxsize=2)
 def _get_model(model_name: str):
     cls = _import_text_embedding()
     if cls is None:
         raise RuntimeError("fastembed is not installed")
+    _ensure_custom_model_registered(cls, model_name)
     return cls(model_name=model_name)
 
 
