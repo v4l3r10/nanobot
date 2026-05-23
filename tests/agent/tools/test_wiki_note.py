@@ -925,13 +925,39 @@ async def test_search_ranks_title_over_body(tmp_path):
     _seed_page(
         tmp_path,
         "concepts/b.md",
-        _page(type="concepts", title="Other", body="this mentions widget once"),
+        _page(
+            type="concepts",
+            title="Other",
+            body="a longer note that only mentions widget once among many other words",
+        ),
     )
     out = await t.execute(operation="search", query="widget")
     assert "concepts/a.md" in out
     assert "concepts/b.md" in out
-    # Title-weighted A must rank before body-only B.
+    # BM25 length normalization: 'widget' is prominent in the short, focused A
+    # but incidental in the longer B (same term frequency, larger document), so
+    # A scores higher and ranks first.
     assert out.index("concepts/a.md") < out.index("concepts/b.md")
+
+
+async def test_search_ranks_by_term_relevance_multiword(tmp_path):
+    t = _tool(tmp_path)
+    _seed_page(
+        tmp_path, "projects/logistica.md",
+        _page(type="projects", title="Logistica",
+              body="piano logistica magazzino spedizioni logistica"),
+    )
+    _seed_page(
+        tmp_path, "people/bob.md",
+        _page(type="people", title="Bob",
+              body="bob ogni tanto parla di logistica durante le riunioni"),
+    )
+    # No page contains the exact phrase "logistica magazzino" (old substring
+    # ranker would find nothing); BM25 tokenizes and ranks the focused page first.
+    out = await t.execute(operation="search", query="logistica magazzino")
+    assert "projects/logistica.md" in out
+    assert "people/bob.md" in out
+    assert out.index("projects/logistica.md") < out.index("people/bob.md")
 
 
 async def test_search_tag_filter(tmp_path):
@@ -995,9 +1021,9 @@ async def test_search_caps_at_20(tmp_path):
         _seed_page(
             tmp_path,
             f"concepts/p{i:02d}.md",
-            _page(type="concepts", title=f"P{i}", body="has a z in it"),
+            _page(type="concepts", title=f"P{i}", body="has a zebra in it"),
         )
-    out = await t.execute(operation="search", query="z")
+    out = await t.execute(operation="search", query="zebra")
     assert "Traceback" not in out
     page_lines = [ln for ln in out.splitlines() if ln.startswith("- ")]
     assert len(page_lines) == 20, f"expected 20 page lines, got {len(page_lines)}"

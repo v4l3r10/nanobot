@@ -1035,6 +1035,8 @@ def _run_gateway(
     # Task 4.5; plain attribute assignment is safe (Dream is a normal class)
     # and pre-wires the values so 4.5 only needs to consume them.
     agent.dream.wiki_enabled = dream_cfg.wiki_enabled
+    agent.dream.wiki_embeddings = dream_cfg.wiki_embeddings
+    agent.dream.wiki_embedding_model = dream_cfg.wiki_embedding_model
     if dream_cfg.lint_cadence_h is not None:
         agent.dream.lint_cadence_h = dream_cfg.lint_cadence_h
     from nanobot.cron.types import CronJob, CronPayload
