@@ -12,9 +12,10 @@ frontmatter validation, design §3/P7), refuses duplicates, scaffolds the
 per-type ``_index.md`` Map-of-Content, and runs the page-write + index-append
 as one critical section under the per-vault async lock (design H2/Task 0.3).
 Task 2.3 adds ``append`` + reheat-on-``read``. Task 2.4 adds ``search``: a
-read-only keyword/tag/recency scan over hot AND cold pages (no embeddings,
-no SQLite — design §4) that deliberately does NOT reheat (only ``read``
-does). This completes Milestone 2's read/write agent pen. The parameter
+read-only relevance/tag/recency scan over hot AND cold pages (lexical BM25,
+plus semantic ranking when embeddings are enabled — design §4) that
+deliberately does NOT reheat (only ``read`` does). This completes
+Milestone 2's read/write agent pen. The parameter
 schema here is intentionally the full stable set so it does not churn
 across tasks.
 """
@@ -319,14 +320,14 @@ class WikiNoteTool(_FsTool, ContextAware):
             "already exist — use create first for a new page.\n"
             "- search: find pages (arg: query). Searches across BOTH active "
             "(hot) and archived (cold) pages so older knowledge stays "
-            "discoverable. 'query' may be: a keyword/phrase (case-insensitive "
-            "substring over title, tags, and body, ranked title > tag > "
-            "body); a 'tag:NAME' filter (exact, case-insensitive tag match); "
-            "or empty/omitted to list the most recently touched pages. "
+            "discoverable. 'query' may be: a keyword/phrase (ranked by "
+            "relevance over title, tags, and body — lexical BM25, plus "
+            "semantic ranking when embeddings are enabled); a 'tag:NAME' "
+            "filter (exact, case-insensitive tag match); or empty/omitted to "
+            "list the most recently touched pages. "
             "Returns up to 20 result lines, each starting with the page's "
             "path relative to wiki/ — pass that path to operation='read' to "
-            "open a result. Search is plain keyword/tag/recency (no "
-            "embeddings or semantic search) and is READ-ONLY: unlike read it "
+            "open a result. Search is READ-ONLY: unlike read it "
             "does NOT reheat a cold page — only an explicit read reheats.\n"
             "You may only read, create, append to, and search leaf pages. "
             "You cannot move pages to cold storage, merge pages, or rewrite "
@@ -501,17 +502,17 @@ class WikiNoteTool(_FsTool, ContextAware):
         return f"Appended to {path}"
 
     def _do_search(self, query: str | None) -> str:
-        """Keyword / tag / recency search over hot AND cold pages.
+        """Relevance / tag / recency search over hot AND cold pages.
 
         Read-only by deliberate design (Task 2.3 boundary): NO lock, NO
         write, NO reheat — only an explicit ``read`` reheats a cold page.
         ``search`` is the agent's discovery mechanism for pages not linked
-        from the MOC (design §4): no embeddings, no SQLite — pure
-        keyword/substring + recency over ``Vault.iter_pages`` so cold
-        knowledge stays findable (the agent then ``read``s a hit, which
-        reheats it). Fully deterministic ordering so behaviour is testable
-        and Lint/regeneration stays predictable. Never raises — every path
-        returns a model-readable string.
+        from the MOC (design §4): ranked relevance (lexical BM25, plus
+        semantic ranking when embeddings are enabled) + recency over
+        ``Vault.iter_pages`` so cold knowledge stays findable (the agent then
+        ``read``s a hit, which reheats it). Deterministic ordering so
+        behaviour is testable and Lint/regeneration stays predictable. Never
+        raises — every path returns a model-readable string.
 
         Three modes (mutually exclusive):
 
@@ -520,10 +521,11 @@ class WikiNoteTool(_FsTool, ContextAware):
         * **``tag:`` prefix** → exact case-insensitive tag filter (a page
           matches iff one of its ``tags`` equals the requested tag,
           case-insensitively), ordered ``last_touched`` desc / relpath asc;
-        * **otherwise** → case-insensitive substring search scored by field
-          presence (title 3, tag 2, body 1; presence per field, NOT
-          occurrence count), score>0 only, sorted score desc /
-          ``last_touched`` desc / relpath asc.
+        * **otherwise** → hybrid ranked search via
+          :func:`nanobot.agent.wiki.retrieval.search`: always-on lexical BM25
+          fused (RRF) with an optional dense tier that auto-activates when
+          embeddings have been built and fastembed is installed; otherwise
+          BM25-only. Best first, deterministic relpath tiebreak.
 
         Capped at :data:`_SEARCH_CAP`; an overflow note is appended when
         more matched than were shown.
@@ -562,24 +564,9 @@ class WikiNoteTool(_FsTool, ContextAware):
             results = _ordered_recent(matched)
             header_kind = f"tagged {wanted!r}"
         else:
-            needle = q.lower()
-            scored: list[tuple[int, str, Page]] = []
-            for rel, page in pages:
-                score = 0
-                if needle in page.title.lower():
-                    score += 3
-                if any(needle in tag.lower() for tag in page.tags):
-                    score += 2
-                if needle in page.body.lower():
-                    score += 1
-                if score > 0:
-                    scored.append((score, rel, page))
-            # Deterministic: score DESC, last_touched DESC, relpath ASC.
-            # Apply stable sorts least-significant key first.
-            scored.sort(key=lambda t: t[1])
-            scored.sort(key=lambda t: t[2].last_touched, reverse=True)
-            scored.sort(key=lambda t: t[0], reverse=True)
-            results = [(rel, page) for _, rel, page in scored]
+            from nanobot.agent.wiki import retrieval
+
+            results = retrieval.search(vault, q)  # ranked (rel, Page); dense auto-detected
             header_kind = f"matching {q!r}"
 
         if not results:

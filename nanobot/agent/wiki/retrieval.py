@@ -90,14 +90,12 @@ def rrf_fuse(
     return [rel for rel, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))]
 
 
-def _load_dense_ranker(vault, model):
+def _load_dense_ranker(vault, model=None):
     """Lazily load the optional dense ranker; None when unavailable.
 
-    The import is INSIDE this function so importing this module never pulls
-    numpy/fastembed — the always-on lexical core stays dependency-free.
+    Import is INSIDE this function so importing this module never pulls
+    numpy/fastembed. ``model=None`` → auto-detect from the persisted manifest.
     """
-    if not model:
-        return None
     try:
         from nanobot.agent.wiki.embeddings import load_dense_ranker
     except Exception:
@@ -108,13 +106,15 @@ def _load_dense_ranker(vault, model):
         return None
 
 
-def search(vault, query, k=20, model=None):
+def search(vault, query, k=None, model=None):
     """Hybrid ranked search → ordered ``list[(relpath, Page)]`` (best first).
 
-    ``model`` None / dense unavailable → pure BM25 via the same RRF path.
-    The caller (``_do_search``) owns the empty-query and ``tag:`` branches;
-    ``search`` is only the keyword branch and returns ``[]`` for an empty query
-    or an empty vault.
+    ``model`` None / dense unavailable → pure BM25 via the same RRF path; the
+    dense tier auto-detects its model from the persisted manifest. ``k`` None
+    returns ALL fused candidates (the caller applies its own cap + overflow);
+    an explicit ``k`` truncates. The caller (``_do_search``) owns the
+    empty-query and ``tag:`` branches; ``search`` is only the keyword branch
+    and returns ``[]`` for an empty query or an empty vault.
     """
     q = (query or "").strip()
     if not q:
@@ -131,4 +131,5 @@ def search(vault, query, k=20, model=None):
         except Exception:
             pass  # best-effort: a query-embed failure degrades to BM25 for this call
     fused = rrf_fuse(rankings, k_rrf=60)
-    return [(rel, pages[rel]) for rel in fused[:k] if rel in pages]
+    hits = [(rel, pages[rel]) for rel in fused if rel in pages]
+    return hits if k is None else hits[:k]
