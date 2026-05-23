@@ -84,3 +84,22 @@ version falls through to the normal load → graceful BM25-only.
 (`nanobot/config/schema.py`). Threaded onto the `Dream` object post-construction
 in `cli/commands.py` (same attribute-assignment pattern as `wiki_enabled`).
 Optional dependency: `pip install nanobot[wiki-search]` (fastembed + numpy).
+
+## Deployment — model pre-bake
+
+To stop fastembed from downloading the model *during the Dream cycle* (runtime
+latency + network dependency), the Docker image **pre-bakes** it: the Dockerfile
+installs `.[wiki-search]` and runs `embeddings.warm_embedding_model(<id>)` at
+build. fastembed caches models under `FASTEMBED_CACHE_PATH` (it IGNORES
+`HF_HOME`; default `/tmp/fastembed_cache`), so the Dockerfile pins
+`FASTEMBED_CACHE_PATH=/home/nanobot/.cache/fastembed` — under `$HOME/.cache`,
+NOT the `~/.nanobot` volume, so the baked layer (~397 MB for 97M) is what the
+runtime reads and the volume mount can't shadow it. Validated: a
+`--network none` container embeds with no download (cache hit). Pinned to the
+DreamConfig default; override with `--build-arg WIKI_EMBEDDING_MODEL=<id>` (must
+match config). An HF token is optional (Granite is public) — pass it as a
+BuildKit secret, never an ARG, so it isn't recorded in `docker history`:
+`docker build --secret id=hf_token,env=HF_TOKEN ...`. FAIL-FAST: the build
+exits non-zero if the model can't be baked, so an image that would download at
+runtime is never shipped (retry on transient HF outage). The 1 CPU / 1 GB
+container favours 97M (384-dim).
