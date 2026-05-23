@@ -175,3 +175,101 @@ def test_real_fastembed_embeds(tmp_path):
     from nanobot.agent.wiki.embeddings import embed_texts
     vecs = embed_texts(["ciao mondo", "logistica"], "BAAI/bge-small-en-v1.5")
     assert vecs.shape[0] == 2 and vecs.shape[1] > 0
+
+
+# --- refresh_embeddings (Task 7) --------------------------------------------
+# Page-creation idiom copied from tests/agent/wiki/test_retrieval.py
+# (which copied _page/serialize_page from tests/agent/wiki/test_vault.py).
+from nanobot.agent.wiki.page import Page, serialize_page  # noqa: E402
+
+
+def _page(type, title, body):
+    return Page(type=type, title=title, status="hot",
+                created="2026-05-23", updated="2026-05-23", last_touched="2026-05-23",
+                tags=[], links_out=[], pinned=None, body=body)
+
+
+def _write_page(vault, rel, page):
+    target = vault.wiki_dir / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(serialize_page(page), encoding="utf-8")
+
+
+def _fake_embed_factory(calls):
+    # records each batch of texts; returns deterministic dim-4 vectors
+    def fake_embed(texts, model):
+        texts = list(texts)
+        calls.append(texts)
+        return np.array([[float(len(t)), 1.0, 0.0, 0.0] for t in texts], dtype="float32")
+    return fake_embed
+
+
+def test_refresh_noop_without_fastembed(tmp_path, monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: None)
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    emb.refresh_embeddings(vault, "m")  # must not raise
+    assert not (vault.wiki_dir / ".embeddings").exists()
+
+
+def test_refresh_embeds_then_incremental(tmp_path, monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: object)
+    calls = []
+    monkeypatch.setattr(emb, "embed_texts", _fake_embed_factory(calls))
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    # seed 2 pages (use the test_retrieval idiom): projects/a.md, projects/b.md
+    _write_page(vault, "projects/a.md", _page("projects", "A", "alpha body"))
+    _write_page(vault, "projects/b.md", _page("projects", "B", "beta body"))
+    emb.refresh_embeddings(vault, "m")
+    manifest, vectors = emb.EmbeddingStore(vault.wiki_dir, "m", 4).load()
+    assert vectors is not None and vectors.shape == (2, 4)
+    assert {e["slug"] for e in manifest["entries"]} == {"projects/a.md", "projects/b.md"}
+
+    # second run, NO changes → no page re-embedded (early return, no embed call)
+    calls.clear()
+    emb.refresh_embeddings(vault, "m")
+    assert calls == []  # nothing embedded; manifest unchanged
+    manifest2, vectors2 = emb.EmbeddingStore(vault.wiki_dir, "m", 4).load()
+    assert vectors2.shape == (2, 4)
+
+
+def test_refresh_reembeds_only_changed(tmp_path, monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: object)
+    calls = []
+    monkeypatch.setattr(emb, "embed_texts", _fake_embed_factory(calls))
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    _write_page(vault, "projects/a.md", _page("projects", "A", "alpha body"))
+    _write_page(vault, "projects/b.md", _page("projects", "B", "beta body"))
+    emb.refresh_embeddings(vault, "m")
+    calls.clear()
+    # modify projects/a.md body so its hash changes
+    _write_page(vault, "projects/a.md", _page("projects", "A", "alpha body CHANGED"))
+    emb.refresh_embeddings(vault, "m")
+    # exactly one batch, containing only the changed page's text
+    assert len(calls) == 1 and len(calls[0]) == 1
+
+
+def test_refresh_drops_deleted(tmp_path, monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: object)
+    monkeypatch.setattr(emb, "embed_texts", _fake_embed_factory([]))
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    _write_page(vault, "projects/a.md", _page("projects", "A", "alpha body"))
+    _write_page(vault, "projects/b.md", _page("projects", "B", "beta body"))
+    emb.refresh_embeddings(vault, "m")
+    # delete the projects/b.md file from disk
+    (vault.wiki_dir / "projects" / "b.md").unlink()
+    emb.refresh_embeddings(vault, "m")
+    manifest, vectors = emb.EmbeddingStore(vault.wiki_dir, "m", 4).load()
+    assert vectors.shape == (1, 4)
+    assert {e["slug"] for e in manifest["entries"]} == {"projects/a.md"}
