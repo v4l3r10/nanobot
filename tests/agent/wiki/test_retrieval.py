@@ -132,3 +132,23 @@ def test_search_fuses_dense_when_available(tmp_path, monkeypatch):
     results = retrieval.search(vault, "logistica magazzino", k=20, model="fake-model")
     rels = [r for r, _ in results]
     assert "people/alice.md" in rels and "projects/logistica.md" in rels
+
+
+def test_importing_wiki_note_does_not_pull_numpy_or_fastembed():
+    # Architectural invariant: the always-on lexical path must never import the
+    # optional dense deps (numpy/fastembed). Run in a fresh interpreter so the
+    # assertion is not contaminated by modules other tests already imported.
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, nanobot.agent.tools.wiki_note; "
+        "assert 'numpy' not in sys.modules, 'numpy leaked into the lexical path'; "
+        "assert 'fastembed' not in sys.modules, 'fastembed leaked into the lexical path'; "
+        "print('ok')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
