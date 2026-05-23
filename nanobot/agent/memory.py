@@ -1635,7 +1635,13 @@ class Dream:
                                 render_template,
                             )
                             run_lint(vault, _date.today())
-                            if self.wiki_embeddings:
+                            # Refresh dense embeddings (opt-in). Both the flag
+                            # AND a non-empty model are required: an unset model
+                            # means the dense tier is effectively unconfigured,
+                            # so skip silently rather than fail every cycle. The
+                            # import stays lazy so a stock install never pulls
+                            # numpy/fastembed here.
+                            if self.wiki_embeddings and self.wiki_embedding_model:
                                 from nanobot.agent.wiki.embeddings import (
                                     refresh_embeddings,
                                 )
