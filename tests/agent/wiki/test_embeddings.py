@@ -169,6 +169,20 @@ def test_load_dense_ranker_builds_from_persisted(tmp_path, monkeypatch):
     assert ranker.rank("anything")[0][0] == "a.md"
 
 
+def test_load_dense_ranker_auto_detects_model_from_manifest(tmp_path, monkeypatch):
+    # model=None → use whatever model the manifest was built with, so the query
+    # is guaranteed to embed with the same model as the persisted docs.
+    import nanobot.agent.wiki.embeddings as emb
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: object)
+    (tmp_path / "wiki").mkdir()
+    st = emb.EmbeddingStore(tmp_path / "wiki", model="built-with-this", dim=3)
+    st.save(entries=[("a.md", "h1")], vectors=np.array([[1, 0, 0]], dtype="float32"))
+    ranker = emb.load_dense_ranker(tmp_path / "wiki")  # no model arg
+    assert ranker is not None
+    assert ranker.model == "built-with-this"
+    assert ranker.rels == ["a.md"]
+
+
 @pytest.mark.slow
 def test_real_fastembed_embeds(tmp_path):
     pytest.importorskip("fastembed")
