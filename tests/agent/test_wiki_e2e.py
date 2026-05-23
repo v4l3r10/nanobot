@@ -909,6 +909,128 @@ class TestWikiOffGoldenE2E:
 # =========================================================================== #
 
 
+# =========================================================================== #
+# J. Hybrid (BM25) search end-to-end through the real wiki_note tool
+# =========================================================================== #
+
+
+class TestHybridSearchE2E:
+    """End-to-end through the actual ``wiki_note`` tool (Task 9): tokenized
+    BM25 ranking + the three search-mode coexistence, no extra installed
+    (BM25-only — the dense tier is absent/auto-detected-off here).
+
+    Reuses this file's own harness verbatim: ``_wiki_tool`` (the
+    SimpleNamespace ToolContext + RequestContext wiring mirrored from
+    ``tests/agent/tools/test_wiki_note.py``) and ``_vault_root``; pages are
+    created through the tool's ``create`` operation, exactly as
+    ``TestCoreValuePropLoop`` does.
+    """
+
+    async def test_tokenized_bm25_beats_exact_substring(self, store):
+        """A multi-word keyword query whose EXACT phrase appears in NO page
+        still ranks the page matching the most/rarest query terms first —
+        proving the search is tokenized Okapi BM25 (retrieval.bm25_ranking),
+        not the old exact-substring scan. The query 'idempotency retries
+        payment' appears verbatim nowhere; the payment-flow page is the only
+        page carrying the rare terms 'idempotency' + 'retries', so it must
+        rank first."""
+        session = "telegram:1"
+        tool = _wiki_tool(store.workspace, session)
+
+        # A mix of people / projects / concepts pages via the tool's create.
+        await tool.execute(
+            operation="create", type="people", slug="alice",
+            title="Alice Rossi",
+            body="Alice manages the marketing team and quarterly reports.",
+        )
+        await tool.execute(
+            operation="create", type="projects", slug="logistica",
+            title="Logistica Platform",
+            body="Warehouse logistics platform with shipment tracking.",
+        )
+        await tool.execute(
+            operation="create", type="concepts", slug="payment-flow",
+            title="Payment Flow",
+            body=(
+                "The payment service uses idempotency keys and safe retries "
+                "so a duplicated request never charges a card twice."
+            ),
+        )
+        await tool.execute(
+            operation="create", type="concepts", slug="checkout",
+            title="Checkout",
+            body="The checkout step collects the cart and starts a payment.",
+        )
+
+        # Exact phrase 'idempotency retries payment' is in NO page; the
+        # payment-flow page carries the rarest matching terms.
+        out = tool._do_search("idempotency retries payment")
+        lines = [ln for ln in out.splitlines() if ln.startswith("- ")]
+        assert lines, f"no ranked results returned:\n{out}"
+        assert lines[0].startswith("- concepts/payment-flow.md"), (
+            "tokenized BM25 did not rank the rarest-term page first "
+            f"(exact-substring behavior would have failed entirely):\n{out}"
+        )
+
+    async def test_three_search_modes_coexist(self, store):
+        """Empty query → most-recent ordering; ``tag:NAME`` → only tag-matched
+        pages; keyword → ranked results. All three through the real tool."""
+        session = "telegram:2"
+        vroot = _vault_root(store, "telegram_2")
+        tool = _wiki_tool(store.workspace, session)
+
+        await tool.execute(
+            operation="create", type="people", slug="bob",
+            title="Bob", body="Bob is an engineer who owns the billing code.",
+        )
+        await tool.execute(
+            operation="create", type="projects", slug="atlas",
+            title="Atlas", body="Atlas is the data ingestion pipeline.",
+        )
+
+        # Seed a tagged page directly (the tool's create always sets tags=[],
+        # so a tag-mode assertion needs a page authored with a tag on disk).
+        # Give it a clearly NEWER last_touched so the empty-query (recency)
+        # branch has a deterministic, content-driven winner.
+        concepts = vroot / "wiki" / "concepts"
+        concepts.mkdir(parents=True, exist_ok=True)
+        tagged = Page(
+            type="concepts", title="GDPR Notes", status="hot",
+            created="2026-05-20", updated="2026-05-20",
+            last_touched="2099-01-01",
+            tags=["compliance"], links_out=[], pinned=None,
+            body="Data retention and consent requirements.",
+        )
+        (concepts / "gdpr.md").write_text(serialize_page(tagged), encoding="utf-8")
+
+        # 1. Empty query → most-recently-touched first (gdpr's 2099 date wins).
+        empty_out = tool._do_search("")
+        assert "most recently touched" in empty_out
+        empty_lines = [ln for ln in empty_out.splitlines() if ln.startswith("- ")]
+        assert empty_lines[0].startswith("- concepts/gdpr.md"), (
+            f"empty query did not order by recency:\n{empty_out}"
+        )
+        # All three pages are listed in recency mode.
+        assert any("people/bob.md" in ln for ln in empty_lines)
+        assert any("projects/atlas.md" in ln for ln in empty_lines)
+
+        # 2. tag:compliance → ONLY the tagged page.
+        tag_out = tool._do_search("tag:compliance")
+        tag_lines = [ln for ln in tag_out.splitlines() if ln.startswith("- ")]
+        assert len(tag_lines) == 1
+        assert tag_lines[0].startswith("- concepts/gdpr.md")
+        assert "atlas" not in tag_out and "bob" not in tag_out
+
+        # 3. Keyword → ranked results (the billing/engineer page for 'billing').
+        kw_out = tool._do_search("billing engineer")
+        kw_lines = [ln for ln in kw_out.splitlines() if ln.startswith("- ")]
+        assert kw_lines, f"keyword search returned no results:\n{kw_out}"
+        assert kw_lines[0].startswith("- people/bob.md"), (
+            f"keyword mode did not rank the matching page first:\n{kw_out}"
+        )
+        assert f"matching {'billing engineer'!r}" in kw_out
+
+
 class TestWikiNoteToolGatedOnWikiEnabled:
     """``WikiNoteTool`` must be gated on the resolved ``dream.wiki_enabled``.
 

@@ -271,6 +271,62 @@ def test_refresh_reembeds_only_changed(tmp_path, monkeypatch):
     assert len(calls) == 1 and len(calls[0]) == 1
 
 
+def test_real_dense_refresh_then_search_roundtrip(tmp_path):
+    """GATED real-dense round-trip (Task 9). SKIPS without the
+    ``nanobot[wiki-search]`` extra (fastembed). Documents + locks the real
+    dense path for anyone who installs the extra: refresh persists vectors, a
+    second refresh is a no-op (delta empty), and ``retrieval.search`` fuses
+    BM25 + dense (model auto-detected from the manifest) and surfaces the
+    semantically-relevant page. Reuses the ``_page``/``_write_page`` seeding
+    idiom defined above in this file (copied from test_retrieval/test_vault)."""
+    pytest.importorskip("fastembed")
+    from nanobot.agent.wiki import embeddings, retrieval
+    from nanobot.agent.wiki.vault import Vault
+
+    model = "BAAI/bge-small-en-v1.5"
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+
+    # Seed 3 pages with clearly distinct topics.
+    _write_page(vault, "concepts/payments.md", _page(
+        "concepts", "Payment Processing",
+        "Credit card transactions, idempotency keys, refunds and chargebacks."))
+    _write_page(vault, "people/gardener.md", _page(
+        "people", "The Gardener",
+        "Grows tomatoes, prunes roses, and waters the vegetable beds daily."))
+    _write_page(vault, "projects/telescope.md", _page(
+        "projects", "Telescope",
+        "Astronomy software for tracking stars, planets and distant galaxies."))
+
+    vectors_path = vault.wiki_dir / ".embeddings" / "vectors.npy"
+    manifest_path = vault.wiki_dir / ".embeddings" / "manifest.json"
+
+    embeddings.refresh_embeddings(vault, model)
+    assert vectors_path.exists()
+    assert manifest_path.exists()
+    import json as _json
+    count1 = len(_json.loads(manifest_path.read_text(encoding="utf-8"))["entries"])
+    assert count1 == 3
+    mtime1 = vectors_path.stat().st_mtime_ns
+
+    # Second refresh: delta is empty → no-op (must not raise; stable manifest).
+    embeddings.refresh_embeddings(vault, model)
+    count2 = len(_json.loads(manifest_path.read_text(encoding="utf-8"))["entries"])
+    assert count2 == count1
+    # The early-return-on-empty-delta means vectors.npy is not rewritten.
+    assert vectors_path.stat().st_mtime_ns == mtime1
+
+    # search now fuses BM25 + dense (model auto-detected from the manifest).
+    # A semantic query that shares NO surface tokens with the target page's
+    # text still surfaces the gardening page via the dense tier.
+    results = retrieval.search(vault, "horticulture and planting flowers")
+    assert results, "real-dense fused search returned no hits"
+    rels = [rel for rel, _ in results]
+    assert "people/gardener.md" in rels, (
+        f"the semantically-closest page was absent from the fused results: {rels}"
+    )
+
+
 def test_refresh_drops_deleted(tmp_path, monkeypatch):
     import nanobot.agent.wiki.embeddings as emb
     from nanobot.agent.wiki.vault import Vault
