@@ -152,6 +152,32 @@ def embed_texts(texts, model_name: str) -> "np.ndarray":
     return np.array(list(model.embed(list(texts))), dtype="float32")
 
 
+def warm_embedding_model(model_name: str) -> bool:
+    """Download + initialize the embedding model into the local cache.
+
+    Called at image-build (or boot) time so the Dream cycle never downloads the
+    model at runtime. Goes through the same path as a real embed
+    (``_get_model`` → custom-model registration + fastembed download + one
+    inference), so whatever cache the runtime uses is populated identically.
+
+    Returns True when the model loaded and produced a vector; False when
+    fastembed is unavailable or the load/download failed. Never raises — the
+    caller (Dockerfile/entrypoint) decides whether a miss is fatal.
+    """
+    if _import_text_embedding() is None:
+        logger.warning("fastembed not installed; cannot warm embedding model {}", model_name)
+        return False
+    try:
+        vec = embed_texts(["warmup"], model_name)
+        ok = getattr(vec, "shape", (0,))[0] == 1
+        if ok:
+            logger.info("warmed embedding model {} (dim={})", model_name, vec.shape[1])
+        return ok
+    except Exception:
+        logger.warning("failed to warm embedding model {}", model_name)
+        return False
+
+
 def cosine_ranking(query_vec, doc_vectors, rels) -> list[tuple[str, int]]:
     """Rank docs by cosine similarity to the query. Returns [(rel, rank), ...]
     1-based, best first, deterministic relpath-asc tiebreak. Zero-norm vectors

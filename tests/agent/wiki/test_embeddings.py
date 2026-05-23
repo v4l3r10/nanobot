@@ -433,3 +433,34 @@ def test_ensure_noop_for_non_granite_model(monkeypatch):
     # Not a Granite custom id → returns immediately, registers nothing.
     emb._ensure_custom_model_registered(FakeCls, "BAAI/bge-small-en-v1.5")
     assert calls == []
+
+
+def test_warm_embedding_model_false_without_fastembed(monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: None)
+    assert emb.warm_embedding_model("any/model") is False
+
+
+def test_warm_embedding_model_downloads_and_reports_ok(monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: object)
+    calls = []
+
+    def fake_embed(texts, model):
+        calls.append((list(texts), model))
+        return np.zeros((1, 4), dtype="float32")
+
+    monkeypatch.setattr(emb, "embed_texts", fake_embed)
+    assert emb.warm_embedding_model("some/model") is True
+    assert calls == [(["warmup"], "some/model")]
+
+
+def test_warm_embedding_model_false_on_failure(monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: object)
+
+    def boom(texts, model):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(emb, "embed_texts", boom)
+    assert emb.warm_embedding_model("some/model") is False

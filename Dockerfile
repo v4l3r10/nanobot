@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 # Install Node.js 20 for the WhatsApp bridge
@@ -18,14 +19,14 @@ WORKDIR /app
 # hook from hatch_build.py even for this metadata-only install.
 COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md hatch_build.py ./
 RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
-    uv pip install --system --no-cache . && \
+    uv pip install --system --no-cache '.[wiki-search]' && \
     rm -rf nanobot bridge
 
 # Copy the full source and install
 COPY nanobot/ nanobot/
 COPY bridge/ bridge/
 COPY webui/ webui/
-RUN NANOBOT_FORCE_WEBUI_BUILD=1 uv pip install --system --no-cache .
+RUN NANOBOT_FORCE_WEBUI_BUILD=1 uv pip install --system --no-cache '.[wiki-search]'
 
 # Build the WhatsApp bridge
 WORKDIR /app/bridge
@@ -44,6 +45,30 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/ent
 
 USER nanobot
 ENV HOME=/home/nanobot
+
+# Pre-bake the wiki-search embedding model into the image so the Dream cycle
+# never downloads it at runtime. fastembed stores models under
+# FASTEMBED_CACHE_PATH (it IGNORES HF_HOME), default /tmp/fastembed_cache —
+# pin it to a stable path under $HOME/.cache, which is NOT a mounted volume
+# (only ~/.nanobot is), so the baked layer is exactly what the runtime reads
+# and the volume mount can't shadow it. Pinned to the DreamConfig default;
+# override to match a custom wiki_embedding_model with
+#   --build-arg WIKI_EMBEDDING_MODEL=<id>
+# Granite is a public model and downloads fine unauthenticated; an HF token is
+# OPTIONAL (only raises HF Hub rate limits / silences the unauthenticated
+# warning). Pass it as a BuildKit secret so it is never recorded in ENV or
+# `docker history`:
+#   docker build --secret id=hf_token,env=HF_TOKEN ...        (from host env)
+#   docker build --secret id=hf_token,src=./hf_token.txt ...  (from a file)
+# FAIL-FAST: the build EXITS NON-ZERO if the model can't be baked, so an image
+# that would otherwise download the model at runtime is never shipped. Retry
+# the build if a transient HF outage causes a miss.
+ENV FASTEMBED_CACHE_PATH=/home/nanobot/.cache/fastembed
+ENV HF_HOME=/home/nanobot/.cache/huggingface
+ARG WIKI_EMBEDDING_MODEL=ibm-granite/granite-embedding-97m-multilingual-r2
+RUN --mount=type=secret,id=hf_token,uid=1000,required=false \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    python -c "from nanobot.agent.wiki.embeddings import warm_embedding_model as w; import sys; sys.exit(0 if w('${WIKI_EMBEDDING_MODEL}') else 1)"
 
 # Gateway health endpoint and optional WebUI/WebSocket channel ports
 EXPOSE 18790 8765
