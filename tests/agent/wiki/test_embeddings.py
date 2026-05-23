@@ -343,3 +343,93 @@ def test_refresh_drops_deleted(tmp_path, monkeypatch):
     manifest, vectors = emb.EmbeddingStore(vault.wiki_dir, "m", 4).load()
     assert vectors.shape == (1, 4)
     assert {e["slug"] for e in manifest["entries"]} == {"projects/a.md"}
+
+
+def _fake_model_description_module():
+    import types
+    mod = types.ModuleType("fastembed.common.model_description")
+
+    class _PoolingType:
+        CLS = "cls"
+        MEAN = "mean"
+
+    class _ModelSource:
+        def __init__(self, hf=None):
+            self.hf = hf
+
+    mod.PoolingType = _PoolingType
+    mod.ModelSource = _ModelSource
+    return mod
+
+
+def _install_fake_fastembed(monkeypatch):
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, "fastembed", types.ModuleType("fastembed"))
+    monkeypatch.setitem(sys.modules, "fastembed.common", types.ModuleType("fastembed.common"))
+    monkeypatch.setitem(
+        sys.modules, "fastembed.common.model_description", _fake_model_description_module()
+    )
+
+
+def test_ensure_registers_granite_custom_model(monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    _install_fake_fastembed(monkeypatch)
+    calls = []
+
+    class FakeCls:
+        @staticmethod
+        def list_supported_models():
+            return [{"model": "BAAI/bge-small-en-v1.5"}]
+
+        @staticmethod
+        def add_custom_model(**kwargs):
+            calls.append(kwargs)
+
+    emb._ensure_custom_model_registered(
+        FakeCls, "ibm-granite/granite-embedding-97m-multilingual-r2"
+    )
+    assert len(calls) == 1
+    assert calls[0]["model"] == "ibm-granite/granite-embedding-97m-multilingual-r2"
+    assert calls[0]["dim"] == 384
+    assert calls[0]["normalization"] is True
+    assert calls[0]["model_file"] == "onnx/model.onnx"
+
+
+def test_ensure_skips_when_already_supported(monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    _install_fake_fastembed(monkeypatch)
+    calls = []
+
+    class FakeCls:
+        @staticmethod
+        def list_supported_models():
+            return [{"model": "ibm-granite/granite-embedding-311m-multilingual-r2"}]
+
+        @staticmethod
+        def add_custom_model(**kwargs):
+            calls.append(kwargs)
+
+    emb._ensure_custom_model_registered(
+        FakeCls, "ibm-granite/granite-embedding-311m-multilingual-r2"
+    )
+    assert calls == []  # already registered → no-op
+
+
+def test_ensure_noop_for_non_granite_model(monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    _install_fake_fastembed(monkeypatch)
+    calls = []
+
+    class FakeCls:
+        @staticmethod
+        def list_supported_models():
+            raise AssertionError("should not be consulted for a built-in model")
+
+        @staticmethod
+        def add_custom_model(**kwargs):
+            calls.append(kwargs)
+
+    # Not a Granite custom id → returns immediately, registers nothing.
+    emb._ensure_custom_model_registered(FakeCls, "BAAI/bge-small-en-v1.5")
+    assert calls == []
