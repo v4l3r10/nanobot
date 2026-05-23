@@ -137,19 +137,75 @@ def _ensure_custom_model_registered(cls, model_name: str) -> None:
         logger.debug("could not register custom embedding model {}", model_name)
 
 
+# Granite R2 is a ModernBERT (max_position_embeddings=32768), so a single long
+# page would tokenize into thousands of tokens and the global-attention layers'
+# O(seq^2) activations spike RAM (a 5k-token page alone OOMs a 2 GB cgroup).
+# Instead of TRUNCATING (which drops the tail of long pages and loses recall),
+# we split a page into <=_CHUNK_CHARS windows, embed each, and mean-pool the
+# chunk vectors into one per page — every word still contributes. _MAX_SEQ_TOKENS
+# is a hard backstop on the tokenizer so a pathologically dense chunk can never
+# blow up attention memory; _CHUNK_CHARS is sized to stay well under it for
+# multilingual text (~0.3 tok/char here) so the backstop rarely bites.
+_MAX_SEQ_TOKENS = 512
+_CHUNK_CHARS = 1200
+_EMBED_BATCH = 8
+
+
 @lru_cache(maxsize=2)
 def _get_model(model_name: str):
     cls = _import_text_embedding()
     if cls is None:
         raise RuntimeError("fastembed is not installed")
     _ensure_custom_model_registered(cls, model_name)
-    return cls(model_name=model_name)
+    model = cls(model_name=model_name)
+    # Cap sequence length at the source: the tokenizer ships with max_length=
+    # 32768, so without this a long chunk would still produce a huge sequence.
+    # Best-effort (internal handle) — degrades to fastembed's own default.
+    try:
+        model.model.tokenizer.enable_truncation(max_length=_MAX_SEQ_TOKENS)
+    except Exception:
+        logger.debug("could not pin tokenizer truncation on {}", model_name)
+    return model
+
+
+def _chunk_text(text: str) -> list[str]:
+    """Split into <=_CHUNK_CHARS windows. Always returns >=1 non-empty chunk
+    (fastembed errors on an empty string)."""
+    text = text or " "
+    if len(text) <= _CHUNK_CHARS:
+        return [text]
+    return [text[i:i + _CHUNK_CHARS] for i in range(0, len(text), _CHUNK_CHARS)]
 
 
 def embed_texts(texts, model_name: str) -> "np.ndarray":
-    """Embed a list of strings → float32 [N, dim] ndarray. Requires fastembed."""
+    """Embed a list of strings → float32 [N, dim] ndarray. Requires fastembed.
+
+    Long inputs are split into <=_CHUNK_CHARS windows, embedded in small
+    batches, and mean-pooled (then L2-normalized) into one vector per input, so
+    no content is dropped and per-pass attention memory stays bounded. A
+    single-chunk input is unchanged (mean of one already-unit vector = itself).
+    """
     model = _get_model(model_name)
-    return np.array(list(model.embed(list(texts))), dtype="float32")
+    texts = list(texts)
+    # Flatten every page's chunks into one stream so fastembed batches across
+    # pages, then fold back per page via the recorded chunk counts.
+    flat_chunks: list[str] = []
+    counts: list[int] = []
+    for t in texts:
+        cs = _chunk_text(t)
+        counts.append(len(cs))
+        flat_chunks.extend(cs)
+    vecs = np.array(list(model.embed(flat_chunks, batch_size=_EMBED_BATCH)), dtype="float32")
+    out = np.empty((len(texts), vecs.shape[1]), dtype="float32")
+    pos = 0
+    for i, c in enumerate(counts):
+        pooled = vecs[pos:pos + c].mean(axis=0)
+        pos += c
+        # Granite emits L2-normalized vectors; the mean of unit vectors is NOT
+        # unit-length, so renormalize to keep cosine == dot product downstream.
+        norm = float(np.linalg.norm(pooled)) or 1.0
+        out[i] = pooled / norm
+    return out
 
 
 def warm_embedding_model(model_name: str) -> bool:
