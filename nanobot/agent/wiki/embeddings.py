@@ -46,8 +46,13 @@ class EmbeddingStore:
             vectors = np.load(vpath)
         except (ValueError, OSError):
             return {}, None
-        if vectors.shape[0] != len(manifest.get("entries", [])):
-            return {}, None  # misaligned → rebuild
+        # Shape guard: row count must match the manifest, and the column count
+        # must match the configured dim. A partial overwrite that left a
+        # wrong-shaped array on disk is treated as corrupt → full rebuild.
+        if vectors.ndim != 2 or vectors.shape[0] != len(manifest.get("entries", [])):
+            return {}, None
+        if vectors.shape[1] != self.dim:
+            return {}, None
         return manifest, vectors
 
     def delta(self, current: dict[str, str], manifest: dict) -> tuple[list[str], list[str]]:
