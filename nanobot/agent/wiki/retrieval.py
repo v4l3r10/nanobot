@@ -122,7 +122,11 @@ def search(vault, query, k=None, model=None):
     pages = {rel: page for rel, page in vault.iter_pages(include_cold=True)}
     if not pages:
         return []
-    corpus = {rel: f"{p.title}\n{p.body}" for rel, p in pages.items()}
+    # BM25 corpus = title + tags + body, so a keyword query can still surface a
+    # page via its tags (the pre-BM25 substring ranker scored tag matches too).
+    corpus = {
+        rel: "\n".join((p.title, " ".join(p.tags), p.body)) for rel, p in pages.items()
+    }
     rankings = [bm25_ranking(corpus, tokenize(q))]
     dense = _load_dense_ranker(vault, model)
     if dense is not None:

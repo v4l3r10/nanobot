@@ -925,12 +925,18 @@ async def test_search_ranks_title_over_body(tmp_path):
     _seed_page(
         tmp_path,
         "concepts/b.md",
-        _page(type="concepts", title="Other", body="this mentions widget once"),
+        _page(
+            type="concepts",
+            title="Other",
+            body="a longer note that only mentions widget once among many other words",
+        ),
     )
     out = await t.execute(operation="search", query="widget")
     assert "concepts/a.md" in out
     assert "concepts/b.md" in out
-    # Title-weighted A must rank before body-only B.
+    # BM25 length normalization: 'widget' is prominent in the short, focused A
+    # but incidental in the longer B (same term frequency, larger document), so
+    # A scores higher and ranks first.
     assert out.index("concepts/a.md") < out.index("concepts/b.md")
 
 
