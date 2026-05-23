@@ -671,3 +671,10 @@ class TestDreamPhase2DailyJournal:
         assert (store.workspace / target).exists()
         assert "# 2026-05-08" in (store.workspace / target).read_text(encoding="utf-8")
 
+
+def test_dream_has_wiki_embedding_attrs_defaulting_off(dream):
+    # Reuse the module's `dream` fixture, which builds:
+    #   Dream(store=store, provider=mock_provider, model="test-model", max_batch_size=5)
+    assert dream.wiki_embeddings is False
+    assert dream.wiki_embedding_model == ""
+

@@ -997,6 +997,8 @@ class Dream:
         daily_notes_context_days: int = 2,
         daily_notes_max_chars: int = 8_000,
         wiki_enabled: bool = False,
+        wiki_embeddings: bool = False,
+        wiki_embedding_model: str = "",
         lint_cadence_h: int | None = None,
     ):
         self.store = store
@@ -1016,6 +1018,8 @@ class Dream:
         # golden test can set ``dream.wiki_enabled = False``. Default False:
         # with the gate off Dream is byte-identical to v0.2.0.
         self.wiki_enabled: bool = wiki_enabled
+        self.wiki_embeddings: bool = wiki_embeddings
+        self.wiki_embedding_model: str = wiki_embedding_model
         # NOTE: decoupled lint cadence (lint_cadence_h) is a future
         # refinement; Lint is idempotent so running it each Dream cycle is
         # safe. Stored here for the cli pre-wiring; not consulted in 4.5.
