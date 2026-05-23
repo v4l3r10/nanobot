@@ -227,7 +227,7 @@ class TestWikiDreamConfig:
 def test_wiki_embedding_defaults():
     cfg = DreamConfig()
     assert cfg.wiki_embeddings is False
-    assert cfg.wiki_embedding_model == "ibm-granite/granite-embedding-107m-multilingual"
+    assert cfg.wiki_embedding_model == "ibm-granite/granite-embedding-97m-multilingual-r2"
 
 
 def test_wiki_embeddings_can_be_set():

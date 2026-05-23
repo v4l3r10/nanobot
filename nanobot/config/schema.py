@@ -96,12 +96,19 @@ class DreamConfig(Base):
     # search always works without it. When on, Dream embeds wiki pages and
     # search fuses BM25 + cosine via RRF.
     wiki_embeddings: bool = False
-    # fastembed model id for the dense tier. Configurable so 97M/107M/311M
-    # variants swap without code changes (dim is read from the model).
-    # NOTE: confirm this exact id against fastembed's supported-model registry
-    # when first enabling the extra; a wrong/absent id degrades gracefully to
-    # BM25-only (load fails → None).
-    wiki_embedding_model: str = "ibm-granite/granite-embedding-107m-multilingual"
+    # Embedding model id for the dense tier. Configurable so the 97M (384-dim)
+    # and 311M (768-dim) Granite R2 multilingual variants swap without code
+    # changes (dim is read from the model and recorded in the manifest).
+    #
+    # Granite R2 needs NO query/passage instruction prefix — query and document
+    # text are embedded symmetrically (unlike E5-family models); it uses CLS
+    # pooling and L2-normalized output. NOTE: fastembed does NOT ship Granite in
+    # its built-in registry, so enabling the dense tier requires registering it
+    # as a custom ONNX model (TextEmbedding.add_custom_model with
+    # pooling=CLS, normalization=True, dim, model_file="onnx/model.onnx").
+    # Until that is wired/installed, a model fastembed can't load degrades
+    # gracefully to BM25-only (load fails → None). See .agent/wiki-search.md.
+    wiki_embedding_model: str = "ibm-granite/granite-embedding-97m-multilingual-r2"
     lint_cadence_h: int | None = Field(default=None, ge=1)  # None => use interval_h
 
     def build_schedule(self, timezone: str) -> CronSchedule:
