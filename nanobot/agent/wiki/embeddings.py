@@ -138,12 +138,13 @@ class DenseRanker:
         return cosine_ranking(qv, self.doc_vectors, self.rels)
 
 
-def load_dense_ranker(wiki_dir: Path, model: str) -> "DenseRanker | None":
+def load_dense_ranker(wiki_dir: Path, model: str | None = None) -> "DenseRanker | None":
     """Build a DenseRanker from persisted vectors, or None to degrade to BM25.
 
-    Returns None when: fastembed is unavailable, no persisted vectors exist,
-    the manifest is unreadable, or the persisted vectors were built for a
-    DIFFERENT model (stale until the next Dream refresh re-embeds).
+    ``model`` None → use whatever model the persisted manifest was built with
+    (guarantees the query embeds with the same model as the docs). An EXPLICIT
+    model that does not match the manifest → None (stale until next refresh).
+    Also None when: fastembed unavailable, no/unreadable manifest, no vectors.
     """
     if _import_text_embedding() is None:
         return None
@@ -154,14 +155,18 @@ def load_dense_ranker(wiki_dir: Path, model: str) -> "DenseRanker | None":
         manifest = json.loads(mpath.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return None
-    if manifest.get("model") != model:
+    manifest_model = manifest.get("model")
+    if model is not None and manifest_model != model:
         return None
-    store = EmbeddingStore(Path(wiki_dir), model=model, dim=manifest.get("dim"))
+    use_model = model or manifest_model
+    if not use_model:
+        return None
+    store = EmbeddingStore(Path(wiki_dir), model=use_model, dim=manifest.get("dim"))
     loaded, vectors = store.load()
     if vectors is None:
         return None
     rels = [e["slug"] for e in loaded.get("entries", [])]
-    return DenseRanker(rels, vectors, model)
+    return DenseRanker(rels, vectors, use_model)
 
 
 def _doc_text(page) -> str:
