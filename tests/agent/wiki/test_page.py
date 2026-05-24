@@ -29,3 +29,29 @@ def test_parse_rejects_unknown_status():
     bad = serialize_page(_page()).replace("status: hot", "status: lukewarm")
     with pytest.raises(ValueError):
         parse_page(bad)
+
+
+def test_summary_and_sender_ids_roundtrip():
+    p = Page(
+        type="people", title="Eugenio", status="hot",
+        created="2026-05-24", updated="2026-05-24", last_touched="2026-05-24",
+        summary="giornalista, IT informale", sender_ids=["telegram:136150230"],
+    )
+    back = parse_page(serialize_page(p))
+    assert back.summary == "giornalista, IT informale"
+    assert back.sender_ids == ["telegram:136150230"]
+
+
+def test_absent_fields_serialize_byte_identical():
+    """A page WITHOUT summary/sender_ids must serialize exactly as before."""
+    p = Page(
+        type="people", title="X", status="hot",
+        created="d", updated="d", last_touched="d",
+    )
+    text = serialize_page(p)
+    assert "summary" not in text
+    assert "sender_ids" not in text
+    # And it must round-trip back to absent (None / empty list).
+    back = parse_page(text)
+    assert back.summary is None
+    assert back.sender_ids == []
