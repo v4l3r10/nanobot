@@ -716,12 +716,10 @@ class Consolidator:
             len(chunk),
             replay_max_messages,
         )
-        # Task 7.2: thread the EFFECTIVE session key (session.key — unified
-        # or channel:chat_id) so Dream routes this user's consolidated
-        # memory into THAT user's per-user vault.
-        # CV2: under unified_memory=true the resolver collapses to
-        # UNIFIED_SESSION_KEY so the shared vault receives consolidation.
-        summary = await self.archive(chunk, session_key=self._resolve_memory_key(session))
+        # CV2: consegna la session ad archive(), che risolve internamente la
+        # memory_key via _resolve_memory_key (unified sotto unified_memory,
+        # session.key per il wiki per-utente).
+        summary = await self.archive(chunk, session=session)
         session.last_consolidated = end_idx
         self.sessions.save(session)
         return summary
@@ -790,23 +788,26 @@ class Consolidator:
             return truncate_text(text, budget * 4)
 
     async def archive(
-        self, messages: list[dict], *, session_key: str | None = None
+        self, messages: list[dict], *, session: "Session | None" = None
     ) -> str | None:
         """Summarize messages via LLM and append to history.jsonl.
 
         Returns the summary text on success, None if nothing to archive.
 
-        Task 7.2: *session_key* is the EFFECTIVE key of the session being
-        consolidated (``session.key``: ``"unified:default"`` under
-        ``unified_session``, else ``channel:chat_id``). It is threaded into
-        the appended history record (both the LLM-summary path and the
-        ``raw_archive`` degraded fallback) so Dream routes this user's
-        consolidated memory into THAT user's per-user wiki vault. ``None``
-        (a caller with no session in scope) → unified (safe back-compat);
-        consolidation logic itself is UNCHANGED.
+        CV2: accetta la *session* e risolve internamente la memory_key via
+        ``_resolve_memory_key`` (single source of truth) — i call-site non
+        passano più una chiave grezza, così nessuno può dimenticarsi del
+        resolver. Sotto ``unified_memory``/``unified_session`` la chiave
+        collassa a ``"unified:default"`` (vault condiviso); altrimenti resta
+        ``session.key`` (wiki per-utente). ``session=None`` (caller senza
+        sessione in scope) → ``None`` → unified (safe back-compat). La logica
+        di consolidamento è invariata.
         """
         if not messages:
             return None
+        # CV2: il Consolidator è l'unico a tradurre session -> memory_key.
+        # session=None (caller senza sessione in scope) -> None -> unified.
+        key = self._resolve_memory_key(session) if session is not None else None
         try:
             formatted = MemoryStore._format_messages(messages)
             formatted = self._truncate_to_token_budget(formatted)
@@ -831,12 +832,12 @@ class Consolidator:
             self.store.append_history(
                 summary,
                 max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
-                session_key=session_key,
+                session_key=key,
             )
             return summary
         except Exception:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
-            self.store.raw_archive(messages, session_key=session_key)
+            self.store.raw_archive(messages, session_key=key)
             return None
 
     async def maybe_consolidate_by_tokens(
@@ -919,11 +920,9 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                # Task 7.2: thread the EFFECTIVE session key for per-user
-                # vault routing (see _consolidate_replay_overflow).
-                # CV2: resolver collapses to UNIFIED_SESSION_KEY under
-                # unified_memory=true (shared vault).
-                summary = await self.archive(chunk, session_key=self._resolve_memory_key(session))
+                # CV2: archive() risolve internamente la memory_key dalla
+                # session (vedi _consolidate_replay_overflow).
+                summary = await self.archive(chunk, session=session)
                 # Advance the cursor either way: on success the chunk was
                 # summarized; on failure archive() already raw-archived it as
                 # a breadcrumb. Re-archiving the same chunk on the next call
