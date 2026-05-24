@@ -1290,3 +1290,32 @@ class TestConsolidationMemoryKeyMatrix:
         assert entries
         assert all(e["session_key"] == "telegram:9" for e in entries)
         await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_cmd_new_passes_session_to_archive(self, tmp_path):
+        """#4: /new deve consegnare la SESSIONE (session=) al Consolidator,
+        non session_key grezzo."""
+        from nanobot.command import CommandContext
+        from nanobot.command.builtin import cmd_new
+
+        loop = _make_loop(tmp_path, session_ttl_minutes=15, unified_memory=True)
+        session = loop.sessions.get_or_create("telegram:5")
+        _add_turns(session, 2)
+        loop.sessions.save(session)
+
+        captured: dict = {}
+
+        async def _spy(messages, **kwargs):
+            captured["messages"] = messages
+            captured.update(kwargs)
+            return "S"
+
+        loop.consolidator.archive = _spy
+
+        msg = InboundMessage(channel="telegram", sender_id="u", chat_id="5", content="/new")
+        ctx = CommandContext(msg=msg, session=session, key="telegram:5", raw="/new", loop=loop)
+        await cmd_new(ctx)
+        await asyncio.sleep(0.05)  # lascia girare il task di _schedule_background
+
+        assert captured.get("session") is session
+        await loop.close_mcp()
