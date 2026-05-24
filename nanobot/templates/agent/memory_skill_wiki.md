@@ -19,6 +19,15 @@ the same turn:
 Do not record ephemera: one-off questions, transient state, anything already
 on a page, or anything the user did not actually assert.
 
+## Bind who you're talking to
+
+When you confirm who a chat partner is, bind their identity to their people
+page with `wiki_note` `operation=bind`: set a one-line `summary` (identity,
+language/tone, context) and add the channel-qualified `sender_id` from the
+runtime `Sender ID` (e.g. `telegram:136150230` — use the numeric id before any
+`|`). This makes their summary appear automatically the next time they write.
+Create their people page first if it does not exist yet.
+
 ## Recall — check before answering from ignorance
 
 If the user asks something that depends on past knowledge and the memory map

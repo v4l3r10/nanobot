@@ -219,6 +219,15 @@ def _terminated_line_set(text: str) -> set[str]:
         title=StringSchema("For create: the human-readable page title."),
         body=StringSchema("For create: the Markdown body of the page."),
         text=StringSchema("Reserved for the append operation (Task 2.3)."),
+        summary=StringSchema(
+            "For bind: a short one-line card for this person (identity, "
+            "language/tone, context) surfaced automatically when they message."
+        ),
+        sender_id=StringSchema(
+            "For bind: a channel-qualified interlocutor id to attach to this "
+            "page, e.g. 'telegram:136150230'. Binds the live Sender ID to the "
+            "page so its summary is injected when that person writes."
+        ),
         query=StringSchema(
             "For search: a keyword/phrase, a 'tag:NAME' filter, or empty "
             "to list the most recently touched pages."
@@ -331,9 +340,16 @@ class WikiNoteTool(_FsTool, ContextAware):
             "path relative to wiki/ — pass that path to operation='read' to "
             "open a result. Search is READ-ONLY: unlike read it "
             "does NOT reheat a cold page — only an explicit read reheats.\n"
-            "You may only read, create, append to, and search leaf pages. "
-            "You cannot move pages to cold storage, merge pages, or rewrite "
-            "indexes/MOC files — those are automatic and Dream-only."
+            "- bind: attach a person's identity to a page (args: path, "
+            "optional summary, optional sender_id). Use when you confirm WHO a "
+            "chat partner is: set a one-line 'summary' and/or add the "
+            "channel-qualified 'sender_id' (e.g. 'telegram:136150230') to "
+            "their people page. The id is matched against the live Sender ID "
+            "so this person's summary is surfaced automatically next time they "
+            "message. The page must already exist (use create first).\n"
+            "You may only read, create, append to, bind, and search leaf "
+            "pages. You cannot move pages to cold storage, merge pages, or "
+            "rewrite indexes/MOC files — those are automatic and Dream-only."
         )
 
     async def execute(self, operation: str | None = None, **kw: Any) -> str:
@@ -348,6 +364,10 @@ class WikiNoteTool(_FsTool, ContextAware):
             )
         if operation == "append":
             return await self._do_append(kw.get("path"), kw.get("text"))
+        if operation == "bind":
+            return await self._do_bind(
+                kw.get("path"), kw.get("summary"), kw.get("sender_id"),
+            )
         if operation == "search":
             # search is read-only and synchronous (no lock/write/reheat); call
             # the sync helper directly without await.
@@ -502,6 +522,72 @@ class WikiNoteTool(_FsTool, ContextAware):
         # lock and success-only by design — never on a partial/failed write.
         mark_vault_dirty(vault_slug(self._session_key()))
         return f"Appended to {path}"
+
+    async def _do_bind(
+        self, path: str | None, summary: str | None, sender_id: str | None,
+    ) -> str:
+        """Set ``summary`` and/or add a ``sender_id`` on an existing page.
+
+        Layer 2 self-binding: lets the agent attach a person's identity card
+        to their people page (frontmatter only — body untouched). Mirrors
+        ``_do_append``'s guards and critical section (per-vault lock, missing
+        / structural / cold / containment-escape / malformed refusals). The
+        sender_id is de-duplicated within the page (one entry per id; the
+        design's last-write/warn on cross-page duplicates is left to a future
+        global check). Other frontmatter (type/title/status/created/tags/
+        links_out/pinned/body) is left UNCHANGED; updated/last_touched bump.
+        """
+        if not path:
+            return "Error: 'path' is required for bind"
+        clean_summary = summary.strip() if summary else ""
+        clean_sender = sender_id.strip() if sender_id else ""
+        if not clean_summary and not clean_sender:
+            return "Error: bind requires a 'summary' and/or a 'sender_id'"
+
+        vault = self._vault()
+        target = vault.wiki_dir / path
+        resolved = self._resolved_in_vault(target, vault)
+        if resolved is None:
+            return f"Error: refusing to bind {path} — resolves outside the vault"
+        if resolved.name in _NON_PAGE_NAMES:
+            return (
+                f"Error: refusing to bind {path} "
+                "— not a content page (structural/index file)"
+            )
+        if _COLD_COMPONENT in resolved.parts:
+            return (
+                f"Error: refusing to bind {path} "
+                "— cold pages are reheated via read, not bound"
+            )
+
+        async with self._vault_lock():
+            if not resolved.exists():
+                return (
+                    f"Error: Page not found: {path}. "
+                    "Use operation='create' first."
+                )
+            try:
+                page = parse_page(resolved.read_text(encoding="utf-8"))
+            except OSError as e:
+                return f"Error: {e}"
+            except ValueError:
+                return f"Error: cannot bind — {path} is malformed"
+
+            if clean_summary:
+                page.summary = clean_summary
+            if clean_sender and clean_sender not in page.sender_ids:
+                page.sender_ids.append(clean_sender)
+
+            today = datetime.date.today().isoformat()
+            page.updated = today
+            page.last_touched = today
+            try:
+                atomic_write_text(resolved, serialize_page(page))
+            except OSError as e:
+                return f"Error: {e}"
+
+        mark_vault_dirty(vault_slug(self._session_key()))
+        return f"Bound identity on {path}"
 
     def _do_search(self, query: str | None) -> str:
         """Relevance / tag / recency search over hot AND cold pages.

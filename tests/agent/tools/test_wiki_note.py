@@ -1220,3 +1220,48 @@ async def test_search_logs_tool_line_recent(tmp_path):
     finally:
         logger.remove(sink_id)
     assert any("wiki_note search [recent]" in m for m in captured), captured
+
+
+# --- Layer 2: agent self-binding (sender_ids + summary frontmatter) ---------
+
+
+async def test_bind_sets_summary_and_sender_id(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(operation="create", type="people", slug="alice",
+                    title="Alice", body="Leads payments.")
+    out = await t.execute(operation="bind", path="people/alice.md",
+                          sender_id="telegram:1|alice", summary="dev, IT informale")
+    assert "alice" in out.lower() and "Traceback" not in out
+    page = parse_page(
+        (vault_dir(tmp_path, "telegram:1") / "wiki" / "people" / "alice.md")
+        .read_text(encoding="utf-8")
+    )
+    assert page.summary == "dev, IT informale"
+    assert "telegram:1|alice" in page.sender_ids
+
+
+async def test_bind_dedupes_sender_id(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(operation="create", type="people", slug="alice", title="Alice")
+    await t.execute(operation="bind", path="people/alice.md", sender_id="telegram:1|a")
+    await t.execute(operation="bind", path="people/alice.md", sender_id="telegram:1|a")
+    page = parse_page(
+        (vault_dir(tmp_path, "telegram:1") / "wiki" / "people" / "alice.md")
+        .read_text(encoding="utf-8")
+    )
+    assert page.sender_ids.count("telegram:1|a") == 1
+
+
+async def test_bind_missing_page_errors_cleanly(tmp_path):
+    t = _tool(tmp_path)
+    out = await t.execute(operation="bind", path="people/ghost.md",
+                          sender_id="telegram:1|g")
+    assert "not found" in out.lower()
+    assert "Traceback" not in out
+
+
+async def test_bind_requires_some_field(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(operation="create", type="people", slug="alice", title="Alice")
+    out = await t.execute(operation="bind", path="people/alice.md")
+    assert "error" in out.lower()
