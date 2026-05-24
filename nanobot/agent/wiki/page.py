@@ -32,6 +32,8 @@ _KEY_ORDER = (
     "tags",
     "links_out",
     "pinned",
+    "summary",
+    "sender_ids",
 )
 
 
@@ -53,6 +55,13 @@ class Page:
     tags: list[str] = field(default_factory=list)
     links_out: list[str] = field(default_factory=list)
     pinned: bool | None = None
+    # Optional sender-card fields (Layer 2). ``summary`` is a short one-liner
+    # surfaced in the runtime-context tail; ``sender_ids`` are channel-qualified
+    # interlocutor ids (e.g. ``"telegram:136150230"``) the agent self-binds.
+    # Both are emitted ONLY when present so fieldless pages serialize
+    # byte-identically to before. ``None`` / ``[]`` mean absent.
+    summary: str | None = None
+    sender_ids: list[str] = field(default_factory=list)
     body: str = ""
 
 
@@ -73,14 +82,22 @@ def serialize_page(page: Page) -> str:
         "tags": list(page.tags),
         "links_out": list(page.links_out),
         "pinned": page.pinned,
+        "summary": page.summary,
+        "sender_ids": list(page.sender_ids),
     }
     # _KEY_ORDER is the single source of truth for which keys are emitted and
     # in what order; building fm by iterating it keeps the two from drifting.
     fm: dict[str, object] = {}
     for key in _KEY_ORDER:
         value = values[key]
-        # pinned is the sole optional field: omitted entirely when None.
+        # pinned is the sole optional bool: omitted entirely when None.
         if key == "pinned" and value is None:
+            continue
+        # Optional sender-card fields: omitted when absent so a page that
+        # never set them serializes byte-identically to the pre-Layer-2 format.
+        if key == "summary" and value is None:
+            continue
+        if key == "sender_ids" and not value:
             continue
         fm[key] = value
 
@@ -153,6 +170,11 @@ def parse_page(text: str) -> Page:
     if pinned is not None and not isinstance(pinned, bool):
         raise ValueError("frontmatter 'pinned' must be a boolean if present")
 
+    # Optional sender-card fields (absent -> None / []).
+    summary = parsed.get("summary")
+    summary = None if summary is None else str(summary)
+    sender_ids = _str_list("sender_ids")
+
     # Body convention: after the closing "---\n" there is exactly one blank
     # line ("\n"), then the body verbatim. serialize_page emits "---\n\n<body>",
     # so `after` here is "\n<body>"; drop that single separator newline.
@@ -171,5 +193,7 @@ def parse_page(text: str) -> Page:
         tags=_str_list("tags"),
         links_out=_str_list("links_out"),
         pinned=pinned,
+        summary=summary,
+        sender_ids=sender_ids,
         body=body,
     )

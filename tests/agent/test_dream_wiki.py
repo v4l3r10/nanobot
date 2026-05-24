@@ -464,6 +464,130 @@ class TestDreamWikiEnabled:
         assert alice.is_file()
 
 
+# --- Layer 1a: unified vault USER.md mirror ---------------------------------
+
+
+class TestDreamVaultUserMirror:
+    """Layer 1a: with wiki on, each Dream cycle mirrors the (Phase-2-refined)
+    global USER.md into the UNIFIED vault's USER.md, un-freezing the stale
+    vault file the prompt reads. Unified-only, deterministic (no LLM call)."""
+
+    async def test_unified_vault_user_is_refreshed_from_global(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        dream.wiki_enabled = True
+        # Global USER.md = the rich, Phase-2-maintained card (fixture seeds it).
+        # Pre-create a STALE vault USER.md (simulating the frozen migrate one-shot).
+        vault_root = store.workspace / "memory" / "users" / "unified_default"
+        (vault_root / "wiki").mkdir(parents=True, exist_ok=True)
+        (vault_root / "USER.md").write_text("STALE 3-line note", encoding="utf-8")
+
+        store.append_history("event 1")
+        store.append_history("event 2")
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+        # Vault USER.md now equals the global card (stale note overwritten).
+        assert (vault_root / "USER.md").read_text(encoding="utf-8") == "# User\n- Developer"
+
+    async def test_mirror_skipped_when_global_user_blank(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """If the global USER.md is blank/whitespace, do NOT clobber the vault
+        copy with emptiness (guard against wiping a good vault card)."""
+        dream.wiki_enabled = True
+        store.write_user("   \n")  # blank global
+        vault_root = store.workspace / "memory" / "users" / "unified_default"
+        (vault_root / "wiki").mkdir(parents=True, exist_ok=True)
+        (vault_root / "USER.md").write_text("keep me", encoding="utf-8")
+        store.append_history("event 1")
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "x"}],
+        ))
+        await dream.run()
+        assert (vault_root / "USER.md").read_text(encoding="utf-8") == "keep me"
+
+
+# --- Layer 1b: per-user vault USER.md slice-refine --------------------------
+
+
+class TestDreamPerUserVaultUserRefine:
+    """Layer 1b: a per-user (non-unified) vault gets its USER.md refined from
+    THAT user's slice via a focused LLM call — never the global blob (C1)."""
+
+    async def test_per_user_vault_user_refined_from_slice(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        dream.wiki_enabled = True
+        store.append_history("USER ONE likes dark mode", session_key="telegram:1")
+
+        # Phase1 -> ingest(telegram_1) -> user-refine(telegram_1).
+        calls = {"n": 0}
+
+        async def _se(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return MagicMock(content="New fact", finish_reason="stop")
+            if calls["n"] == 2:
+                return MagicMock(content=_INGEST_OUTPUT, finish_reason="stop")
+            return MagicMock(
+                content="# User (telegram 1)\n- prefers dark mode",
+                finish_reason="stop",
+            )
+
+        mock_provider.chat_with_retry.side_effect = _se
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "x"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+        v1_user = store.workspace / "memory" / "users" / "telegram_1" / "USER.md"
+        assert v1_user.is_file()
+        body = v1_user.read_text(encoding="utf-8")
+        assert "prefers dark mode" in body
+        # NEVER the global profile blob (C1: no cross-user / global contamination).
+        assert "# User\n- Developer" not in body
+
+    async def test_per_user_refine_skipped_when_slice_empty(
+        self, dream, mock_provider, mock_runner, store, monkeypatch,
+    ):
+        """A vault with no slice this cycle (e.g. forced into the loop with an
+        empty filtered batch) must NOT trigger an LLM refine — no provider call
+        is spent and no USER.md is written for it."""
+        dream.wiki_enabled = True
+        store.append_history("only unified", session_key="unified:default")
+
+        unified = vault_slug("unified:default")
+        extra = vault_slug("telegram:777")
+        monkeypatch.setattr(dream, "_vaults_for_batch", lambda _b: [unified, extra])
+
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),  # unified ingest
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),  # extra ingest (empty slice)
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "x"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+        # The empty-slice extra vault got NO USER.md (no refine call spent).
+        assert not (store.workspace / "memory" / "users" / extra / "USER.md").exists()
+
+
 # --- Task 7: Dream-time embedding refresh (dense tier optional) -------------
 
 
@@ -725,7 +849,10 @@ class TestMultiUserVaultIsolation:
             assert (v / "wiki" / "SCHEMA.md").is_file()
             assert not (v / ".migrated").exists()
             assert not (v / "wiki" / "concepts" / "imported-memory.md").exists()
-            assert not (v / "USER.md").exists()
+            # Layer 1b: per-user vaults now get their OWN USER.md (refined from
+            # their slice) — but it must NEVER be the global blob (C1 holds).
+            if (v / "USER.md").exists():
+                assert (v / "USER.md").read_text(encoding="utf-8") != "# User\n- Developer"
             dump = (v / "wiki" / "concepts" / "dump.md").read_text(encoding="utf-8")
             assert own in dump
             assert foreign not in dump
