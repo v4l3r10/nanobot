@@ -30,6 +30,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.filesystem import _FsTool
@@ -551,9 +553,15 @@ class WikiNoteTool(_FsTool, ContextAware):
         header: str
         results: list[tuple[str, Page]]
 
+        # mode_tag / q_suffix feed a single INFO line so each search the agent
+        # runs is observable (which mode, how many hits, cap/overflow). The
+        # per-layer (BM25/dense/RRF) breakdown is logged by retrieval.search.
+        mode_tag: str
+        q_suffix = ""
         if not q:
             results = _ordered_recent(pages)
             header_kind = "most recently touched"
+            mode_tag = "recent"
         elif q[:4].lower() == "tag:":
             wanted = q[4:].strip().lower()
             matched = [
@@ -563,16 +571,24 @@ class WikiNoteTool(_FsTool, ContextAware):
             ]
             results = _ordered_recent(matched)
             header_kind = f"tagged {wanted!r}"
+            mode_tag = f"tag:{wanted}"
         else:
             from nanobot.agent.wiki import retrieval
 
             results = retrieval.search(vault, q)  # ranked (rel, Page); dense auto-detected
             header_kind = f"matching {q!r}"
+            mode_tag = "hybrid"
+            q_suffix = f" {q!r}"
+
+        total = len(results)
+        logger.info(
+            "wiki_note search [{}]{} → {} shown / {} total",
+            mode_tag, q_suffix, min(total, _SEARCH_CAP), total,
+        )
 
         if not results:
             return f"No matching pages for {query!r}."
 
-        total = len(results)
         shown = results[:_SEARCH_CAP]
         header = f"Found {len(shown)} page(s) ({header_kind}):"
         lines = [header]

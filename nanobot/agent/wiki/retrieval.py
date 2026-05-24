@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from collections import Counter
+
+from loguru import logger
 
 # Minimal IT/EN stopwords — just the highest-frequency function words that add
 # noise to BM25. Deliberately small (YAGNI): a full list is overkill for a
@@ -128,13 +131,44 @@ def search(vault, query, k=None, model=None):
     corpus = {
         rel: "\n".join((p.title, " ".join(p.tags), p.body)) for rel, p in pages.items()
     }
-    rankings = [bm25_ranking(corpus, tokenize(q))]
+    t0 = time.perf_counter()
+    bm25 = bm25_ranking(corpus, tokenize(q))
+    t_bm25 = time.perf_counter() - t0
+    rankings = [bm25]
+
+    # dense_n is None while the tier is inactive (fastembed missing / no
+    # embeddings built / query-embed failure) — logged as "inactive" so a
+    # silent BM25-only degrade is visible.
+    dense_n: int | None = None
+    t1 = time.perf_counter()
     dense = _load_dense_ranker(vault, model)
     if dense is not None:
         try:
-            rankings.append(dense.rank(q))
+            dense_rank = dense.rank(q)
+            rankings.append(dense_rank)
+            dense_n = len(dense_rank)
         except Exception:
             pass  # best-effort: a query-embed failure degrades to BM25 for this call
+    t_dense = time.perf_counter() - t1
+
+    t2 = time.perf_counter()
     fused = rrf_fuse(rankings, k_rrf=60)
+    t_fuse = time.perf_counter() - t2
+
     hits = [(rel, pages[rel]) for rel in fused if rel in pages]
+
+    def _ms(s: float) -> str:
+        return f"{s * 1000:.0f}ms"
+
+    dense_part = (
+        f" + dense={dense_n} ({_ms(t_dense)})" if dense_n is not None
+        else ", dense=inactive"
+    )
+    msg = (
+        f"wiki search {q[:80]!r} : bm25={len(bm25)} ({_ms(t_bm25)})"
+        f"{dense_part} → fused {len(fused)} ({_ms(t_fuse)}), "
+        f"top={fused[0] if fused else 'none'}"
+    )
+    logger.info("{}", msg)
+
     return hits if k is None else hits[:k]

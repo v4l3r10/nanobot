@@ -134,6 +134,60 @@ def test_search_fuses_dense_when_available(tmp_path, monkeypatch):
     assert "people/alice.md" in rels and "projects/logistica.md" in rels
 
 
+# --- search layer-breakdown logging (visibility) ----------------------------
+
+
+def test_search_logs_layer_breakdown_with_dense(tmp_path, monkeypatch):
+    from loguru import logger
+
+    from nanobot.agent.wiki import retrieval
+    from nanobot.agent.wiki.vault import Vault
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    _seed_vault(vault)
+
+    class FakeDense:
+        def rank(self, query):
+            return [("people/alice.md", 1), ("projects/logistica.md", 2)]
+
+    monkeypatch.setattr(retrieval, "_load_dense_ranker",
+                        lambda vault, model: FakeDense())
+    captured: list[str] = []
+    sink_id = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        retrieval.search(vault, "logistica magazzino", k=20, model="fake-model")
+    finally:
+        logger.remove(sink_id)
+    line = next((m for m in captured if "wiki search" in m), "")
+    assert line, captured
+    assert "bm25=" in line
+    assert "dense=2" in line          # FakeDense returned 2 candidates
+    assert "fused" in line
+    assert "top=" in line
+    assert "ms" in line               # per-layer latency present
+
+
+def test_search_logs_dense_inactive(tmp_path, monkeypatch):
+    from loguru import logger
+
+    from nanobot.agent.wiki import retrieval
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    _seed_vault(vault)
+    captured: list[str] = []
+    sink_id = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        retrieval.search(vault, "logistica magazzino", k=20, model=None)
+    finally:
+        logger.remove(sink_id)
+    line = next((m for m in captured if "wiki search" in m), "")
+    assert line, captured
+    assert "dense=inactive" in line
+    assert "bm25=" in line
+
+
 def test_importing_wiki_note_does_not_pull_numpy_or_fastembed():
     # Architectural invariant: the always-on lexical path must never import the
     # optional dense deps (numpy/fastembed). Run in a fresh interpreter so the

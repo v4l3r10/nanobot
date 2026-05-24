@@ -1172,3 +1172,51 @@ async def test_wiki_note_failed_append_does_not_mark(tmp_path):
     assert "not found" in out.lower()
     # A failed append must NOT mark the vault.
     assert take_dirty(slug) is False
+
+
+# --- search tool-line logging (visibility) ----------------------------------
+
+
+async def test_search_logs_tool_line_hybrid(tmp_path):
+    from loguru import logger
+    t = _tool(tmp_path)
+    _seed_page(tmp_path, "people/alice.md",
+               _page(type="people", title="Alice", body="handles the payment flow"))
+    captured: list[str] = []
+    sink_id = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        await t.execute(operation="search", query="payment")
+    finally:
+        logger.remove(sink_id)
+    line = next((m for m in captured if "wiki_note search" in m), "")
+    assert line, captured
+    assert "[hybrid]" in line
+    assert "shown" in line and "total" in line
+
+
+async def test_search_logs_tool_line_tag(tmp_path):
+    from loguru import logger
+    t = _tool(tmp_path)
+    _seed_page(tmp_path, "people/alice.md",
+               _page(type="people", title="Alice", body="x", tags=["eng"]))
+    captured: list[str] = []
+    sink_id = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        await t.execute(operation="search", query="tag:eng")
+    finally:
+        logger.remove(sink_id)
+    assert any("wiki_note search [tag:eng]" in m for m in captured), captured
+
+
+async def test_search_logs_tool_line_recent(tmp_path):
+    from loguru import logger
+    t = _tool(tmp_path)
+    _seed_page(tmp_path, "people/alice.md",
+               _page(type="people", title="Alice", body="x"))
+    captured: list[str] = []
+    sink_id = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        await t.execute(operation="search", query="")
+    finally:
+        logger.remove(sink_id)
+    assert any("wiki_note search [recent]" in m for m in captured), captured
