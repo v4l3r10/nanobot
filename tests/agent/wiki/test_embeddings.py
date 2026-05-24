@@ -477,6 +477,96 @@ def test_refresh_rebuilds_from_old_layout_manifest(tmp_path, monkeypatch):
     assert {e["slug"] for e in manifest["entries"]} == {"projects/a.md"}
 
 
+# --- refresh_embeddings RETURN REPORT (dream visibility) --------------------
+# refresh_embeddings now returns an EmbedRefreshReport so the Dream loop can log
+# what it did per vault. These lock the report fields for every branch.
+
+
+def test_refresh_report_fastembed_unavailable(tmp_path, monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: None)
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    report = emb.refresh_embeddings(vault, "m")
+    assert report.available is False
+    assert report.changed is False
+    assert report.failed is False
+
+
+def test_refresh_report_on_rebuild(tmp_path, monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: object)
+    monkeypatch.setattr(emb, "embed_texts_chunked", _fake_chunked_factory([]))
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    _write_page(vault, "projects/a.md", _page("projects", "A", "alpha body"))
+    _write_page(vault, "projects/b.md", _page("projects", "B", "beta body"))
+    report = emb.refresh_embeddings(vault, "m")
+    assert report.available is True
+    assert report.changed is True
+    assert report.pages == 2
+    assert report.vectors == 2
+    assert report.reembedded == 2
+    assert report.deleted == 0
+
+
+def test_refresh_report_up_to_date(tmp_path, monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: object)
+    monkeypatch.setattr(emb, "embed_texts_chunked", _fake_chunked_factory([]))
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    _write_page(vault, "projects/a.md", _page("projects", "A", "alpha body"))
+    _write_page(vault, "projects/b.md", _page("projects", "B", "beta body"))
+    emb.refresh_embeddings(vault, "m")
+    report = emb.refresh_embeddings(vault, "m")  # second run, no changes
+    assert report.available is True
+    assert report.changed is False
+    assert report.pages == 2
+    assert report.vectors == 2
+    assert report.reembedded == 0
+    assert report.deleted == 0
+
+
+def test_refresh_report_counts_deleted(tmp_path, monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: object)
+    monkeypatch.setattr(emb, "embed_texts_chunked", _fake_chunked_factory([]))
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    _write_page(vault, "projects/a.md", _page("projects", "A", "alpha body"))
+    _write_page(vault, "projects/b.md", _page("projects", "B", "beta body"))
+    emb.refresh_embeddings(vault, "m")
+    (vault.wiki_dir / "projects" / "b.md").unlink()
+    report = emb.refresh_embeddings(vault, "m")
+    assert report.changed is True
+    assert report.deleted == 1
+    assert report.reembedded == 0
+    assert report.pages == 1
+    assert report.vectors == 1
+
+
+def test_refresh_report_counts_multichunk_vectors(tmp_path, monkeypatch):
+    import nanobot.agent.wiki.embeddings as emb
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(emb, "_import_text_embedding", lambda: object)
+    chunks_for = lambda t: 3 if "LONG" in t else 1  # noqa: E731
+    monkeypatch.setattr(emb, "embed_texts_chunked",
+                        _fake_chunked_factory([], chunks_for))
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    _write_page(vault, "projects/a.md", _page("projects", "A", "LONG body here"))
+    _write_page(vault, "projects/b.md", _page("projects", "B", "short"))
+    report = emb.refresh_embeddings(vault, "m")
+    assert report.pages == 2       # two pages
+    assert report.vectors == 4     # 3 chunks + 1 chunk
+    assert report.reembedded == 2
+
+
 def _fake_model_description_module():
     import types
     mod = types.ModuleType("fastembed.common.model_description")
