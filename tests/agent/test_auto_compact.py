@@ -18,6 +18,9 @@ from nanobot.providers.base import LLMResponse
 def _make_loop(
     tmp_path: Path,
     session_ttl_minutes: int = 15,
+    *,
+    unified_memory: bool = False,
+    unified_session: bool = False,
 ) -> AgentLoop:
     """Create a minimal AgentLoop for testing."""
     bus = MessageBus()
@@ -33,6 +36,8 @@ def _make_loop(
         model="test-model",
         context_window_tokens=128_000,
         session_ttl_minutes=session_ttl_minutes,
+        unified_memory=unified_memory,
+        unified_session=unified_session,
     )
     loop.tools.get_definitions = MagicMock(return_value=[])
     return loop
@@ -163,14 +168,10 @@ class TestAgentLoopTTLParam:
         archived = archive_fn.call_args.args[0]
         assert [m["content"] for m in archived] == ["u2", "u3"]
 
-    def test_enforce_file_cap_passes_session_key_exactly_once(self, tmp_path):
-        """I2 (Task 7.2 review): ``enforce_file_cap`` must call ``on_archive``
-        with ``session_key=self.key`` EXACTLY ONCE — no keyless double-call.
-
-        Every real in-tree ``on_archive`` is the bound ``MemoryStore.raw_archive``
-        which accepts ``session_key``, so the old ``except TypeError`` keyless
-        fallback was DEAD; option (a) drops it entirely.
-        """
+    def test_enforce_file_cap_passes_session_exactly_once(self, tmp_path):
+        """CV2/3a: enforce_file_cap consegna la SESSIONE (session=self) all'owner
+        (Consolidator.raw_archive), che risolve la memory_key. Una sola chiamata,
+        nessun session_key grezzo al call-site."""
         from nanobot.session.manager import Session
 
         archive_fn = MagicMock()
@@ -182,20 +183,17 @@ class TestAgentLoopTTLParam:
         session.enforce_file_cap(on_archive=archive_fn, limit=4)
 
         archive_fn.assert_called_once()
-        assert archive_fn.call_args.kwargs == {"session_key": "telegram:7"}
+        assert archive_fn.call_args.kwargs == {"session": session}
 
     def test_enforce_file_cap_interior_typeerror_propagates(self, tmp_path):
-        """I2: a ``TypeError`` raised DEEP INSIDE a correctly-signatured
-        ``on_archive`` must PROPAGATE — it must NOT be silently swallowed and
-        the call must NOT be retried keyless (which would double/mis-route the
-        archive). The masking ``except TypeError`` shim is gone.
-        """
+        """Un TypeError sollevato DENTRO on_archive deve PROPAGARE — mai
+        mascherato/ritentato keyless."""
         from nanobot.session.manager import Session
 
         calls: list[dict] = []
 
-        def _archive(chunk, *, session_key=None):
-            calls.append({"session_key": session_key})
+        def _archive(chunk, *, session=None):
+            calls.append({"session": session})
             raise TypeError("interior bug, NOT a signature mismatch")
 
         session = Session(key="telegram:7")
@@ -206,8 +204,7 @@ class TestAgentLoopTTLParam:
         with pytest.raises(TypeError, match="interior bug"):
             session.enforce_file_cap(on_archive=_archive, limit=4)
 
-        # Called exactly once, WITH session_key — never retried keyless.
-        assert calls == [{"session_key": "telegram:7"}]
+        assert calls == [{"session": session}]
 
 
 class TestAutoCompact:
@@ -1237,4 +1234,88 @@ class TestSummaryPersistence:
         # After /new, metadata should no longer contain _last_summary
         fresh = loop.sessions.get_or_create("cli:test")
         assert "_last_summary" not in fresh.metadata
+        await loop.close_mcp()
+
+
+class TestConsolidationMemoryKeyMatrix:
+    """Tutti i write-path di consolidamento devono scrivere session_key =
+    _resolve_memory_key(session). Config B -> unified; config A -> per-utente."""
+
+    @pytest.mark.asyncio
+    async def test_autocompact_config_b_archives_to_unified(self, tmp_path):
+        loop = _make_loop(tmp_path, session_ttl_minutes=15, unified_memory=True)
+        session = loop.sessions.get_or_create("telegram:123")
+        _add_turns(session, 6)
+        loop.sessions.save(session)
+        await loop.auto_compact._archive("telegram:123")
+        entries = loop.context.memory.read_unprocessed_history(since_cursor=0)
+        assert entries, "autocompact should have archived a record"
+        assert all(e["session_key"] == "unified:default" for e in entries)
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_autocompact_config_a_archives_per_user(self, tmp_path):
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)  # both flags off
+        session = loop.sessions.get_or_create("telegram:123")
+        _add_turns(session, 6)
+        loop.sessions.save(session)
+        await loop.auto_compact._archive("telegram:123")
+        entries = loop.context.memory.read_unprocessed_history(since_cursor=0)
+        assert entries
+        assert all(e["session_key"] == "telegram:123" for e in entries)
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_enforce_file_cap_config_b_archives_to_unified(self, tmp_path):
+        loop = _make_loop(tmp_path, session_ttl_minutes=15, unified_memory=True)
+        session = loop.sessions.get_or_create("telegram:9")
+        for i in range(8):
+            session.add_message("user", f"u{i}")
+        session.last_consolidated = 2
+        session.enforce_file_cap(on_archive=loop.consolidator.raw_archive, limit=4)
+        entries = loop.context.memory.read_unprocessed_history(since_cursor=0)
+        assert entries, "file-cap should have raw-archived a record"
+        assert all(e["session_key"] == "unified:default" for e in entries)
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_enforce_file_cap_config_a_archives_per_user(self, tmp_path):
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)  # flags off
+        session = loop.sessions.get_or_create("telegram:9")
+        for i in range(8):
+            session.add_message("user", f"u{i}")
+        session.last_consolidated = 2
+        session.enforce_file_cap(on_archive=loop.consolidator.raw_archive, limit=4)
+        entries = loop.context.memory.read_unprocessed_history(since_cursor=0)
+        assert entries
+        assert all(e["session_key"] == "telegram:9" for e in entries)
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_cmd_new_passes_session_to_archive(self, tmp_path):
+        """#4: /new deve consegnare la SESSIONE (session=) al Consolidator,
+        non session_key grezzo."""
+        from nanobot.command import CommandContext
+        from nanobot.command.builtin import cmd_new
+
+        loop = _make_loop(tmp_path, session_ttl_minutes=15, unified_memory=True)
+        session = loop.sessions.get_or_create("telegram:5")
+        _add_turns(session, 2)
+        loop.sessions.save(session)
+
+        captured: dict = {}
+
+        async def _spy(messages, **kwargs):
+            captured["messages"] = messages
+            captured.update(kwargs)
+            return "S"
+
+        loop.consolidator.archive = _spy
+
+        msg = InboundMessage(channel="telegram", sender_id="u", chat_id="5", content="/new")
+        ctx = CommandContext(msg=msg, session=session, key="telegram:5", raw="/new", loop=loop)
+        await cmd_new(ctx)
+        await asyncio.sleep(0.05)  # lascia girare il task di _schedule_background
+
+        assert captured.get("session") is session
         await loop.close_mcp()

@@ -85,11 +85,12 @@ class AutoCompact:
             last_active = session.updated_at
             summary = ""
             if archive_msgs:
-                # Task 7.2: thread the EFFECTIVE session key (the idle
-                # session's key) so Dream routes this user's auto-compacted
-                # memory into THAT user's per-user wiki vault.
+                # CV2: consegna la session al Consolidator, che risolve la
+                # memory_key via il resolver (unified sotto unified_memory,
+                # session.key per il wiki per-utente). Nessuna chiave grezza
+                # al call-site.
                 summary = await self.consolidator.archive(
-                    archive_msgs, session_key=session.key
+                    archive_msgs, session=session
                 ) or ""
             if summary and summary != "(nothing)":
                 self._summaries[key] = (summary, last_active)
