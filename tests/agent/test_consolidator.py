@@ -390,3 +390,44 @@ class TestArchiveTruncation:
         sent_content = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
         token_count = len(enc.encode(sent_content))
         assert token_count <= 9_900 + 10  # small margin for truncation suffix
+
+
+class TestConsolidatorResolvesMemoryKey:
+    """CV2: archive() deve risolvere session -> memory_key via il resolver
+    iniettato (single source of truth), mai scrivere la chat-key grezza.
+    Matrice: config A (wiki per-utente) tiene session.key; config B/C -> unified."""
+
+    def _consolidator(self, store, mock_provider, resolver):
+        sessions = MagicMock()
+        sessions.save = MagicMock()
+        return Consolidator(
+            store=store, provider=mock_provider, model="test-model",
+            sessions=sessions, context_window_tokens=1000,
+            build_messages=MagicMock(return_value=[]),
+            get_tool_definitions=MagicMock(return_value=[]),
+            max_completion_tokens=100,
+            memory_key_resolver=resolver,
+        )
+
+    async def test_archive_config_b_writes_unified(self, store, mock_provider):
+        mock_provider.chat_with_retry.return_value = MagicMock(content="S", finish_reason="stop")
+        c = self._consolidator(store, mock_provider, lambda s: "unified:default")
+        session = Session(key="telegram:11589542")
+        await c.archive([{"role": "user", "content": "hi"}], session=session)
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[-1]["session_key"] == "unified:default"
+
+    async def test_archive_config_a_keeps_per_user(self, store, mock_provider):
+        mock_provider.chat_with_retry.return_value = MagicMock(content="S", finish_reason="stop")
+        c = self._consolidator(store, mock_provider, lambda s: s.key)
+        session = Session(key="telegram:11589542")
+        await c.archive([{"role": "user", "content": "hi"}], session=session)
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[-1]["session_key"] == "telegram:11589542"
+
+    async def test_archive_no_session_defaults_unified(self, store, mock_provider):
+        mock_provider.chat_with_retry.return_value = MagicMock(content="S", finish_reason="stop")
+        c = self._consolidator(store, mock_provider, lambda s: s.key)
+        await c.archive([{"role": "user", "content": "hi"}])  # session=None
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[-1]["session_key"] == "unified:default"

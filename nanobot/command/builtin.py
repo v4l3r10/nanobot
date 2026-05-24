@@ -206,10 +206,10 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
     if snapshot:
-        # Task 7.2: thread the EFFECTIVE session key so the consolidated
-        # snapshot of the session being reset routes to THAT user's vault.
+        # CV2: consegna la session al Consolidator, che risolve la memory_key
+        # via il resolver (unified sotto unified_memory; session.key altrimenti).
         loop._schedule_background(
-            loop.consolidator.archive(snapshot, session_key=session.key)
+            loop.consolidator.archive(snapshot, session=session)
         )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,

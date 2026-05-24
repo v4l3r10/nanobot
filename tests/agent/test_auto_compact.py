@@ -18,6 +18,9 @@ from nanobot.providers.base import LLMResponse
 def _make_loop(
     tmp_path: Path,
     session_ttl_minutes: int = 15,
+    *,
+    unified_memory: bool = False,
+    unified_session: bool = False,
 ) -> AgentLoop:
     """Create a minimal AgentLoop for testing."""
     bus = MessageBus()
@@ -33,6 +36,8 @@ def _make_loop(
         model="test-model",
         context_window_tokens=128_000,
         session_ttl_minutes=session_ttl_minutes,
+        unified_memory=unified_memory,
+        unified_session=unified_session,
     )
     loop.tools.get_definitions = MagicMock(return_value=[])
     return loop
@@ -1237,4 +1242,33 @@ class TestSummaryPersistence:
         # After /new, metadata should no longer contain _last_summary
         fresh = loop.sessions.get_or_create("cli:test")
         assert "_last_summary" not in fresh.metadata
+        await loop.close_mcp()
+
+
+class TestConsolidationMemoryKeyMatrix:
+    """Tutti i write-path di consolidamento devono scrivere session_key =
+    _resolve_memory_key(session). Config B -> unified; config A -> per-utente."""
+
+    @pytest.mark.asyncio
+    async def test_autocompact_config_b_archives_to_unified(self, tmp_path):
+        loop = _make_loop(tmp_path, session_ttl_minutes=15, unified_memory=True)
+        session = loop.sessions.get_or_create("telegram:123")
+        _add_turns(session, 6)
+        loop.sessions.save(session)
+        await loop.auto_compact._archive("telegram:123")
+        entries = loop.context.memory.read_unprocessed_history(since_cursor=0)
+        assert entries, "autocompact should have archived a record"
+        assert all(e["session_key"] == "unified:default" for e in entries)
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_autocompact_config_a_archives_per_user(self, tmp_path):
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)  # both flags off
+        session = loop.sessions.get_or_create("telegram:123")
+        _add_turns(session, 6)
+        loop.sessions.save(session)
+        await loop.auto_compact._archive("telegram:123")
+        entries = loop.context.memory.read_unprocessed_history(since_cursor=0)
+        assert entries
+        assert all(e["session_key"] == "telegram:123" for e in entries)
         await loop.close_mcp()
