@@ -347,7 +347,14 @@ class ContextBuilder:
         vault resolution inside :meth:`build_system_prompt`. Threaded
         unchanged; back-compat by default (``None`` → use session_key).
         """
-        extra = goal_state_runtime_lines(session_metadata)
+        extra = list(goal_state_runtime_lines(session_metadata) or [])
+        # Layer 2: per-interlocutor sender card. Resolved from people-page
+        # frontmatter and appended to the VOLATILE runtime tail (never the
+        # cacheable system-prompt prefix), so it is group-safe and adds zero
+        # cache cost. None -> no line -> tail byte-identical (opt-in by data).
+        card = self.resolve_sender_card(sender_id, channel, memory_key or session_key)
+        if card:
+            extra.append(f"Sender: {card}")
         runtime_ctx = self._build_runtime_context(
             channel,
             chat_id,
