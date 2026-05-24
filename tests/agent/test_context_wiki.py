@@ -352,3 +352,68 @@ class TestUnifiedSessionVaultPath:
         mem = _memory_section(prompt)
         assert mem is not None
         assert "vault for telegram" in mem
+
+
+# ---------------------------------------------------------------------------
+# Layer 2 — per-interlocutor sender card
+# ---------------------------------------------------------------------------
+
+
+def _seed_person(tmp_path, slug, sender_ids, summary, title="Eugenio"):
+    """Write a hot people page with sender-card frontmatter into a vault."""
+    from nanobot.agent.wiki.vault import Vault
+    from nanobot.agent.wiki.page import Page, serialize_page
+    from nanobot.utils.atomic import atomic_write_text
+
+    v = Vault(tmp_path / "memory" / "users" / slug)
+    v.ensure_initialized()
+    p = Page(
+        type="people", title=title, status="hot",
+        created="2026-05-24", updated="2026-05-24", last_touched="2026-05-24",
+        summary=summary, sender_ids=sender_ids, body="full bio here",
+    )
+    atomic_write_text(v.page_path("people", title.lower()), serialize_page(p))
+
+
+class TestResolveSenderCard:
+    def test_resolves_by_numeric_prefix(self, tmp_path):
+        _seed_person(tmp_path, "unified_default",
+                     ["telegram:136150230"], "giornalista, IT informale")
+        cb = ContextBuilder(tmp_path, wiki_enabled=True)
+        line = cb.resolve_sender_card(
+            sender_id="136150230|eugenio_user", channel="telegram",
+            vault_key="unified:default")
+        assert line is not None
+        assert "Eugenio" in line and "giornalista" in line
+
+    def test_resolves_by_full_sender_id(self, tmp_path):
+        _seed_person(tmp_path, "unified_default",
+                     ["telegram:136150230|eugenio_user"], "giornalista")
+        cb = ContextBuilder(tmp_path, wiki_enabled=True)
+        line = cb.resolve_sender_card(
+            sender_id="136150230|eugenio_user", channel="telegram",
+            vault_key="unified:default")
+        assert line is not None and "Eugenio" in line
+
+    def test_no_binding_returns_none(self, tmp_path):
+        _seed_person(tmp_path, "unified_default",
+                     ["telegram:999"], "someone else")
+        cb = ContextBuilder(tmp_path, wiki_enabled=True)
+        assert cb.resolve_sender_card(
+            sender_id="136150230|x", channel="telegram",
+            vault_key="unified:default") is None
+
+    def test_disabled_returns_none(self, tmp_path):
+        _seed_person(tmp_path, "unified_default", ["telegram:1"], "x")
+        cb = ContextBuilder(tmp_path, wiki_enabled=False)
+        assert cb.resolve_sender_card("1|a", "telegram", "unified:default") is None
+
+    def test_no_vault_key_returns_none(self, tmp_path):
+        cb = ContextBuilder(tmp_path, wiki_enabled=True)
+        assert cb.resolve_sender_card("1|a", "telegram", None) is None
+
+    def test_page_without_summary_is_not_resolved(self, tmp_path):
+        # Bound id but no summary -> nothing useful to inject -> None.
+        _seed_person(tmp_path, "unified_default", ["telegram:55"], "")
+        cb = ContextBuilder(tmp_path, wiki_enabled=True)
+        assert cb.resolve_sender_card("55|x", "telegram", "unified:default") is None
