@@ -1361,7 +1361,7 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history), turn_latency_ms=latency_ms)
         if channel == "websocket":
             self._pending_turn_latency_ms[key] = latency_ms
-        session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+        session.enforce_file_cap(on_archive=self.consolidator.raw_archive)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
         self._schedule_background(
@@ -1685,7 +1685,7 @@ class AgentLoop:
         )
         if ctx.msg.channel == "websocket":
             self._pending_turn_latency_ms[ctx.session_key] = ctx.turn_latency_ms
-        ctx.session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+        ctx.session.enforce_file_cap(on_archive=self.consolidator.raw_archive)
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
         self.sessions.save(ctx.session)
