@@ -840,6 +840,21 @@ class Consolidator:
             self.store.raw_archive(messages, session_key=key)
             return None
 
+    def raw_archive(
+        self,
+        messages: list[dict],
+        *,
+        session: "Session | None" = None,
+        max_chars: int | None = None,
+    ) -> None:
+        """CV2: risolve session -> memory_key e delega al writer fisico
+        (MemoryStore.raw_archive). È l'``on_archive`` bound da
+        ``enforce_file_cap``, così anche il path file-cap passa dal resolver
+        (il Consolidator è l'unico owner delle scritture di history).
+        ``session=None`` -> None -> unified (back-compat)."""
+        key = self._resolve_memory_key(session) if session is not None else None
+        self.store.raw_archive(messages, session_key=key, max_chars=max_chars)
+
     async def maybe_consolidate_by_tokens(
         self,
         session: Session,
