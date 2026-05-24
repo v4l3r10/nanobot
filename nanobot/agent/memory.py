@@ -1656,6 +1656,55 @@ class Dream:
                                     atomic_write_text(
                                         vault.root / "USER.md", global_user,
                                     )
+                            # Layer 1b: per-user vaults — refine THIS user's
+                            # vault USER.md from THIS slug's slice only. In
+                            # non-unified mode the slice is single-user by
+                            # construction (session_key routes per user), so
+                            # the refine is attributable. Guarded on a
+                            # non-empty slice (no slice -> nothing to learn ->
+                            # no LLM call, so the empty-`extra`-slug tests keep
+                            # their exact provider-call counts). Best-effort:
+                            # any failure is caught by the per-slug `except`
+                            # below and never touches the legacy path.
+                            elif slug_batch:
+                                cur = (
+                                    self.store.read_file(vault.root / "USER.md")
+                                    or "(empty)"
+                                )
+                                slice_text = "\n".join(
+                                    f"[{e['timestamp']}] "
+                                    f"{truncate_text(e['content'], self.history_entry_preview_max_chars)}"
+                                    for e in slug_batch
+                                )
+                                refine = await self.provider.chat_with_retry(
+                                    model=self.model,
+                                    messages=[
+                                        {
+                                            "role": "system",
+                                            "content": render_template(
+                                                "agent/dream_user_vault.md",
+                                                strip=True,
+                                            ),
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": (
+                                                f"## Current USER.md\n{cur}\n\n"
+                                                f"## Recent conversation\n{slice_text}"
+                                            ),
+                                        },
+                                    ],
+                                    tools=None,
+                                    tool_choice=None,
+                                )
+                                new_user = (refine.content or "").strip()
+                                if new_user:
+                                    atomic_write_text(
+                                        vault.root / "USER.md",
+                                        truncate_text(
+                                            new_user, self.user_file_max_chars
+                                        ),
+                                    )
                             # Refresh dense embeddings (opt-in). Both the flag
                             # AND a non-empty model are required: an unset model
                             # means the dense tier is effectively unconfigured,
