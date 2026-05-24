@@ -1289,3 +1289,154 @@ class TestDreamRunsAttachmentsReconciler:
         assert recon_calls == ["unified_default"], (
             f"reconciler called for unexpected slugs: {recon_calls!r}"
         )
+
+
+# --- Dream wiki-block logging (visibility) ----------------------------------
+# The wiki sub-stages each build a structured report; the Dream loop turns each
+# into one INFO line so the operator can see what happened per vault. The pure
+# ``_fmt_wiki_*`` formatters are unit-tested here for every branch; the two
+# integration tests confirm the lines are actually emitted at INFO during a run.
+from nanobot.agent.wiki.attachments_reconciler import ReconcileReport  # noqa: E402
+from nanobot.agent.wiki.embeddings import EmbedRefreshReport  # noqa: E402
+from nanobot.agent.wiki.ingest import IngestReport  # noqa: E402
+from nanobot.agent.wiki.lint import LintReport  # noqa: E402
+
+
+def test_fmt_wiki_ingest_changed():
+    r = IngestReport(created=["people/a.md", "people/b.md"],
+                     appended=["topics/c.md"], skipped_duplicate=1)
+    assert memory_mod._fmt_wiki_ingest("unified_default", r) == (
+        "Dream wiki[unified_default] ingest: "
+        "created=2 appended=1 contra=0 dup-skip=1"
+    )
+
+
+def test_fmt_wiki_ingest_no_changes():
+    assert memory_mod._fmt_wiki_ingest("u", IngestReport()) == (
+        "Dream wiki[u] ingest: no changes"
+    )
+
+
+def test_fmt_wiki_ingest_skipped():
+    assert memory_mod._fmt_wiki_ingest("u", IngestReport(skipped=True)) == (
+        "Dream wiki[u] ingest: skipped"
+    )
+
+
+def test_fmt_wiki_ingest_anomalies_suffix():
+    r = IngestReport(created=["x.md"], unknown=[("people", "ghost")],
+                     dropped=2, malformed_lines=3)
+    assert memory_mod._fmt_wiki_ingest("u", r) == (
+        "Dream wiki[u] ingest: created=1 appended=0 contra=0 dup-skip=0 "
+        "[unknown=1 dropped=2 malformed=3]"
+    )
+
+
+def test_fmt_wiki_lint_changed():
+    r = LintReport(cooled=["a.md"], moc_regenerated=True,
+                   indexes_regenerated=["index.md"])
+    assert memory_mod._fmt_wiki_lint("u", r) == (
+        "Dream wiki[u] lint: cooled=1 reheated=0 merged=0 orphans=0 "
+        "indexes=1 moc=yes"
+    )
+
+
+def test_fmt_wiki_lint_no_changes_with_findings():
+    r = LintReport(broken_links=[("a.md", "b")], malformed=["bad.md"])
+    assert memory_mod._fmt_wiki_lint("u", r) == (
+        "Dream wiki[u] lint: no changes [broken=1 malformed=1]"
+    )
+
+
+def test_fmt_wiki_embeddings_changed():
+    r = EmbedRefreshReport(available=True, changed=True, pages=4, vectors=11,
+                           reembedded=3, deleted=1)
+    assert memory_mod._fmt_wiki_embeddings("u", r) == (
+        "Dream wiki[u] embeddings: 4 pages → 11 vectors (3 re-embedded, 1 deleted)"
+    )
+
+
+def test_fmt_wiki_embeddings_up_to_date():
+    r = EmbedRefreshReport(available=True, changed=False, pages=6, vectors=9)
+    assert memory_mod._fmt_wiki_embeddings("u", r) == (
+        "Dream wiki[u] embeddings: up-to-date (6 pages)"
+    )
+
+
+def test_fmt_wiki_embeddings_unavailable():
+    msg = memory_mod._fmt_wiki_embeddings("u", EmbedRefreshReport(available=False))
+    assert "fastembed unavailable" in msg
+
+
+def test_fmt_wiki_attachments_active():
+    r = ReconcileReport(created=["inbox/a.md"], duplicates=3, skipped_binary=2)
+    assert memory_mod._fmt_wiki_attachments("u", r) == (
+        "Dream wiki[u] attachments: created=1 appended=0 dup=3 binary-skip=2"
+    )
+
+
+class TestDreamWikiLoggingIntegration:
+    """The formatted lines are actually emitted at INFO during a real run."""
+
+    async def test_wiki_logs_ingest_and_lint_at_info(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        dream.wiki_enabled = True
+        store.append_history("event 1")
+        store.append_history("event 2")
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok",
+                          "detail": "memory/MEMORY.md"}],
+        ))
+
+        captured: list[str] = []
+        sink_id = logger.add(lambda m: captured.append(str(m)), level="INFO")
+        try:
+            await dream.run()
+        finally:
+            logger.remove(sink_id)
+
+        assert any("ingest: created=1" in m for m in captured), captured
+        assert any("] lint:" in m for m in captured), captured
+        # No attachments on disk → idle reconcile stays at DEBUG (not INFO).
+        assert not any("] attachments:" in m for m in captured), captured
+        # Embeddings gate off (default) → disabled, stays at DEBUG (not INFO).
+        assert not any("] embeddings:" in m for m in captured), captured
+
+    async def test_wiki_logs_embeddings_summary_at_info(
+        self, dream, mock_provider, mock_runner, store, monkeypatch,
+    ):
+        dream.wiki_enabled = True
+        dream.wiki_embeddings = True
+        dream.wiki_embedding_model = "m"
+        monkeypatch.setattr(
+            "nanobot.agent.wiki.embeddings.refresh_embeddings",
+            lambda vault, model: EmbedRefreshReport(
+                available=True, changed=True, pages=4, vectors=11,
+                reembedded=3, deleted=1),
+        )
+        store.append_history("event 1")
+        store.append_history("event 2")
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "x"}],
+        ))
+
+        captured: list[str] = []
+        sink_id = logger.add(lambda m: captured.append(str(m)), level="INFO")
+        try:
+            await dream.run()
+        finally:
+            logger.remove(sink_id)
+
+        assert any(
+            "embeddings: 4 pages → 11 vectors (3 re-embedded, 1 deleted)" in m
+            for m in captured
+        ), captured

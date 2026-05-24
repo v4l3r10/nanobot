@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -16,6 +17,27 @@ import numpy as np
 from loguru import logger
 
 from nanobot.utils.atomic import atomic_write_text
+
+
+@dataclass
+class EmbedRefreshReport:
+    """Outcome of one ``refresh_embeddings`` run, for Dream-loop visibility.
+
+    ``available`` is False when fastembed is not installed (dense tier is a true
+    no-op). ``failed`` is True when the best-effort body raised and was swallowed
+    (the exception is already logged). ``changed`` is True iff a write happened
+    this run (a page was re-embedded or dropped). ``pages``/``vectors`` are the
+    totals persisted after the run; ``reembedded``/``deleted`` are this run's
+    deltas."""
+
+    available: bool = True
+    failed: bool = False
+    changed: bool = False
+    pages: int = 0
+    vectors: int = 0
+    reembedded: int = 0
+    deleted: int = 0
+
 
 _MANIFEST = "manifest.json"
 _VECTORS = "vectors.npy"
@@ -388,15 +410,16 @@ def _doc_text(page) -> str:
     return f"{page.title}\n{page.body}"
 
 
-def refresh_embeddings(vault, model: str) -> None:
+def refresh_embeddings(vault, model: str) -> EmbedRefreshReport:
     """Re-embed new/changed wiki pages, drop deleted ones, persist. Best-effort.
 
     Caller holds the per-vault Dream lock (serialized with ingest/lint and
     wiki_note writes). No-op when fastembed is unavailable. Never raises — a
-    failure here must never break the Dream cycle.
+    failure here must never break the Dream cycle. Returns an
+    :class:`EmbedRefreshReport` so the Dream loop can log what happened.
     """
     if _import_text_embedding() is None:
-        return
+        return EmbedRefreshReport(available=False)
     try:
         pages = {rel: page for rel, page in vault.iter_pages(include_cold=True)}
         current = {rel: body_hash(_doc_text(page)) for rel, page in pages.items()}
@@ -419,7 +442,12 @@ def refresh_embeddings(vault, model: str) -> None:
         new = [rel for rel in current if prev.get(rel) != current[rel]]
         deleted = [rel for rel in prev if rel not in current]
         if not new and not deleted:
-            return
+            prev_vectors = sum(
+                int(e.get("chunks", 0)) for e in prev_manifest.get("entries", [])
+            )
+            return EmbedRefreshReport(
+                changed=False, pages=len(current), vectors=prev_vectors,
+            )
 
         dim = prev_manifest.get("dim") or int(embed_texts_chunked(["x"], model)[0].shape[1])
         store = EmbeddingStore(vault.wiki_dir, model=model, dim=dim)
@@ -452,5 +480,13 @@ def refresh_embeddings(vault, model: str) -> None:
             entries.append((rel, current[rel], block.shape[0]))
         matrix = np.vstack(rows).astype("float32") if rows else np.zeros((0, dim), "float32")
         store.save(entries=entries, vectors=matrix)
+        return EmbedRefreshReport(
+            changed=True,
+            pages=len(entries),
+            vectors=int(matrix.shape[0]),
+            reembedded=len(to_embed),
+            deleted=len(deleted),
+        )
     except Exception:
         logger.exception("wiki embedding refresh failed for {} (non-fatal)", vault.wiki_dir)
+        return EmbedRefreshReport(failed=True)
