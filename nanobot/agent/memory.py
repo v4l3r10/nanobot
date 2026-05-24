@@ -1712,6 +1712,24 @@ class Dream:
                             logger.info("{}", _fmt_wiki_ingest(slug, ingest_report))
                             lint_report = run_lint(vault, _date.today())
                             logger.info("{}", _fmt_wiki_lint(slug, lint_report))
+                            # Layer 1a: keep the UNIFIED vault's USER.md in
+                            # sync with the global card Phase 2 just refined,
+                            # so the prompt (which reads <vault>/USER.md when
+                            # wiki is active) stops reading the frozen
+                            # migrate-one-shot copy. Deterministic mirror (no
+                            # LLM call -> the fixed-side_effect unified tests
+                            # keep their exact call counts). Unified-only:
+                            # per-user vaults must NEVER receive the global
+                            # blob (C1 cross-user contamination); they are
+                            # handled by the per-user slice-refine below. Guard
+                            # on a non-blank global so a missing/blank USER.md
+                            # can never wipe a good vault card.
+                            if slug == unified:
+                                global_user = self.store.read_user()
+                                if global_user and global_user.strip():
+                                    atomic_write_text(
+                                        vault.root / "USER.md", global_user,
+                                    )
                             # Refresh dense embeddings (opt-in). Both the flag
                             # AND a non-empty model are required: an unset model
                             # means the dense tier is effectively unconfigured,

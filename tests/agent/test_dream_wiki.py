@@ -464,6 +464,61 @@ class TestDreamWikiEnabled:
         assert alice.is_file()
 
 
+# --- Layer 1a: unified vault USER.md mirror ---------------------------------
+
+
+class TestDreamVaultUserMirror:
+    """Layer 1a: with wiki on, each Dream cycle mirrors the (Phase-2-refined)
+    global USER.md into the UNIFIED vault's USER.md, un-freezing the stale
+    vault file the prompt reads. Unified-only, deterministic (no LLM call)."""
+
+    async def test_unified_vault_user_is_refreshed_from_global(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        dream.wiki_enabled = True
+        # Global USER.md = the rich, Phase-2-maintained card (fixture seeds it).
+        # Pre-create a STALE vault USER.md (simulating the frozen migrate one-shot).
+        vault_root = store.workspace / "memory" / "users" / "unified_default"
+        (vault_root / "wiki").mkdir(parents=True, exist_ok=True)
+        (vault_root / "USER.md").write_text("STALE 3-line note", encoding="utf-8")
+
+        store.append_history("event 1")
+        store.append_history("event 2")
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        result = await dream.run()
+        assert result is True
+        # Vault USER.md now equals the global card (stale note overwritten).
+        assert (vault_root / "USER.md").read_text(encoding="utf-8") == "# User\n- Developer"
+
+    async def test_mirror_skipped_when_global_user_blank(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """If the global USER.md is blank/whitespace, do NOT clobber the vault
+        copy with emptiness (guard against wiping a good vault card)."""
+        dream.wiki_enabled = True
+        store.write_user("   \n")  # blank global
+        vault_root = store.workspace / "memory" / "users" / "unified_default"
+        (vault_root / "wiki").mkdir(parents=True, exist_ok=True)
+        (vault_root / "USER.md").write_text("keep me", encoding="utf-8")
+        store.append_history("event 1")
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="New fact", finish_reason="stop"),
+            MagicMock(content=_INGEST_OUTPUT, finish_reason="stop"),
+        ]
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "x"}],
+        ))
+        await dream.run()
+        assert (vault_root / "USER.md").read_text(encoding="utf-8") == "keep me"
+
+
 # --- Task 7: Dream-time embedding refresh (dense tier optional) -------------
 
 
