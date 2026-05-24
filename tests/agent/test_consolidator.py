@@ -431,3 +431,24 @@ class TestConsolidatorResolvesMemoryKey:
         await c.archive([{"role": "user", "content": "hi"}])  # session=None
         entries = store.read_unprocessed_history(since_cursor=0)
         assert entries[-1]["session_key"] == "unified:default"
+
+    def test_raw_archive_config_b_writes_unified(self, store, mock_provider):
+        c = self._consolidator(store, mock_provider, lambda s: "unified:default")
+        session = Session(key="telegram:7")
+        c.raw_archive([{"role": "user", "content": "hi"}], session=session)
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[-1]["session_key"] == "unified:default"
+        assert "[RAW]" in entries[-1]["content"]
+
+    def test_raw_archive_config_a_keeps_per_user(self, store, mock_provider):
+        c = self._consolidator(store, mock_provider, lambda s: s.key)
+        session = Session(key="telegram:7")
+        c.raw_archive([{"role": "user", "content": "hi"}], session=session)
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[-1]["session_key"] == "telegram:7"
+
+    def test_raw_archive_no_session_defaults_unified(self, store, mock_provider):
+        c = self._consolidator(store, mock_provider, lambda s: s.key)
+        c.raw_archive([{"role": "user", "content": "hi"}])  # session=None
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[-1]["session_key"] == "unified:default"
