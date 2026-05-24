@@ -394,13 +394,18 @@ class ContextBuilder:
         unchanged; back-compat by default (``None`` → use session_key).
         """
         root = workspace or self.workspace
-        extra = [
-            *goal_state_runtime_lines(session_metadata),
-        ]
+        extra = list(goal_state_runtime_lines(session_metadata) or [])
         if runtime_state is not None and inbound_message is not None:
             extra.extend(runtime_lines(runtime_state, inbound_message, root, skip=skip_runtime_lines))
         if current_runtime_lines:
             extra.extend(line for line in current_runtime_lines if line)
+        # Layer 2: per-interlocutor sender card. Resolved from people-page
+        # frontmatter and appended to the VOLATILE runtime tail (never the
+        # cacheable system-prompt prefix), so it is group-safe and adds zero
+        # cache cost. None -> no line -> tail byte-identical (opt-in by data).
+        card = self.resolve_sender_card(sender_id, channel, memory_key or session_key)
+        if card:
+            extra.append(f"Sender: {card}")
         runtime_ctx = self._build_runtime_context(
             channel,
             chat_id,

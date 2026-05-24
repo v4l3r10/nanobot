@@ -417,3 +417,46 @@ class TestResolveSenderCard:
         _seed_person(tmp_path, "unified_default", ["telegram:55"], "")
         cb = ContextBuilder(tmp_path, wiki_enabled=True)
         assert cb.resolve_sender_card("55|x", "telegram", "unified:default") is None
+
+
+class TestSenderCardInTail:
+    def test_bound_sender_line_in_tail_not_prefix(self, tmp_path):
+        _seed_person(tmp_path, "unified_default",
+                     ["telegram:136150230"], "giornalista, IT informale")
+        cb = ContextBuilder(tmp_path, wiki_enabled=True)
+        msgs = cb.build_messages(
+            history=[], current_message="hi", channel="telegram",
+            chat_id="c1", sender_id="136150230|eugenio_user",
+            memory_key="unified:default")
+        system = msgs[0]["content"]
+        tail = msgs[-1]["content"]
+        assert "Eugenio" in tail and "giornalista" in tail   # tail carries it
+        assert "Eugenio (giornalista" not in system          # NOT in cacheable prefix
+
+    def test_group_prefix_identical_tail_differs(self, tmp_path):
+        _seed_person(tmp_path, "unified_default",
+                     ["telegram:136150230"], "giornalista, IT informale")
+        _seed_person(tmp_path, "unified_default",
+                     ["telegram:999"], "altro", title="Rocco")
+        cb = ContextBuilder(tmp_path, wiki_enabled=True)
+        a = cb.build_messages(history=[], current_message="m", channel="telegram",
+                              chat_id="g", sender_id="136150230|e", memory_key="unified:default")
+        b = cb.build_messages(history=[], current_message="m", channel="telegram",
+                              chat_id="g", sender_id="999|r", memory_key="unified:default")
+        assert a[0]["content"] == b[0]["content"]   # cacheable prefix identical
+        assert a[-1]["content"] != b[-1]["content"] # tail differs per sender
+        assert "Eugenio" in a[-1]["content"]
+        assert "Rocco" in b[-1]["content"]
+
+    def test_unbound_sender_tail_has_no_card_line(self, tmp_path):
+        cb = ContextBuilder(tmp_path, wiki_enabled=True)
+        msgs = cb.build_messages(history=[], current_message="hi", channel="telegram",
+                                 chat_id="c1", sender_id="42|nobody", memory_key="unified:default")
+        assert "Sender:" not in msgs[-1]["content"]  # opt-in by data presence
+
+    def test_wiki_off_tail_has_no_card_line(self, tmp_path):
+        _seed_person(tmp_path, "unified_default", ["telegram:7"], "x")
+        cb = ContextBuilder(tmp_path, wiki_enabled=False)
+        msgs = cb.build_messages(history=[], current_message="hi", channel="telegram",
+                                 chat_id="c1", sender_id="7|a", memory_key="unified:default")
+        assert "Sender:" not in msgs[-1]["content"]
