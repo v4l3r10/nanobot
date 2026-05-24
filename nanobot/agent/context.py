@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.wiki.paths import vault_dir
+from nanobot.agent.wiki.vault import Vault
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
     current_time_str,
@@ -44,6 +45,10 @@ class ContextBuilder:
     # bounded text. The wiki-OFF path (global get_memory_context) is unchanged.
     _MAX_MEMORY_CHARS = 32_000
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
+    # Hard cap on the per-interlocutor "Sender:" line injected in the runtime
+    # tail (Layer 2). Bounds a single summary so a bloated people-page
+    # frontmatter can't grow the per-message tail.
+    _SENDER_CARD_MAX = 200
 
     def __init__(
         self,
@@ -241,6 +246,37 @@ class ContextBuilder:
         if supplemental_lines:
             lines.extend(supplemental_lines)
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + ContextBuilder._RUNTIME_CONTEXT_END
+
+    def resolve_sender_card(
+        self, sender_id: str | None, channel: str | None, vault_key: str | None,
+    ) -> str | None:
+        """Resolve the current interlocutor to a people-page one-liner.
+
+        Returns ``"<title> (<summary>)"`` (bounded) for the first hot people
+        page whose ``sender_ids`` frontmatter contains a channel-qualified
+        match for this sender, else ``None``. Matches the full ``sender_id``
+        first, then its numeric prefix before ``|`` (telegram's id is
+        ``"<numeric>|<username>"``, so a username change does not break the
+        binding). Wiki-gated AND data-gated: with the wiki off, no vault key,
+        or no binding, returns ``None`` so the runtime tail is byte-identical
+        (opt-in by data presence, no new flag). Hot path — never raises: a
+        parse/IO failure for any page is suppressed and yields ``None``.
+        """
+        if not (self.wiki_enabled and vault_key and sender_id and channel):
+            return None
+        candidates = {
+            f"{channel}:{sender_id}",
+            f"{channel}:{sender_id.split('|', 1)[0]}",
+        }
+        with suppress(Exception):
+            for _rel, page in Vault(vault_dir(self.workspace, vault_key)).iter_pages():
+                if page.type != "people" or not page.sender_ids or not page.summary:
+                    continue
+                if candidates.intersection(page.sender_ids):
+                    return truncate_text(
+                        f"{page.title} ({page.summary})", self._SENDER_CARD_MAX,
+                    )
+        return None
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
