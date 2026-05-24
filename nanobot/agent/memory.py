@@ -958,6 +958,73 @@ class Consolidator:
 _STALE_THRESHOLD_DAYS = 14
 
 
+# --- Dream wiki-block log formatting ----------------------------------------
+# Each wiki sub-stage (attachments / ingest / lint / embeddings) builds a
+# structured report; these pure helpers fold one into a single human-readable
+# line so a Dream cycle is observable per vault. Side-effect-free and duck-typed
+# (no report-class imports — the embeddings report lives behind memory.py's lazy
+# numpy import) so they unit-test trivially and never pull heavy deps.
+
+
+def _fmt_wiki_ingest(slug: str, r) -> str:
+    base = f"Dream wiki[{slug}] ingest: "
+    if r.skipped:
+        return base + "skipped"
+    if r.changed:
+        body = (f"created={len(r.created)} appended={len(r.appended)} "
+                f"contra={len(r.contradictions)} dup-skip={r.skipped_duplicate}")
+    else:
+        body = "no changes"
+    extras = []
+    if r.unknown:
+        extras.append(f"unknown={len(r.unknown)}")
+    if r.dropped:
+        extras.append(f"dropped={r.dropped}")
+    if r.malformed_lines:
+        extras.append(f"malformed={r.malformed_lines}")
+    if not r.changed and r.skipped_duplicate:
+        extras.append(f"dup-skip={r.skipped_duplicate}")
+    return base + body + (f" [{' '.join(extras)}]" if extras else "")
+
+
+def _fmt_wiki_lint(slug: str, r) -> str:
+    base = f"Dream wiki[{slug}] lint: "
+    if r.changed:
+        body = (f"cooled={len(r.cooled)} reheated={len(r.reheated)} "
+                f"merged={len(r.merged)} orphans={len(r.orphans_fixed)} "
+                f"indexes={len(r.indexes_regenerated)} "
+                f"moc={'yes' if r.moc_regenerated else 'no'}")
+    else:
+        body = "no changes"
+    findings = []
+    if r.broken_links:
+        findings.append(f"broken={len(r.broken_links)}")
+    if r.malformed:
+        findings.append(f"malformed={len(r.malformed)}")
+    return base + body + (f" [{' '.join(findings)}]" if findings else "")
+
+
+def _fmt_wiki_embeddings(slug: str, r) -> str:
+    base = f"Dream wiki[{slug}] embeddings: "
+    if not r.available:
+        return base + "skipped (fastembed unavailable)"
+    if r.failed:
+        return base + "failed (see exception above)"
+    if r.changed:
+        return base + (f"{r.pages} pages → {r.vectors} vectors "
+                       f"({r.reembedded} re-embedded, {r.deleted} deleted)")
+    return base + f"up-to-date ({r.pages} pages)"
+
+
+def _fmt_wiki_attachments(slug: str, r) -> str:
+    msg = (f"Dream wiki[{slug}] attachments: created={len(r.created)} "
+           f"appended={len(r.appended)} dup={r.duplicates} "
+           f"binary-skip={r.skipped_binary}")
+    if r.errors:
+        msg += f" [errors={len(r.errors)}]"
+    return msg
+
+
 class Dream:
     """Two-phase memory processor: analyze history.jsonl, then edit files via AgentRunner.
 
@@ -1549,18 +1616,28 @@ class Dream:
                             # Lint for this slug.
                             if slug == unified:
                                 try:
-                                    await run_attachments_reconcile(vault, slug)
+                                    recon = await run_attachments_reconcile(vault, slug)
+                                    # Idle sweeps (no new attachments) are the
+                                    # common case — keep them at DEBUG so they
+                                    # don't drown the per-cycle INFO signal.
+                                    _active = recon.created or recon.appended or recon.errors
+                                    logger.log(
+                                        "INFO" if _active else "DEBUG",
+                                        "{}", _fmt_wiki_attachments(slug, recon),
+                                    )
                                 except Exception:
                                     logger.exception(
                                         "attachments reconcile failed for vault "
                                         "{} (non-fatal — Ingest+Lint proceed)",
                                         slug,
                                     )
-                            await run_ingest(
+                            ingest_report = await run_ingest(
                                 vault, slug_batch, self.provider, self.model,
                                 render_template,
                             )
-                            run_lint(vault, _date.today())
+                            logger.info("{}", _fmt_wiki_ingest(slug, ingest_report))
+                            lint_report = run_lint(vault, _date.today())
+                            logger.info("{}", _fmt_wiki_lint(slug, lint_report))
                             # Refresh dense embeddings (opt-in). Both the flag
                             # AND a non-empty model are required: an unset model
                             # means the dense tier is effectively unconfigured,
@@ -1571,7 +1648,19 @@ class Dream:
                                 from nanobot.agent.wiki.embeddings import (
                                     refresh_embeddings,
                                 )
-                                refresh_embeddings(vault, self.wiki_embedding_model)
+                                emb_report = refresh_embeddings(
+                                    vault, self.wiki_embedding_model)
+                                # INFO when the tier actually ran (counts);
+                                # DEBUG for the no-tier paths (fastembed missing
+                                # / swallowed failure) so they stay quiet.
+                                logger.log(
+                                    "INFO" if (emb_report.available
+                                               and not emb_report.failed) else "DEBUG",
+                                    "{}", _fmt_wiki_embeddings(slug, emb_report),
+                                )
+                            else:
+                                logger.debug(
+                                    "Dream wiki[{}] embeddings: disabled", slug)
                     except Exception:
                         logger.exception(
                             "wiki ingest/lint failed for vault {}; other "
