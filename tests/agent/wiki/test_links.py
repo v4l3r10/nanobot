@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from nanobot.agent.wiki.links import (
+    build_adjacency,
     build_page_index,
     parse_wikilinks,
     resolve_links,
@@ -9,10 +10,11 @@ from nanobot.agent.wiki.links import (
 from nanobot.agent.wiki.page import Page
 
 
-def _page(last_touched="2026-05-20"):
+def _page(last_touched="2026-05-20", links_out=None):
     return Page(
         type="people", title="T", status="hot",
         created="2020-01-01", updated=last_touched, last_touched=last_touched,
+        links_out=list(links_out or []),
         body="b\n",
     )
 
@@ -93,3 +95,42 @@ def test_resolve_bare_slug_resolves_to_cold_target():
     # the caller, so here we just confirm normal folder/slug resolution).
     index = build_page_index([("concepts/note.md", _page())])
     assert resolve_links(["note"], index) == ["concepts/note"]
+
+
+# --- build_adjacency ---
+
+def test_adjacency_undirected_out_and_backlink():
+    pages = [
+        ("people/alice.md", _page(links_out=["projects/pay"])),
+        ("projects/pay.md", _page(links_out=[])),
+    ]
+    adj = build_adjacency(pages)
+    assert adj["people/alice.md"] == {"projects/pay.md"}
+    assert adj["projects/pay.md"] == {"people/alice.md"}  # backlink emerges
+
+
+def test_adjacency_resolves_cold_target_by_canonical_ref():
+    pages = [
+        ("people/alice.md", _page(links_out=["projects/pay"])),
+        (".cold/projects/pay.md", _page(links_out=[])),
+    ]
+    adj = build_adjacency(pages)
+    assert adj["people/alice.md"] == {".cold/projects/pay.md"}
+    assert adj[".cold/projects/pay.md"] == {"people/alice.md"}
+
+
+def test_adjacency_skips_unresolvable_ref():
+    pages = [("people/alice.md", _page(links_out=["projects/ghost"]))]
+    adj = build_adjacency(pages)
+    assert adj.get("people/alice.md", set()) == set()
+
+
+def test_adjacency_drops_self_reference():
+    pages = [("people/alice.md", _page(links_out=["people/alice"]))]
+    adj = build_adjacency(pages)
+    assert adj.get("people/alice.md", set()) == set()
+
+
+def test_adjacency_empty_when_no_links():
+    pages = [("people/alice.md", _page()), ("people/bob.md", _page())]
+    assert build_adjacency(pages) == {}
