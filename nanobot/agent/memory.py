@@ -1080,6 +1080,7 @@ def _fmt_wiki_lint(slug: str, r) -> str:
     if r.changed:
         body = (f"cooled={len(r.cooled)} reheated={len(r.reheated)} "
                 f"merged={len(r.merged)} orphans={len(r.orphans_fixed)} "
+                f"links={len(r.links_reconciled)} "
                 f"indexes={len(r.indexes_regenerated)} "
                 f"moc={'yes' if r.moc_regenerated else 'no'}")
     else:

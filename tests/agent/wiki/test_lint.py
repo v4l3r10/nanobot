@@ -416,43 +416,55 @@ class TestDedupNeverDropsLoserBody:
 
 
 class TestBrokenLinks:
-    def test_broken_link_escaping_vault_is_reported_not_followed(self, tmp_path):
+    def test_escaping_vault_link_neutralized_not_followed(self, tmp_path):
         v = _vault(tmp_path)
-        # A links_out ref that escapes the vault via .. traversal AND whose
-        # resolved target actually EXISTS on disk (outside the vault). With
-        # no containment guard, vault.wiki_dir / f"{ref}.md" .exists() would
-        # be True and the escaping ref falsely treated as "not broken".
+        # A poisoned page whose frontmatter links_out escapes the vault via ..
+        # traversal AND whose resolved target actually EXISTS on disk (outside
+        # the vault). links_out is now a body-derived projection: the reconcile
+        # phase (which runs before the broken-link audit) rewrites it from the
+        # body. resolve_links rejects the escaping ref (>2 segments / dotted),
+        # so it never survives into links_out — stripped before the audit and
+        # never followed. The out-of-vault file is never read or written.
         outside = tmp_path / "outside.md"
         outside.write_text("secret\n", encoding="utf-8")
         # people/alice.md -> need to climb out of wiki/people/ to tmp_path:
         #   wiki/people/<ref>.md ; ../../../../outside reaches tmp_path/outside
         ref = "../../../../outside"
-        page = _page(title="Alice", links_out=[ref])
-        before = serialize_page(page)
-        _write(v, "people/alice.md", page)
+        _write(
+            v,
+            "people/alice.md",
+            _page(title="Alice", links_out=[ref], body=f"Escape [[{ref}]].\n"),
+        )
         # Sanity: the escaping candidate really does resolve onto a real file.
         assert (v.wiki_dir / f"{ref}.md").exists()
 
         rep = run_lint(v, TODAY)
 
-        assert ("people/alice.md", ref) in rep.broken_links
-        # Nothing about the page was modified by the broken-link phase.
+        # Reconcile stripped the escaping ref: links_out is empty and it is
+        # never reported as broken (it never survives into links_out).
         got = parse_page(
             (v.wiki_dir / "people" / "alice.md").read_text(encoding="utf-8")
         )
-        assert serialize_page(got) == before
+        assert got.links_out == []
+        assert all(r != ref for (_p, r) in rep.broken_links)
         # The out-of-vault file is never touched.
         assert outside.read_text(encoding="utf-8") == "secret\n"
 
     def test_broken_link_recorded_not_modified(self, tmp_path):
         v = _vault(tmp_path)
-        page = _page(title="Alice", links_out=["projects/ghost"])
+        # The broken ref lives in the body (the authoritative source) so it
+        # survives reconcile and is still audited; reconcile leaves a page
+        # whose links_out already matches its body byte-untouched.
+        page = _page(
+            title="Alice", links_out=["projects/ghost"],
+            body="See [[projects/ghost]].\n",
+        )
         before = serialize_page(page)
         _write(v, "people/alice.md", page)
         rep = run_lint(v, TODAY)
 
         assert ("people/alice.md", "projects/ghost") in rep.broken_links
-        # The page body/frontmatter is untouched by the broken-link phase.
+        # The page body/frontmatter is untouched (links_out already matched).
         got = parse_page((v.wiki_dir / "people" / "alice.md").read_text(encoding="utf-8"))
         assert got.links_out == ["projects/ghost"]
         assert serialize_page(got) == before
@@ -462,7 +474,10 @@ class TestBrokenLinks:
         _write(
             v,
             "people/alice.md",
-            _page(title="Alice", links_out=["projects/payment-svc"]),
+            _page(
+                title="Alice", links_out=["projects/payment-svc"],
+                body="See [[projects/payment-svc]].\n",
+            ),
         )
         _write(
             v,
@@ -710,3 +725,48 @@ class TestIdempotenceAndDeterminism:
         sa = _snapshot(va)
         sb = _snapshot(vb)
         assert sa == sb
+
+
+def test_reconcile_links_derives_links_out_from_body(tmp_path):
+    vault = _vault(tmp_path)
+    _write(vault, "people/alice.md", _page(title="Alice"))
+    _write(vault, "people/bob.md",
+           _page(title="Bob", body="Bob knows [[people/alice]].\n"))
+    run_lint(vault, TODAY)
+    bob = parse_page((vault.wiki_dir / "people/bob.md").read_text(encoding="utf-8"))
+    assert bob.links_out == ["people/alice"]
+
+
+def test_reconcile_links_resolves_bare_slug(tmp_path):
+    vault = _vault(tmp_path)
+    _write(vault, "people/alice.md", _page(title="Alice"))
+    _write(vault, "people/carol.md",
+           _page(title="Carol", body="Carol knows [[alice]].\n"))
+    run_lint(vault, TODAY)
+    carol = parse_page((vault.wiki_dir / "people/carol.md").read_text(encoding="utf-8"))
+    assert carol.links_out == ["people/alice"]
+
+
+def test_reconcile_links_reports_and_is_idempotent(tmp_path):
+    vault = _vault(tmp_path)
+    _write(vault, "people/alice.md", _page(title="Alice"))
+    _write(vault, "people/bob.md",
+           _page(title="Bob", body="Bob knows [[people/alice]].\n"))
+    r1 = run_lint(vault, TODAY)
+    assert "people/bob.md" in r1.links_reconciled
+    snap = _snapshot(vault)
+    r2 = run_lint(vault, TODAY)
+    assert r2.links_reconciled == []
+    assert _snapshot(vault) == snap  # second run is a byte no-op
+
+
+def test_reconcile_links_only_touches_links_out_field(tmp_path):
+    vault = _vault(tmp_path)
+    _write(vault, "people/alice.md", _page(title="Alice"))
+    _write(vault, "people/bob.md", _page(
+        title="Bob", tags=["x"], body="Bob knows [[people/alice]].\n"))
+    run_lint(vault, TODAY)
+    bob = parse_page((vault.wiki_dir / "people/bob.md").read_text(encoding="utf-8"))
+    assert bob.links_out == ["people/alice"]
+    assert bob.tags == ["x"]  # other frontmatter untouched
+    assert "Bob knows [[people/alice]]." in bob.body  # body untouched

@@ -74,6 +74,7 @@ from pathlib import Path
 
 from nanobot.agent.tools.path_utils import is_under
 from nanobot.agent.wiki.decay import should_cool
+from nanobot.agent.wiki.links import build_page_index, parse_wikilinks, resolve_links
 from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.vault import _COLD_COMPONENT, _NON_PAGE_NAMES, Vault
 from nanobot.utils.atomic import atomic_write_text
@@ -96,6 +97,7 @@ class LintReport:
     broken_links: list[tuple[str, str]] = field(default_factory=list)
     malformed: list[str] = field(default_factory=list)
     orphans_fixed: list[str] = field(default_factory=list)
+    links_reconciled: list[str] = field(default_factory=list)
     indexes_regenerated: list[str] = field(default_factory=list)
     moc_regenerated: bool = False
 
@@ -118,6 +120,7 @@ class LintReport:
             or self.reheated
             or self.merged
             or self.orphans_fixed
+            or self.links_reconciled
             or self.indexes_regenerated
             or self.moc_regenerated
         )
@@ -494,6 +497,41 @@ def _dedup(
 
 
 # --------------------------------------------------------------------------- #
+# Phase 4b -- reconcile links_out from page bodies
+# --------------------------------------------------------------------------- #
+def _reconcile_links(
+    vault: Vault, entries: list[_Entry], report: LintReport
+) -> None:
+    """Re-derive ``links_out`` for every hot page from its body wikilinks.
+
+    The body is authoritative; ``links_out`` is a derived projection of the
+    canonical ``folder/slug`` refs in the body. Bare ``[[slug]]`` links are
+    resolved against ALL pages (hot + cold). Only ``links_out`` is rewritten
+    (other frontmatter and the body are untouched). Idempotent: a page already
+    matching its body is not rewritten (the equality check below). Runs before
+    ``_broken_links`` so the audit sees the reconciled links.
+    """
+    # Index over hot + cold by canonical folder/slug relpath (strip .cold/).
+    pairs: list[tuple[str, Page]] = []
+    for e in entries:
+        rel = e.relpath
+        if rel.startswith(f"{_COLD_COMPONENT}/"):
+            rel = rel[len(_COLD_COMPONENT) + 1:]
+        pairs.append((rel, e.page))
+    index = build_page_index(pairs)
+
+    reconciled: list[str] = []
+    for entry in sorted([e for e in entries if not e.in_cold], key=lambda e: e.relpath):
+        owner_ref = entry.relpath[: -len(".md")]
+        new_links = resolve_links(parse_wikilinks(entry.page.body), index, owner_ref)
+        if new_links != entry.page.links_out:
+            entry.page.links_out = new_links
+            atomic_write_text(entry.path, serialize_page(entry.page))
+            reconciled.append(entry.relpath)
+    report.links_reconciled = sorted(reconciled)
+
+
+# --------------------------------------------------------------------------- #
 # Phase 5 -- broken links
 # --------------------------------------------------------------------------- #
 def _broken_links(
@@ -794,6 +832,7 @@ def run_lint(vault: Vault, today: dt.date) -> LintReport:
     # it here so the whole run reaches a fixpoint (run #2 == run #1). The
     # sweep is itself idempotent: on a settled tree nothing is stale-and-hot.
     entries = _stale_to_cold_impl(vault, entries, report, today, occ)
+    _reconcile_links(vault, entries, report)
     _broken_links(vault, entries, report)
     _regenerate_indexes(vault, entries, report)
     _regenerate_moc(vault, entries, report)

@@ -1464,7 +1464,7 @@ def test_fmt_wiki_lint_changed():
                    indexes_regenerated=["index.md"])
     assert memory_mod._fmt_wiki_lint("u", r) == (
         "Dream wiki[u] lint: cooled=1 reheated=0 merged=0 orphans=0 "
-        "indexes=1 moc=yes"
+        "links=0 indexes=1 moc=yes"
     )
 
 
