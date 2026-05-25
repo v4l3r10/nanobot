@@ -20,9 +20,9 @@ from nanobot.agent.tools import wiki_note as _wn
 from nanobot.agent.wiki.ingest import (
     _MAX_BODY_CHARS,
     _MAX_DIRECTIVES,
+    IngestReport,
     _safe_slug,
     _slug_ok,
-    IngestReport,
     run_ingest,
 )
 from nanobot.agent.wiki.lint import run_lint
@@ -598,3 +598,38 @@ def test_slug_policy_parity_with_wiki_note():
             f"accept/reject divergence for {raw!r}: ingest={ig_accept} "
             f"wiki_note={wn_accept}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Ingest linking (increment 2.5): the prompt instructs body wikilinks, and an
+# ingest-written [[folder/slug]] is reconciled into links_out in one pass.
+# --------------------------------------------------------------------------- #
+def test_template_instructs_body_linking():
+    rendered = render_template(
+        "agent/wiki_ingest.md", strip=True, allowed_types="people, projects, concepts"
+    )
+    assert "[[" in rendered  # teaches linking existing pages in the body
+
+
+async def test_ingest_body_link_reconciled_into_links_out(tmp_path):
+    vault = _vault(tmp_path)
+    # An existing page the ingest body will link to.
+    _write_page(
+        vault, "people", "alice",
+        Page(
+            type="people", title="Alice", status="hot",
+            created="2020-01-01", updated="2020-01-01", last_touched="2020-01-01",
+            body="Alice leads payments.\n",
+        ),
+    )
+    # First non-empty body line ("Bob") becomes the title; the link sits in the
+    # body below it.
+    provider = _provider("[PAGE people/bob]\nBob\nWorks with [[people/alice]].")
+    await run_ingest(
+        vault, _entries("bob works with alice"), provider, "m", render_template
+    )
+    # Reconcile (increment 1) runs in the same Dream pass right after ingest.
+    run_lint(vault, date.today())
+
+    bob = parse_page(vault.page_path("people", "bob").read_text(encoding="utf-8"))
+    assert bob.links_out == ["people/alice"]

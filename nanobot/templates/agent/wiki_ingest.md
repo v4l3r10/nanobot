@@ -54,6 +54,10 @@ single `/` (slash). Do NOT use a space between type and slug.
   duplicate. Check the existing-pages list before emitting a PAGE.
 - Keep slugs short and kebab-case (e.g. `alice`, `payment-svc`, `q3-roadmap`).
 - One directive per fact cluster; keep bodies concise and factual.
+- When a body refers to another page that appears in the existing-pages list,
+  link it in the body with `[[folder/slug]]` — copy the ref exactly as shown in
+  that list. Link ONLY to pages present in the list, so the wiki forms a
+  connected graph.
 - Persist durable knowledge only — not transient chit-chat, greetings, or
   task acknowledgements.
 - Output ONLY directives (and their bodies). No explanations, no preamble,
