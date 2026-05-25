@@ -17,10 +17,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from nanobot.agent.tools import wiki_note as _wn
+from nanobot.agent.wiki import retrieval
 from nanobot.agent.wiki.ingest import (
     _MAX_BODY_CHARS,
     _MAX_DIRECTIVES,
     IngestReport,
+    _build_existing_pages,
     _safe_slug,
     _slug_ok,
     run_ingest,
@@ -633,3 +635,114 @@ async def test_ingest_body_link_reconciled_into_links_out(tmp_path):
 
     bob = parse_page(vault.page_path("people", "bob").read_text(encoding="utf-8"))
     assert bob.links_out == ["people/alice"]
+
+
+# --------------------------------------------------------------------------- #
+# Existing-pages relevance (sub-project A): the list shown to the ingest LLM is
+# the top-N pages RELEVANT to the batch (reusing retrieval.search), hot-only, in
+# relevance order — not the first-200 alphabetical.
+# --------------------------------------------------------------------------- #
+def _hot(vault, type_, slug, body, *, title="T", links_out=None):
+    _write_page(
+        vault, type_, slug,
+        Page(
+            type=type_, title=title, status="hot",
+            created="2020-01-01", updated="2020-01-01", last_touched="2020-01-01",
+            links_out=list(links_out or []), body=body + "\n",
+        ),
+    )
+
+
+def test_existing_pages_ranked_by_relevance(tmp_path, monkeypatch):
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    vault = _vault(tmp_path)
+    # Slugs chosen so alphabetical order (alpha < zeta) is the OPPOSITE of
+    # relevance order: zeta matches both query terms, alpha only one.
+    _hot(vault, "projects", "zeta", "logistica magazzino spedizioni ecommerce")
+    _hot(vault, "projects", "alpha", "logistica")
+    _hot(vault, "people", "bob", "marketing budget planning")  # no overlap
+    out = _build_existing_pages(vault, "logistica magazzino")
+    assert "projects/zeta" in out
+    assert "people/bob" not in out                       # irrelevant -> absent
+    assert out.index("projects/zeta") < out.index("projects/alpha")  # relevance order
+
+
+def test_existing_pages_includes_graph_neighbor(tmp_path, monkeypatch):
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    vault = _vault(tmp_path)
+    # payment-svc matches the query; alice does NOT, but links to it -> the
+    # increment-3 graph-boost (reused via search()) pulls alice in.
+    _hot(vault, "projects", "payment-svc", "payment gateway billing stripe")
+    _hot(vault, "people", "alice", "alice runs the team",
+         links_out=["projects/payment-svc"])
+    out = _build_existing_pages(vault, "gateway billing")
+    assert "projects/payment-svc" in out      # direct lexical hit (the seed)
+    assert "people/alice" in out              # surfaced only via the link graph
+
+
+def test_existing_pages_excludes_cold(tmp_path, monkeypatch):
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    vault = _vault(tmp_path)
+    _hot(vault, "projects", "warehouse", "logistica magazzino")  # hot, matches
+    # A cold page whose body ALSO matches the query, written straight under
+    # .cold/ (iter_pages exposes it as ".cold/projects/cold-svc.md").
+    cold = vault.wiki_dir / ".cold" / "projects" / "cold-svc.md"
+    cold.parent.mkdir(parents=True, exist_ok=True)
+    cold.write_text(
+        serialize_page(Page(
+            type="projects", title="Cold", status="cold",
+            created="2020-01-01", updated="2020-01-01", last_touched="2020-01-01",
+            body="logistica magazzino archived\n",
+        )),
+        encoding="utf-8",
+    )
+    out = _build_existing_pages(vault, "logistica magazzino")
+    assert "projects/warehouse" in out
+    assert ".cold" not in out
+    assert "cold-svc" not in out              # archived page is not an ingest target
+
+
+def test_existing_pages_none_when_no_match(tmp_path, monkeypatch):
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    vault = _vault(tmp_path)
+    _hot(vault, "people", "alice", "alice runs payments")
+    # A brand-new-topic query overlaps nothing -> empty list (caller renders
+    # "(none)").
+    assert _build_existing_pages(vault, "quantum chromodynamics") == ""
+
+
+def test_existing_pages_capped_at_max(tmp_path, monkeypatch):
+    # The function's own cap, tested honestly: monkeypatch _EXISTING_PAGES_MAX
+    # small (the real 200 ceiling is rarely hit because rrf_fuse's
+    # per_ranker_cap=50 already bounds search()'s union) and create more
+    # matching pages than that, then assert the list is truncated to the cap.
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    monkeypatch.setattr("nanobot.agent.wiki.ingest._EXISTING_PAGES_MAX", 3)
+    vault = _vault(tmp_path)
+    for i in range(6):
+        _hot(vault, "concepts", f"note-{i:04d}", "logistica shared-term")
+    out = _build_existing_pages(vault, "logistica")
+    assert len(out.splitlines()) == 3
+
+
+def test_existing_pages_format_preserved(tmp_path, monkeypatch):
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    vault = _vault(tmp_path)
+    _hot(vault, "projects", "zeta", "logistica magazzino", title="Logistica Plan")
+    out = _build_existing_pages(vault, "logistica magazzino")
+    assert out == "- projects/zeta: Logistica Plan"
+
+
+async def test_run_ingest_prompt_shows_relevant_existing(tmp_path, monkeypatch):
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    vault = _vault(tmp_path)
+    _hot(vault, "projects", "logistica", "piano logistica magazzino spedizioni")
+    _hot(vault, "people", "bob", "marketing budget planning")  # irrelevant
+    provider = _provider("[SKIP]")
+    await run_ingest(
+        vault, _entries("dobbiamo rivedere la logistica del magazzino"),
+        provider, "m", render_template,
+    )
+    user_msg = provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+    assert "projects/logistica" in user_msg   # relevant existing page is offered
+    assert "people/bob" not in user_msg       # irrelevant one is not

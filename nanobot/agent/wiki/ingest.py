@@ -73,6 +73,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from nanobot.agent.tools.path_utils import is_under
+from nanobot.agent.wiki import retrieval
 from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.vault import _COLD_COMPONENT, _NON_PAGE_NAMES, Vault
 from nanobot.utils.atomic import atomic_write_text
@@ -88,8 +89,10 @@ __all__ = ["IngestReport", "run_ingest"]
 # int. Keep this value in lockstep with that constant if it ever changes.
 _HISTORY_ENTRY_PREVIEW_MAX_CHARS = 4_000
 
-# Cap on the existing-pages listing fed to the model (sorted, first N) so a
-# huge vault cannot blow up the prompt.
+# Cap on the existing-pages listing fed to the model (top-N by batch relevance
+# via retrieval.search) so a huge vault cannot blow up the prompt. A ceiling
+# rarely hit in practice: rrf_fuse's per_ranker_cap already bounds search()'s
+# union below it.
 _EXISTING_PAGES_MAX = 200
 
 # C1 (DoS under the per-vault Dream lock): the model output is fully
@@ -652,16 +655,27 @@ def _build_history_text(history_entries: list[dict]) -> str:
     )
 
 
-def _build_existing_pages(vault: Vault) -> str:
-    """``- {type}/{slug}: {title}`` per hot page, sorted, capped."""
+def _build_existing_pages(vault: Vault, query: str) -> str:
+    """``- {type}/{slug}: {title}`` for the hot pages most RELEVANT to ``query``.
+
+    Reuses ``retrieval.search`` whole (BM25 + optional dense + the increment-3
+    graph-boost), so neighbors of the directly-relevant pages are surfaced too.
+    Cold pages (``.cold/`` relpaths) are filtered out — they stay linkable from
+    the graph at runtime but are not offered as ingest targets. Rows are emitted
+    in relevance order (search() is deterministic: RRF score, then relpath) and
+    capped at ``_EXISTING_PAGES_MAX``. An empty result renders as ``""`` (the
+    caller turns that into ``(none)``).
+    """
     rows: list[str] = []
-    for rel, page in vault.iter_pages(include_cold=False):
-        # rel is ``{folder}/{slug}.md``; present folder/slug + title.
+    for rel, page in retrieval.search(vault, query, k=None):
+        if rel.startswith(f"{_COLD_COMPONENT}/"):
+            continue  # hot-only: never offer an archived page as a target
         stem = rel[: -len(".md")] if rel.endswith(".md") else rel
         title = " ".join(page.title.split())
         rows.append(f"- {stem}: {title}")
-    rows.sort()
-    return "\n".join(rows[:_EXISTING_PAGES_MAX])
+        if len(rows) >= _EXISTING_PAGES_MAX:
+            break
+    return "\n".join(rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -687,7 +701,7 @@ async def run_ingest(
         return report
 
     history_text = _build_history_text(history_entries)
-    existing_pages = _build_existing_pages(vault)
+    existing_pages = _build_existing_pages(vault, history_text)
     allowed_types = ", ".join(sorted(vault.schema.types))
 
     system = render_template(
