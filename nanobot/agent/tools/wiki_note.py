@@ -36,7 +36,11 @@ from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.filesystem import _FsTool
 from nanobot.agent.tools.path_utils import is_under
-from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import (
+    ArraySchema,
+    StringSchema,
+    tool_parameters_schema,
+)
 from nanobot.agent.wiki.moc_refresh import mark_vault_dirty
 from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.paths import vault_dir, vault_slug
@@ -70,6 +74,20 @@ _SLUG_DASH_RUN = re.compile(r"-{2,}")
 # OS rather than a Linux-accepted / Windows-``WinError 123`` divergence.
 _SLUG_MAX_LEN = 80
 
+# --- tag tunables (single source of truth: referenced by BOTH the parameter
+# schema and _normalize_tags — never inline these literals) ---
+_TAGS_MAX = 8  # max tags kept per page (cap); also feeds ArraySchema(max_items=)
+_TAG_MAX_LEN = 40  # max chars per normalized tag
+
+# Tag normalization regexes, mirroring the _SLUG_* group. Applied lowercased.
+# 1. Fold path separators + whitespace runs to a single '-'.
+_TAG_SEP = re.compile(r"[/\\\s]+")
+# 2. Drop anything that is not a Unicode word char (letters/digits/_, incl.
+#    accented latin + CJK) or '-'. Strips punctuation/symbols/emoji.
+_TAG_DROP = re.compile(r"[^\w-]", re.UNICODE)
+# 3. Collapse runs of '-'.
+_TAG_DASH_RUN = re.compile(r"-{2,}")
+
 
 def _safe_slug(raw: str) -> str:
     """Sanitize a model-supplied slug to a single filename-safe component.
@@ -100,6 +118,52 @@ def _safe_slug(raw: str) -> str:
     if len(s) > _SLUG_MAX_LEN:
         s = s[:_SLUG_MAX_LEN].rstrip("-._")
     return s
+
+
+def _normalize_tag(raw: str) -> str:
+    """Normalize one model-supplied tag to a slug-style token.
+
+    Lowercase; fold separators/whitespace to ``-``; drop punctuation/symbols/
+    emoji (keep Unicode letters/digits and ``-``); collapse ``-`` runs; strip
+    ``-._`` from the ends; clamp to ``_TAG_MAX_LEN`` and re-strip so a cut never
+    leaves a dangling separator. Returns ``""`` if nothing usable remains.
+    """
+    s = raw.strip().lower()
+    s = _TAG_SEP.sub("-", s)
+    s = _TAG_DROP.sub("", s)
+    s = _TAG_DASH_RUN.sub("-", s)
+    s = s.strip("-._")
+    if len(s) > _TAG_MAX_LEN:
+        s = s[:_TAG_MAX_LEN].rstrip("-._")
+    return s
+
+
+def _normalize_tags(raw: "list[str] | str | None") -> list[str]:
+    """Best-effort normalize a model-supplied tag list (never raises).
+
+    Accepts ``None``, a bare string, or a list of strings. Each tag is run
+    through :func:`_normalize_tag`; empties are dropped, the result is
+    de-duplicated (first-seen order preserved) and capped to ``_TAGS_MAX``.
+    Tags are non-critical: a bad/garbage input simply yields ``[]`` — it must
+    never fail the create (unlike ``slug``, which is the filename).
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        tag = _normalize_tag(item)
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        out.append(tag)
+        if len(out) >= _TAGS_MAX:
+            break
+    return out
 
 
 def _has_unicode_control(raw: str) -> bool:
@@ -232,6 +296,15 @@ def _terminated_line_set(text: str) -> set[str]:
             "For search: a keyword/phrase, a 'tag:NAME' filter, or empty "
             "to list the most recently touched pages."
         ),
+        tags=ArraySchema(
+            items=StringSchema("A short topical tag."),
+            description=(
+                "For create (optional): a few short topical tags, lowercased "
+                "hashtag-style, to aid future search, e.g. "
+                "['python', 'async', 'telegram']."
+            ),
+            max_items=_TAGS_MAX,
+        ),
         required=["operation"],
     )
 )
@@ -361,6 +434,7 @@ class WikiNoteTool(_FsTool, ContextAware):
                 kw.get("slug"),
                 kw.get("title"),
                 kw.get("body") or "",
+                kw.get("tags"),
             )
         if operation == "append":
             return await self._do_append(kw.get("path"), kw.get("text"))
@@ -693,6 +767,7 @@ class WikiNoteTool(_FsTool, ContextAware):
         slug: str | None,
         title: str | None,
         body: str,
+        tags: "list[str] | str | None" = None,
     ) -> str:
         if not type:
             return "Error: 'type' is required for create"
@@ -752,6 +827,7 @@ class WikiNoteTool(_FsTool, ContextAware):
             )
 
         today = datetime.date.today().isoformat()
+        normalized_tags = _normalize_tags(tags)
         page = Page(
             type=type,
             title=title,
@@ -759,7 +835,7 @@ class WikiNoteTool(_FsTool, ContextAware):
             created=today,
             updated=today,
             last_touched=today,
-            tags=[],
+            tags=normalized_tags,
             links_out=[],
             pinned=None,
             body=body,
