@@ -15,6 +15,7 @@ the same turn:
 1. `search` for an existing page on that subject first.
 2. If one exists, `append` the new fact to it.
 3. If not, `create` a leaf page — closest existing type, one subject per page.
+   Add a few short topical tags so the page is easy to find again later.
 
 Do not record ephemera: one-off questions, transient state, anything already
 on a page, or anything the user did not actually assert.
