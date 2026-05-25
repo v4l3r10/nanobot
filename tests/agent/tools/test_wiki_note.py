@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.context import RequestContext
-from nanobot.agent.tools.wiki_note import WikiNoteTool
+from nanobot.agent.tools.wiki_note import (
+    WikiNoteTool,
+    _TAG_MAX_LEN,
+    _TAGS_MAX,
+    _normalize_tags,
+)
 from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.paths import vault_dir, vault_slug
 from nanobot.utils.vault_lock import get_vault_lock
@@ -1265,3 +1270,112 @@ async def test_bind_requires_some_field(tmp_path):
     await t.execute(operation="create", type="people", slug="alice", title="Alice")
     out = await t.execute(operation="bind", path="people/alice.md")
     assert "error" in out.lower()
+
+
+# --- tags on create: _normalize_tags (pure) + create wiring ---
+
+
+def test_normalize_tags_none_and_empty_return_empty():
+    assert _normalize_tags(None) == []
+    assert _normalize_tags([]) == []
+    assert _normalize_tags(["", "   ", "\t"]) == []
+
+
+def test_normalize_tags_slug_style_lowercase_and_dashes():
+    assert _normalize_tags(["Project Alpha!"]) == ["project-alpha"]
+    assert _normalize_tags(["Machine   Learning"]) == ["machine-learning"]
+    # path separators are folded too
+    assert _normalize_tags(["a/b c"]) == ["a-b-c"]
+
+
+def test_normalize_tags_keeps_accented_and_cjk_letters():
+    assert _normalize_tags(["Caffè", "记忆"]) == ["caffè", "记忆"]
+
+
+def test_normalize_tags_strips_symbols_and_emoji():
+    assert _normalize_tags(["c++", "hello🎉", "#python"]) == ["c", "hello", "python"]
+
+
+def test_normalize_tags_dedup_preserves_first_seen_order():
+    assert _normalize_tags(["Python", "async", "python", "ASYNC"]) == ["python", "async"]
+
+
+def test_normalize_tags_caps_to_max_dropping_extras():
+    raw = [f"tag{i}" for i in range(_TAGS_MAX + 5)]
+    out = _normalize_tags(raw)
+    assert out == [f"tag{i}" for i in range(_TAGS_MAX)]
+    assert len(out) == _TAGS_MAX
+
+
+def test_normalize_tags_clamps_length_without_dangling_separator():
+    long = "a" * (_TAG_MAX_LEN + 10)
+    assert _normalize_tags([long]) == ["a" * _TAG_MAX_LEN]
+    # a value long enough to be clamped never comes back ending on a separator
+    tag = "ab-" * _TAG_MAX_LEN
+    out = _normalize_tags([tag])[0]
+    assert len(out) <= _TAG_MAX_LEN
+    assert not out.endswith("-")
+
+
+def test_normalize_tags_accepts_a_bare_string():
+    # Models sometimes send a single string instead of a one-element array.
+    assert _normalize_tags("Python") == ["python"]
+
+
+async def test_create_with_tags_normalizes_and_persists(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create",
+        type="people",
+        slug="bob",
+        title="Bob",
+        body="Runs ops.",
+        tags=["Project Alpha!", "ops", "Project Alpha!"],
+    )
+    out = await t.execute(operation="read", path="people/bob.md")
+    page = parse_page(out)
+    assert page.tags == ["project-alpha", "ops"]
+
+
+async def test_create_without_tags_is_empty_list(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create", type="people", slug="carol", title="Carol", body="x",
+    )
+    page = parse_page(await t.execute(operation="read", path="people/carol.md"))
+    assert page.tags == []
+
+
+async def test_create_with_garbage_tags_still_succeeds(tmp_path):
+    t = _tool(tmp_path)
+    out = await t.execute(
+        operation="create",
+        type="people",
+        slug="dave",
+        title="Dave",
+        body="x",
+        tags=["", "   ", "🎉", "!!!"],
+    )
+    assert "dave" in out.lower()  # create succeeded
+    assert "error" not in out.lower()
+    page = parse_page(await t.execute(operation="read", path="people/dave.md"))
+    assert page.tags == []
+
+
+async def test_create_caps_tags_in_schema_and_normalizer(tmp_path):
+    # The cap constant is honored end-to-end (single _TAGS_MAX source).
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create",
+        type="people",
+        slug="erin",
+        title="Erin",
+        body="x",
+        tags=[f"tag{i}" for i in range(_TAGS_MAX + 3)],
+    )
+    page = parse_page(await t.execute(operation="read", path="people/erin.md"))
+    assert len(page.tags) == _TAGS_MAX
+
+    # And the declared JSON schema advertises the same cap.
+    props = t.parameters["properties"]
+    assert props["tags"]["maxItems"] == _TAGS_MAX
