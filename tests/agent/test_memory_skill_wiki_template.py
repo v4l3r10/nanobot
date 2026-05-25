@@ -41,3 +41,8 @@ def test_instructs_tagging_on_create():
     out = _render().lower()
     # the create guidance mentions tags as an aid to future search/recall
     assert "tag" in out
+
+
+def test_instructs_body_wikilinks():
+    out = _render().lower()
+    assert "[[" in out  # teaches linking other pages in the body
