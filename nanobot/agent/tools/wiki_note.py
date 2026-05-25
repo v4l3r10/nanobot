@@ -41,6 +41,7 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
+from nanobot.agent.wiki.links import parse_wikilinks, resolve_links
 from nanobot.agent.wiki.moc_refresh import mark_vault_dirty
 from nanobot.agent.wiki.page import Page, parse_page, serialize_page
 from nanobot.agent.wiki.paths import vault_dir, vault_slug
@@ -581,10 +582,15 @@ class WikiNoteTool(_FsTool, ContextAware):
                 body += "\n"
             page.body = body
 
+            owner_ref = path[: -len(".md")] if path.endswith(".md") else path
+            page.links_out = resolve_links(
+                parse_wikilinks(page.body), {}, owner_ref
+            )
+
             today = datetime.date.today().isoformat()
             page.updated = today
             page.last_touched = today
-            # created / type / title / status / tags / links_out / pinned
+            # created / type / title / status / tags / pinned
             # are left UNCHANGED.
 
             try:
@@ -828,6 +834,9 @@ class WikiNoteTool(_FsTool, ContextAware):
 
         today = datetime.date.today().isoformat()
         normalized_tags = _normalize_tags(tags)
+        folder = schema.folder(type)
+        owner_ref = f"{folder}/{safe_slug}"
+        links_out = resolve_links(parse_wikilinks(body), {}, owner_ref)
         page = Page(
             type=type,
             title=title,
@@ -836,7 +845,7 @@ class WikiNoteTool(_FsTool, ContextAware):
             updated=today,
             last_touched=today,
             tags=normalized_tags,
-            links_out=[],
+            links_out=links_out,
             pinned=None,
             body=body,
         )
@@ -882,7 +891,6 @@ class WikiNoteTool(_FsTool, ContextAware):
                 "— resolves outside the vault"
             )
 
-        folder = schema.folder(type)
         index_path = vault.wiki_dir / folder / "_index.md"
         resolved_index = self._resolved_in_vault(index_path, vault)
         if resolved_index is None:
