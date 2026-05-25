@@ -26,6 +26,9 @@ _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)  # runs of word-chars, drops _ and p
 _K1 = 1.5
 _B = 0.75
 
+# Graph-boost: how many top pre-fused hits seed the 1-hop link expansion.
+_GRAPH_SEEDS = 5
+
 
 def tokenize(text: str) -> list[str]:
     """Lowercase, split on non-word chars, drop stopwords and 1-char tokens."""
@@ -92,6 +95,33 @@ def rrf_fuse(
             scores[rel] = scores.get(rel, 0.0) + 1.0 / (k_rrf + rank)
     # Tie-break by relpath asc for determinism.
     return [rel for rel, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def _graph_ranking(
+    adjacency: dict[str, set[str]], seeds: list[str]
+) -> list[tuple[str, int]]:
+    """Rank the 1-hop neighbors of ``seeds`` for RRF (best first, 1-based).
+
+    ``adjacency`` is the undirected relpath graph (``links.build_adjacency``);
+    ``seeds`` are the top pre-fused hit relpaths in rank order. Neighbors that
+    are themselves seeds are excluded (already ranked by bm25/dense). Order:
+    seed-adjacency count DESC, then best (lowest) seed rank ASC, then relpath
+    ASC — fully deterministic. Empty when no neighbors.
+    """
+    seed_rank = {rel: i for i, rel in enumerate(seeds)}
+    seed_set = set(seeds)
+    count: Counter[str] = Counter()
+    best: dict[str, int] = {}
+    for s in seeds:
+        for nb in adjacency.get(s, ()):
+            if nb in seed_set:
+                continue
+            count[nb] += 1
+            r = seed_rank[s]
+            if nb not in best or r < best[nb]:
+                best[nb] = r
+    ordered = sorted(count, key=lambda nb: (-count[nb], best[nb], nb))
+    return [(nb, i + 1) for i, nb in enumerate(ordered)]
 
 
 def _load_dense_ranker(vault, model=None):
