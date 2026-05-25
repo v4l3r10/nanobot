@@ -16,12 +16,13 @@ the eager write-path mode.
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from collections.abc import Iterable
 
 from nanobot.agent.wiki.page import Page
 from nanobot.agent.wiki.vault import _COLD_COMPONENT, _NON_PAGE_NAMES
 
-__all__ = ["build_page_index", "parse_wikilinks", "resolve_links"]
+__all__ = ["build_adjacency", "build_page_index", "parse_wikilinks", "resolve_links"]
 
 # A wikilink ``[[ ... ]]`` with no nested brackets inside the target.
 _WIKILINK = re.compile(r"\[\[([^\[\]]+)\]\]")
@@ -71,6 +72,47 @@ def build_page_index(
         folder, slug = ref.rsplit("/", 1)
         index.setdefault(slug.lower(), []).append((ref, page.last_touched, folder))
     return index
+
+
+def _canonical_ref(relpath: str) -> str:
+    """A corpus relpath -> its canonical ``folder/slug`` ref.
+
+    Strips a leading ``{_COLD_COMPONENT}/`` (a cold page is referenced by its
+    canonical ref, not its archive path) and a trailing ``.md``.
+    """
+    rel = relpath
+    if rel.startswith(f"{_COLD_COMPONENT}/"):
+        rel = rel[len(_COLD_COMPONENT) + 1:]
+    if rel.endswith(".md"):
+        rel = rel[: -len(".md")]
+    return rel
+
+
+def build_adjacency(
+    pages: Iterable[tuple[str, Page]],
+) -> dict[str, set[str]]:
+    """Undirected 1-hop adjacency keyed by corpus relpath, derived from links_out.
+
+    For each page's ``links_out`` ref (canonical ``folder/slug``), resolve it to
+    the matching corpus relpath and add a SYMMETRIC edge — so the result holds
+    both out-links and backlinks with no second structure. A ref to a page not
+    in the corpus (a forward/broken link) does not resolve and is skipped; a
+    self-reference is dropped. Deterministic: iteration is over ``sorted(pages)``
+    and ``ref_to_rel`` keeps the first (lexicographically smallest) relpath for a
+    canonical ref (collisions should not occur post-Lint-dedup).
+    """
+    items = sorted(pages, key=lambda it: it[0])
+    ref_to_rel: dict[str, str] = {}
+    for rel, _page in items:
+        ref_to_rel.setdefault(_canonical_ref(rel), rel)
+    adj: dict[str, set[str]] = defaultdict(set)
+    for rel, page in items:
+        for ref in page.links_out:
+            tgt = ref_to_rel.get(ref)
+            if tgt and tgt != rel:
+                adj[rel].add(tgt)
+                adj[tgt].add(rel)
+    return dict(adj)
 
 
 def _is_safe_ref(folder: str, slug: str) -> bool:
