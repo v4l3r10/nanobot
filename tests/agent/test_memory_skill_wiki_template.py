@@ -35,3 +35,9 @@ def test_does_not_repeat_stale_legacy_memory_claims():
 def test_mentions_automatic_curation_contract():
     out = _render().lower()
     assert "cannot" in out and ("merge" in out or "move" in out or "delete" in out)
+
+
+def test_instructs_tagging_on_create():
+    out = _render().lower()
+    # the create guidance mentions tags as an aid to future search/recall
+    assert "tag" in out
