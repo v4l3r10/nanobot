@@ -31,6 +31,9 @@ _WIKILINK = re.compile(r"\[\[([^\[\]]+)\]\]")
 # set — never link to a structural file.
 _RESERVED_STEMS = {n[: -len(".md")] for n in _NON_PAGE_NAMES if n.endswith(".md")}
 
+# Leading path component marking a cold (archived) page's relpath.
+_COLD_PREFIX = f"{_COLD_COMPONENT}/"
+
 
 def parse_wikilinks(body: str) -> list[str]:
     """Extract raw ``[[...]]`` targets from a body (pure, order-preserving).
@@ -81,8 +84,8 @@ def _canonical_ref(relpath: str) -> str:
     canonical ref, not its archive path) and a trailing ``.md``.
     """
     rel = relpath
-    if rel.startswith(f"{_COLD_COMPONENT}/"):
-        rel = rel[len(_COLD_COMPONENT) + 1:]
+    if rel.startswith(_COLD_PREFIX):
+        rel = rel[len(_COLD_PREFIX):]
     if rel.endswith(".md"):
         rel = rel[: -len(".md")]
     return rel
@@ -98,12 +101,16 @@ def build_adjacency(
     both out-links and backlinks with no second structure. A ref to a page not
     in the corpus (a forward/broken link) does not resolve and is skipped; a
     self-reference is dropped. Deterministic: iteration is over ``sorted(pages)``
-    and ``ref_to_rel`` keeps the first (lexicographically smallest) relpath for a
-    canonical ref (collisions should not occur post-Lint-dedup).
+    and ``ref_to_rel`` prefers the HOT relpath for a canonical ref, then the
+    lexicographically smallest (a hot/cold collision at one ref should not occur
+    post-Lint-dedup — cooling moves, not copies — but if it did the live hot page
+    must win the edge, never its archived copy).
     """
     items = sorted(pages, key=lambda it: it[0])
     ref_to_rel: dict[str, str] = {}
-    for rel, _page in items:
+    # cold relpaths sort first ('.' < letters); the (is_cold, rel) key makes the
+    # hot relpath win when both share a canonical ref.
+    for rel, _page in sorted(items, key=lambda it: (it[0].startswith(_COLD_PREFIX), it[0])):
         ref_to_rel.setdefault(_canonical_ref(rel), rel)
     adj: dict[str, set[str]] = defaultdict(set)
     for rel, page in items:

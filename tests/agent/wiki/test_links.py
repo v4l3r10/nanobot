@@ -119,6 +119,21 @@ def test_adjacency_resolves_cold_target_by_canonical_ref():
     assert adj[".cold/projects/pay.md"] == {"people/alice.md"}
 
 
+def test_adjacency_prefers_hot_relpath_over_cold_at_same_ref():
+    # A hot copy AND a cold copy of the same canonical ref coexist; a third page
+    # links to that ref. The edge MUST resolve to the hot relpath — '.' < letters
+    # would otherwise make ".cold/projects/pay.md" win the relpath sort.
+    pages = [
+        ("people/alice.md", _page(links_out=["projects/pay"])),
+        ("projects/pay.md", _page(links_out=[])),
+        (".cold/projects/pay.md", _page(links_out=[])),
+    ]
+    adj = build_adjacency(pages)
+    assert adj["people/alice.md"] == {"projects/pay.md"}
+    assert adj["projects/pay.md"] == {"people/alice.md"}
+    assert ".cold/projects/pay.md" not in adj
+
+
 def test_adjacency_skips_unresolvable_ref():
     pages = [("people/alice.md", _page(links_out=["projects/ghost"]))]
     adj = build_adjacency(pages)
