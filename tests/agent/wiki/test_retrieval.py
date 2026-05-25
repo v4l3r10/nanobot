@@ -99,12 +99,12 @@ def test_graph_ranking_empty_when_no_neighbors():
 # --- search() orchestrator (Task 5) ----------------------------------------
 
 
-def _page(type, title, body):
+def _page(type, title, body, links_out=None):
     # Mirrors the page-creation idiom in tests/agent/wiki/test_vault.py::_page:
     # build a Page dataclass and serialize_page() it onto disk.
     return Page(type=type, title=title, status="hot",
                 created="2026-05-23", updated="2026-05-23", last_touched="2026-05-23",
-                tags=[], links_out=[], pinned=None, body=body)
+                tags=[], links_out=list(links_out or []), pinned=None, body=body)
 
 
 def _write_page(vault, rel, page):
@@ -169,6 +169,62 @@ def test_search_fuses_dense_when_available(tmp_path, monkeypatch):
     results = retrieval.search(vault, "logistica magazzino", k=20, model="fake-model")
     rels = [r for r, _ in results]
     assert "people/alice.md" in rels and "projects/logistica.md" in rels
+
+
+def test_search_graph_boost_surfaces_linked_neighbor(tmp_path, monkeypatch):
+    from nanobot.agent.wiki import retrieval
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    # payment-svc's body matches "gateway billing"; alice's body does NOT,
+    # but alice links to payment-svc -> she is surfaced ONLY via the graph.
+    _write_page(vault, "projects/payment-svc.md",
+                _page("projects", "Payment Service", "payment gateway billing stripe"))
+    _write_page(vault, "people/alice.md",
+                _page("people", "Alice", "alice runs the team",
+                      links_out=["projects/payment-svc"]))
+    rels = [r for r, _ in retrieval.search(vault, "gateway billing", k=20, model=None)]
+    assert "projects/payment-svc.md" in rels   # direct lexical hit (the seed)
+    assert "people/alice.md" in rels           # pulled in by the link graph
+
+
+def test_search_no_links_identical_to_base_ordering(tmp_path, monkeypatch):
+    # Non-degradation: with no links, graph ranker is empty and search() output
+    # order equals the pre-graph base fusion exactly.
+    from nanobot.agent.wiki import retrieval
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    _seed_vault(vault)  # pages have empty links_out
+    q = "logistica magazzino"
+    got = [r for r, _ in retrieval.search(vault, q, k=20, model=None)]
+    pages = {rel: p for rel, p in vault.iter_pages(include_cold=True)}
+    corpus = {
+        rel: "\n".join((p.title, " ".join(p.tags), p.body)) for rel, p in pages.items()
+    }
+    base = rrf_fuse([bm25_ranking(corpus, tokenize(q))], k_rrf=60)
+    assert got == base
+
+
+def test_search_logs_graph_segment(tmp_path, monkeypatch):
+    from loguru import logger
+
+    from nanobot.agent.wiki import retrieval
+    from nanobot.agent.wiki.vault import Vault
+    monkeypatch.setattr(retrieval, "_load_dense_ranker", lambda *a, **k: None)
+    vault = Vault(tmp_path)
+    vault.ensure_initialized()
+    _seed_vault(vault)
+    captured: list[str] = []
+    sink_id = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        retrieval.search(vault, "logistica magazzino", k=20, model=None)
+    finally:
+        logger.remove(sink_id)
+    line = next((m for m in captured if "wiki search" in m), "")
+    assert "graph=" in line
 
 
 # --- search layer-breakdown logging (visibility) ----------------------------
