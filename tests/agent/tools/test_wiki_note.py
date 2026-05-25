@@ -635,7 +635,10 @@ async def test_append_adds_text_bumps_freshness(tmp_path):
     assert page.type == "people"
     assert page.status == "hot"
     assert page.tags == ["x"]
-    assert page.links_out == ["people/bob"]
+    # links_out is now a derived projection of the body's [[...]] links
+    # (approved design): the appended body has no wikilinks, so the stale
+    # frontmatter ["people/bob"] is reconciled away to [].
+    assert page.links_out == []
     assert page.pinned is True
 
 
@@ -1379,3 +1382,49 @@ async def test_create_caps_tags_in_schema_and_normalizer(tmp_path):
     # And the declared JSON schema advertises the same cap.
     props = t.parameters["properties"]
     assert props["tags"]["maxItems"] == _TAGS_MAX
+
+
+async def test_create_extracts_canonical_links_from_body(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create", type="people", slug="bobby", title="Bobby",
+        body="Works with [[projects/payment-svc]] and [[people/alice]].",
+    )
+    page = parse_page(await t.execute(operation="read", path="people/bobby.md"))
+    assert page.links_out == ["people/alice", "projects/payment-svc"]
+
+
+async def test_create_omits_bare_slug_links_eagerly(tmp_path):
+    # Eager path uses an empty index → bare [[alice]] is NOT resolved here
+    # (Lint resolves it later); the body keeps the link.
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create", type="people", slug="cara", title="Cara",
+        body="Friend of [[alice]].",
+    )
+    out = await t.execute(operation="read", path="people/cara.md")
+    page = parse_page(out)
+    assert page.links_out == []
+    assert "[[alice]]" in page.body
+
+
+async def test_create_without_links_is_empty(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create", type="people", slug="dee", title="Dee", body="No links.",
+    )
+    page = parse_page(await t.execute(operation="read", path="people/dee.md"))
+    assert page.links_out == []
+
+
+async def test_append_updates_links_out_from_new_body(tmp_path):
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create", type="people", slug="ed", title="Ed", body="Start.",
+    )
+    await t.execute(
+        operation="append", path="people/ed.md",
+        text="Now linked to [[projects/payment-svc]].",
+    )
+    page = parse_page(await t.execute(operation="read", path="people/ed.md"))
+    assert page.links_out == ["projects/payment-svc"]
