@@ -1,5 +1,10 @@
 from nanobot.agent.wiki.page import Page, serialize_page
-from nanobot.agent.wiki.retrieval import bm25_ranking, rrf_fuse, tokenize
+from nanobot.agent.wiki.retrieval import (
+    _graph_ranking,
+    bm25_ranking,
+    rrf_fuse,
+    tokenize,
+)
 
 
 def test_tokenize_lowercases_splits_drops_stopwords():
@@ -57,6 +62,38 @@ def test_rrf_caps_each_input_before_fusing():
     big = [(f"{i}.md", i + 1) for i in range(100)]
     fused = rrf_fuse([big], k_rrf=60, per_ranker_cap=50)
     assert len(fused) == 50
+
+
+# --- _graph_ranking ---
+
+def test_graph_ranking_counts_then_seed_rank_then_relpath():
+    adjacency = {
+        "s0": {"a", "b"},
+        "s1": {"a"},
+        "a": {"s0", "s1"},
+        "b": {"s0"},
+    }
+    # "a" is reached by both seeds (count 2), "b" by one (count 1) -> a first.
+    assert _graph_ranking(adjacency, ["s0", "s1"]) == [("a", 1), ("b", 2)]
+
+
+def test_graph_ranking_excludes_seeds():
+    adjacency = {"s0": {"s1", "x"}, "s1": {"s0"}, "x": {"s0"}}
+    # s1 is itself a seed -> excluded; only the non-seed neighbor x remains.
+    assert _graph_ranking(adjacency, ["s0", "s1"]) == [("x", 1)]
+
+
+def test_graph_ranking_tiebreak_best_seed_then_relpath():
+    # equal count (1 each): "m" via s0 (rank 0) beats "z" via s1 (rank 1).
+    adj1 = {"s0": {"m"}, "s1": {"z"}, "m": {"s0"}, "z": {"s1"}}
+    assert _graph_ranking(adj1, ["s0", "s1"]) == [("m", 1), ("z", 2)]
+    # equal count AND equal best-seed-rank -> relpath ascending.
+    adj2 = {"s0": {"beta", "alpha"}, "alpha": {"s0"}, "beta": {"s0"}}
+    assert _graph_ranking(adj2, ["s0"]) == [("alpha", 1), ("beta", 2)]
+
+
+def test_graph_ranking_empty_when_no_neighbors():
+    assert _graph_ranking({}, ["s0", "s1"]) == []
 
 
 # --- search() orchestrator (Task 5) ----------------------------------------
