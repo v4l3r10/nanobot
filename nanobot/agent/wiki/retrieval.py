@@ -13,6 +13,8 @@ from collections import Counter
 
 from loguru import logger
 
+from nanobot.agent.wiki.links import build_adjacency
+
 # Minimal IT/EN stopwords — just the highest-frequency function words that add
 # noise to BM25. Deliberately small (YAGNI): a full list is overkill for a
 # personal vault and risks dropping meaningful tokens.
@@ -182,7 +184,9 @@ def search(vault, query, k=None, model=None):
     t_dense = time.perf_counter() - t1
 
     t2 = time.perf_counter()
-    fused = rrf_fuse(rankings, k_rrf=60)
+    seeds = rrf_fuse(rankings, k_rrf=60)[:_GRAPH_SEEDS]
+    graph = _graph_ranking(build_adjacency(pages.items()), seeds)
+    fused = rrf_fuse(rankings + [graph], k_rrf=60)
     t_fuse = time.perf_counter() - t2
 
     hits = [(rel, pages[rel]) for rel in fused if rel in pages]
@@ -196,7 +200,7 @@ def search(vault, query, k=None, model=None):
     )
     msg = (
         f"wiki search {q[:80]!r} : bm25={len(bm25)} ({_ms(t_bm25)})"
-        f"{dense_part} → fused {len(fused)} ({_ms(t_fuse)}), "
+        f"{dense_part} graph={len(graph)} → fused {len(fused)} ({_ms(t_fuse)}), "
         f"top={fused[0] if fused else 'none'}"
     )
     logger.info("{}", msg)
