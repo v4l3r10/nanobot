@@ -877,6 +877,41 @@ async def test_read_reheat_clears_cooled_on(tmp_path):
     assert on_disk.cooled_on is None, "reheat must clear the stale cooled_on stamp"
 
 
+async def test_read_reheat_marks_vault_dirty(tmp_path):
+    from nanobot.agent.wiki.moc_refresh import take_dirty
+    from nanobot.agent.wiki.paths import vault_slug
+
+    t = _tool(tmp_path)  # session_key telegram:1
+    slug = vault_slug("telegram:1")
+    take_dirty(slug)  # clear any prior mark from setup
+    cold_dir = _wiki_dir(tmp_path) / ".cold" / "people"
+    cold_dir.mkdir(parents=True, exist_ok=True)
+    (cold_dir / "old.md").write_text(
+        serialize_page(Page(
+            type="people", title="Old", status="cold",
+            created="2020-01-01", updated="2020-01-01", last_touched="2020-01-01",
+            body="archived\n",
+        )),
+        encoding="utf-8",
+    )
+    await t.execute(operation="read", path=".cold/people/old.md")
+    assert take_dirty(slug) is True, "read-reheat must mark the vault dirty"
+
+
+async def test_read_hot_page_does_not_mark_dirty(tmp_path):
+    from nanobot.agent.wiki.moc_refresh import take_dirty
+    from nanobot.agent.wiki.paths import vault_slug
+
+    t = _tool(tmp_path)
+    await t.execute(
+        operation="create", type="people", slug="bob", title="Bob"
+    )  # create marks dirty
+    slug = vault_slug("telegram:1")
+    take_dirty(slug)  # clear the create's mark
+    await t.execute(operation="read", path="people/bob.md")  # pure hot read
+    assert take_dirty(slug) is False, "a hot read must NOT mark the vault dirty"
+
+
 # --- Task 2.4: search operation (keyword/tag/recency over hot + cold) ---
 
 

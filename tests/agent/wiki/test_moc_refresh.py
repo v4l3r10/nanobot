@@ -11,6 +11,7 @@ import datetime as dt
 from pathlib import Path
 
 from nanobot.agent.wiki.lint import rebuild_indexes_and_moc, run_lint
+from nanobot.agent.wiki.page import Page, serialize_page
 from nanobot.agent.wiki.vault import Vault
 
 
@@ -103,3 +104,48 @@ def test_rebuild_matches_run_lint_regeneration_on_settled_vault(tmp_path):
     }
     assert sorted(rebuilt_indexes) == sorted(index_snapshot)
     assert rebuilt_indexes == index_snapshot
+
+
+def test_rebuild_includes_reheated_page_still_under_cold(tmp_path):
+    """A read-reheated page (status=hot, physically under .cold/) re-enters the
+    MOC/_index on the cheap rebuild, rendered with its CANONICAL link, without
+    waiting for the heavy Dream relocate."""
+    v = _vault(tmp_path)
+    folder = v.schema.folder("people")
+    cold_dir = v.wiki_dir / ".cold" / folder
+    cold_dir.mkdir(parents=True, exist_ok=True)
+    (cold_dir / "sam.md").write_text(
+        serialize_page(Page(
+            type="people", title="Sam", status="hot",  # status hot...
+            created="2026-05-27", updated="2026-05-27", last_touched="2026-05-27",
+            body="x\n",
+        )),
+        encoding="utf-8",
+    )  # ...but physically under .cold/
+
+    assert rebuild_indexes_and_moc(v) is True
+    moc = (v.root / "MEMORY.md").read_text(encoding="utf-8")
+    assert f"[[{folder}/sam]]" in moc, "canonical link must appear in the MOC"
+    assert ".cold/" not in moc, "must NOT render a .cold/ link"
+    idx = (v.wiki_dir / folder / "_index.md").read_text(encoding="utf-8")
+    assert f"[[{folder}/sam]]" in idx
+
+
+def test_rebuild_excludes_genuinely_cold_page(tmp_path):
+    """A genuinely cold page (status=cold under .cold/) stays OUT of the MOC."""
+    v = _vault(tmp_path)
+    folder = v.schema.folder("people")
+    cold_dir = v.wiki_dir / ".cold" / folder
+    cold_dir.mkdir(parents=True, exist_ok=True)
+    (cold_dir / "gone.md").write_text(
+        serialize_page(Page(
+            type="people", title="Gone", status="cold",
+            created="2020-01-01", updated="2020-01-01", last_touched="2020-01-01",
+            body="x\n",
+        )),
+        encoding="utf-8",
+    )
+    rebuild_indexes_and_moc(v)
+    moc_path = v.root / "MEMORY.md"
+    moc = moc_path.read_text(encoding="utf-8") if moc_path.exists() else ""
+    assert "gone" not in moc, "a genuinely cold page must not appear in the MOC"
