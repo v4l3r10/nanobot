@@ -3,6 +3,7 @@ from nanobot.agent.wiki.retrieval import (
     _graph_ranking,
     bm25_ranking,
     rrf_fuse,
+    search,
     tokenize,
 )
 
@@ -43,6 +44,20 @@ def test_bm25_ties_break_by_relpath_ascending():
     assert [rank for _, rank in ranking] == [1, 2, 3]
 
 
+def test_bm25_demotes_cold_on_score_tie():
+    # Identical text => identical BM25 score. Without a cold signal the ".cold/"
+    # relpath sorts FIRST (. < letters) and steals rank 1; flagging it as cold
+    # demotes it so the hot page gets the better rank.
+    corpus = {"concepts/hot.md": "auth model", ".cold/concepts/cold.md": "auth model"}
+    ranking = bm25_ranking(corpus, tokenize("auth"))
+    assert ranking[0][0] == ".cold/concepts/cold.md"  # latent bug: cold wins
+    ranking2 = bm25_ranking(
+        corpus, tokenize("auth"), cold=frozenset({".cold/concepts/cold.md"})
+    )
+    assert ranking2[0][0] == "concepts/hot.md"  # cold demoted -> hot gets rank 1
+    assert dict(ranking2)["concepts/hot.md"] == 1
+
+
 def test_rrf_fuses_two_rankings():
     bm25 = [("a.md", 1), ("b.md", 2), ("c.md", 3)]
     dense = [("c.md", 1), ("a.md", 2), ("d.md", 3)]
@@ -62,6 +77,26 @@ def test_rrf_caps_each_input_before_fusing():
     big = [(f"{i}.md", i + 1) for i in range(100)]
     fused = rrf_fuse([big], k_rrf=60, per_ranker_cap=50)
     assert len(fused) == 50
+
+
+def test_rrf_tiebreak_default_is_relpath_ascending():
+    # Equal score (each ranked #1 in its own ranker). Default: relpath asc,
+    # so the ".cold/..." relpath sorts FIRST — this is the latent bug.
+    r_hot = [("people/hot.md", 1)]
+    r_cold = [(".cold/people/cold.md", 1)]
+    assert rrf_fuse([r_hot, r_cold], k_rrf=60) == [
+        ".cold/people/cold.md",
+        "people/hot.md",
+    ]
+
+
+def test_rrf_tiebreak_prefers_hot_over_cold():
+    # Same equal-score tie, but the cold relpath is flagged: the HOT page wins.
+    r_hot = [("people/hot.md", 1)]
+    r_cold = [(".cold/people/cold.md", 1)]
+    assert rrf_fuse(
+        [r_hot, r_cold], k_rrf=60, cold=frozenset({".cold/people/cold.md"})
+    ) == ["people/hot.md", ".cold/people/cold.md"]
 
 
 # --- _graph_ranking ---
@@ -299,3 +334,37 @@ def test_importing_wiki_note_does_not_pull_numpy_or_fastembed():
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
+
+
+def test_search_hot_beats_equally_relevant_cold(tmp_path, monkeypatch):
+    from nanobot.agent.wiki.page import Page, serialize_page
+    from nanobot.agent.wiki.vault import Vault
+
+    monkeypatch.setattr(
+        "nanobot.agent.wiki.retrieval._load_dense_ranker", lambda *a, **k: None
+    )
+    v = Vault(tmp_path / "v")
+    v.ensure_initialized()
+    folder = v.schema.folder("concepts")
+
+    # Identical corpus text (title+tags+body) => identical BM25 score => tie.
+    common = dict(
+        type="concepts", title="Auth", status="hot",
+        created="2026-05-27", updated="2026-05-27", last_touched="2026-05-27",
+        body="auth model notes\n",
+    )
+    hot = v.wiki_dir / folder
+    hot.mkdir(parents=True, exist_ok=True)
+    (hot / "hotpage.md").write_text(serialize_page(Page(**common)), encoding="utf-8")
+
+    cold_dir = v.wiki_dir / ".cold" / folder
+    cold_dir.mkdir(parents=True, exist_ok=True)
+    cold = dict(common)
+    cold["status"] = "cold"
+    (cold_dir / "coldpage.md").write_text(serialize_page(Page(**cold)), encoding="utf-8")
+
+    hits = search(v, "auth")
+    rels = [rel for rel, _ in hits]
+    assert rels[0] == f"{folder}/hotpage.md", (
+        f"hot page must win the equal-relevance tie, got order: {rels}"
+    )

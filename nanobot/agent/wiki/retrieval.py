@@ -40,12 +40,21 @@ def tokenize(text: str) -> list[str]:
     ]
 
 
-def bm25_ranking(corpus: dict[str, str], query_tokens: list[str]) -> list[tuple[str, int]]:
+def bm25_ranking(
+    corpus: dict[str, str],
+    query_tokens: list[str],
+    cold: frozenset[str] = frozenset(),
+) -> list[tuple[str, int]]:
     """Okapi BM25 ranking. ``corpus`` maps relpath -> raw text (caller-defined;
     ``search()`` uses title + tags + body).
 
-    Returns ``[(relpath, rank), ...]`` 1-based, score>0 only, best first,
-    ties broken by relpath asc for determinism.
+    Returns ``[(relpath, rank), ...]`` 1-based, score>0 only, best first.
+    Ties break hot-before-cold then relpath asc: ``cold`` is the set of relpaths
+    whose page is ``status: cold``. Without it a cold relpath (which starts with
+    ``.cold/``, and ``.`` sorts before letters) would steal the better rank on a
+    score tie, propagating through RRF as a genuine score advantage over an
+    equally-relevant hot page. Default empty set => plain relpath asc tiebreak,
+    byte-identical to before.
     """
     if not query_tokens or not corpus:
         return []
@@ -76,7 +85,7 @@ def bm25_ranking(corpus: dict[str, str], query_tokens: list[str]) -> list[tuple[
             s += idf[term] * (f * (_K1 + 1)) / denom
         if s > 0:
             scores[rel] = s
-    ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+    ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0] in cold, kv[0]))
     return [(rel, i + 1) for i, (rel, _) in enumerate(ordered)]
 
 
@@ -84,19 +93,31 @@ def rrf_fuse(
     rankings: list[list[tuple[str, int]]],
     k_rrf: int = 60,
     per_ranker_cap: int = 50,
+    cold: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Reciprocal Rank Fusion over rank lists. Returns relpaths, best first.
 
     Fuses on ranks (not raw scores) so an unbounded BM25 score and a bounded
     cosine combine without normalization. Empty rankings contribute nothing,
     so the same code degrades to single-ranker (or zero-ranker) cleanly.
+
+    ``cold`` is the set of relpaths whose page is ``status: cold``. Among
+    entries of EQUAL fused score a hot page beats a cold one (without this,
+    a cold relpath -- which starts with ``.cold/`` -- would sort FIRST and
+    let a cold page outrank an equally-relevant hot page). Default empty set
+    => the tiebreak collapses to plain relpath asc, byte-identical to before.
     """
     scores: dict[str, float] = {}
     for ranking in rankings:
         for rel, rank in ranking[:per_ranker_cap]:
             scores[rel] = scores.get(rel, 0.0) + 1.0 / (k_rrf + rank)
-    # Tie-break by relpath asc for determinism.
-    return [rel for rel, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))]
+    # Tie-break: higher score first, then hot-before-cold, then relpath asc.
+    return [
+        rel
+        for rel, _ in sorted(
+            scores.items(), key=lambda kv: (-kv[1], kv[0] in cold, kv[0])
+        )
+    ]
 
 
 def _graph_ranking(
@@ -158,13 +179,18 @@ def search(vault, query, k=None, model=None):
     pages = {rel: page for rel, page in vault.iter_pages(include_cold=True)}
     if not pages:
         return []
+    # Status-based cold set (NOT path-based): a read-reheated page is status=hot
+    # even while physically under .cold/, so it must NOT be demoted. Computed once
+    # and fed to every ranker tiebreak that could otherwise let a cold page outrank
+    # an equally-relevant hot one.
+    cold = frozenset(rel for rel, p in pages.items() if p.status == "cold")
     # BM25 corpus = title + tags + body, so a keyword query can still surface a
     # page via its tags (the pre-BM25 substring ranker scored tag matches too).
     corpus = {
         rel: "\n".join((p.title, " ".join(p.tags), p.body)) for rel, p in pages.items()
     }
     t0 = time.perf_counter()
-    bm25 = bm25_ranking(corpus, tokenize(q))
+    bm25 = bm25_ranking(corpus, tokenize(q), cold=cold)
     t_bm25 = time.perf_counter() - t0
     rankings = [bm25]
 
@@ -186,7 +212,7 @@ def search(vault, query, k=None, model=None):
     t2 = time.perf_counter()
     seeds = rrf_fuse(rankings, k_rrf=60)[:_GRAPH_SEEDS]
     graph = _graph_ranking(build_adjacency(pages.items()), seeds)
-    fused = rrf_fuse(rankings + [graph], k_rrf=60)
+    fused = rrf_fuse(rankings + [graph], k_rrf=60, cold=cold)
     t_fuse = time.perf_counter() - t2
 
     hits = [(rel, pages[rel]) for rel in fused if rel in pages]
