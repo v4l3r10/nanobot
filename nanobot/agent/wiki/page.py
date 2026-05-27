@@ -34,6 +34,7 @@ _KEY_ORDER = (
     "pinned",
     "summary",
     "sender_ids",
+    "cooled_on",
 )
 
 
@@ -62,6 +63,10 @@ class Page:
     # byte-identically to before. ``None`` / ``[]`` mean absent.
     summary: str | None = None
     sender_ids: list[str] = field(default_factory=list)
+    # Optional decay-provenance field: the ISO date a page was last cooled
+    # (set by Lint's stale->cold phase, cleared on reheat). Emitted ONLY when
+    # present so a page that never cooled serializes byte-identically.
+    cooled_on: str | None = None
     body: str = ""
 
 
@@ -84,6 +89,7 @@ def serialize_page(page: Page) -> str:
         "pinned": page.pinned,
         "summary": page.summary,
         "sender_ids": list(page.sender_ids),
+        "cooled_on": page.cooled_on,
     }
     # _KEY_ORDER is the single source of truth for which keys are emitted and
     # in what order; building fm by iterating it keeps the two from drifting.
@@ -98,6 +104,9 @@ def serialize_page(page: Page) -> str:
         if key == "summary" and value is None:
             continue
         if key == "sender_ids" and not value:
+            continue
+        # Optional decay-provenance field: omitted when never cooled.
+        if key == "cooled_on" and value is None:
             continue
         fm[key] = value
 
@@ -175,6 +184,9 @@ def parse_page(text: str) -> Page:
     summary = None if summary is None else str(summary)
     sender_ids = _str_list("sender_ids")
 
+    cooled_on = parsed.get("cooled_on")
+    cooled_on = None if cooled_on is None else str(cooled_on)
+
     # Body convention: after the closing "---\n" there is exactly one blank
     # line ("\n"), then the body verbatim. serialize_page emits "---\n\n<body>",
     # so `after` here is "\n<body>"; drop that single separator newline.
@@ -195,5 +207,6 @@ def parse_page(text: str) -> Page:
         pinned=pinned,
         summary=summary,
         sender_ids=sender_ids,
+        cooled_on=cooled_on,
         body=body,
     )

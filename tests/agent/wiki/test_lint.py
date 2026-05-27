@@ -770,3 +770,33 @@ def test_reconcile_links_only_touches_links_out_field(tmp_path):
     assert bob.links_out == ["people/alice"]
     assert bob.tags == ["x"]  # other frontmatter untouched
     assert "Bob knows [[people/alice]]." in bob.body  # body untouched
+
+
+def test_cooling_stamps_cooled_on(tmp_path):
+    vault = _vault(tmp_path)
+    _write(vault, "people/old.md", _page(
+        title="Old", status="hot",
+        created="2020-01-01", updated="2020-01-01", last_touched="2020-01-01",
+    ))
+
+    run_lint(vault, dt.date(2026, 5, 27))
+
+    cold_file = vault.wiki_dir / ".cold" / "people" / "old.md"
+    assert cold_file.exists(), "stale page should have been cooled into .cold/"
+    cooled = parse_page(cold_file.read_text(encoding="utf-8"))
+    assert cooled.status == "cold"
+    assert cooled.cooled_on == "2026-05-27"
+
+
+def test_cooled_on_is_idempotent(tmp_path):
+    vault = _vault(tmp_path)
+    _write(vault, "people/old.md", _page(
+        title="Old", status="hot",
+        created="2020-01-01", updated="2020-01-01", last_touched="2020-01-01",
+    ))
+    run_lint(vault, dt.date(2026, 5, 27))
+    cold_file = vault.wiki_dir / ".cold" / "people" / "old.md"
+    bytes1 = cold_file.read_bytes()
+    report2 = run_lint(vault, dt.date(2026, 5, 27))
+    assert report2.changed is False, "second run must be a no-op"
+    assert cold_file.read_bytes() == bytes1, "cooled_on must stay byte-stable"

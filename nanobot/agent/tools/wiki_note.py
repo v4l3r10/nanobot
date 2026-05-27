@@ -501,6 +501,7 @@ class WikiNoteTool(_FsTool, ContextAware):
                 return current
             page.status = "hot"
             page.last_touched = datetime.date.today().isoformat()
+            page.cooled_on = None
             # M2: serialize once so the persisted bytes and the returned
             # bytes are guaranteed identical (no drift if serialization
             # ever becomes nondeterministic).

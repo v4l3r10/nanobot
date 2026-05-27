@@ -55,3 +55,25 @@ def test_absent_fields_serialize_byte_identical():
     back = parse_page(text)
     assert back.summary is None
     assert back.sender_ids == []
+
+
+def test_cooled_on_roundtrip():
+    p = Page(
+        type="people", title="Old", status="cold",
+        created="2020-01-01", updated="2020-01-01", last_touched="2020-01-01",
+        cooled_on="2026-05-27", body="archived\n",
+    )
+    back = parse_page(serialize_page(p))
+    assert back.cooled_on == "2026-05-27"
+    assert back == p
+
+
+def test_cooled_on_absent_serializes_byte_identical():
+    p = Page(
+        type="people", title="X", status="hot",
+        created="d", updated="d", last_touched="d",
+    )
+    text = serialize_page(p)
+    assert "cooled_on" not in text
+    back = parse_page(text)
+    assert back.cooled_on is None
