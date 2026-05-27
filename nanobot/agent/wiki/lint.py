@@ -921,6 +921,7 @@ def _stale_to_cold_impl(
             out.append(entry)
             continue
         entry.page.status = "cold"
+        entry.page.cooled_on = today.isoformat()
         target = vault.wiki_dir / target_rel
         # write-new THEN unlink-old (crash-safe ordering -- never reorder).
         atomic_write_text(target, serialize_page(entry.page))

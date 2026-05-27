@@ -858,6 +858,25 @@ async def test_read_cold_path_reheats_in_place(tmp_path):
     )
 
 
+async def test_read_reheat_clears_cooled_on(tmp_path):
+    t = _tool(tmp_path)
+    cold_dir = _wiki_dir(tmp_path) / ".cold" / "people"
+    cold_dir.mkdir(parents=True, exist_ok=True)
+    cold_file = cold_dir / "old.md"
+    cold_file.write_text(
+        serialize_page(Page(
+            type="people", title="Old", status="cold",
+            created="2020-01-01", updated="2020-01-01", last_touched="2020-01-01",
+            cooled_on="2025-01-01", body="archived\n",
+        )),
+        encoding="utf-8",
+    )
+    await t.execute(operation="read", path=".cold/people/old.md")
+    on_disk = parse_page(cold_file.read_text(encoding="utf-8"))
+    assert on_disk.status == "hot"
+    assert on_disk.cooled_on is None, "reheat must clear the stale cooled_on stamp"
+
+
 # --- Task 2.4: search operation (keyword/tag/recency over hot + cold) ---
 
 
