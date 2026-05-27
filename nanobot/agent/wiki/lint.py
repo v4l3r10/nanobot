@@ -141,6 +141,17 @@ def _slug_of(relpath: str) -> str:
     return relpath.rsplit("/", 1)[-1][: -len(".md")]
 
 
+def _canonical_relpath(relpath: str) -> str:
+    """Relpath with a leading ``.cold/`` component stripped -- the page's
+    canonical hot home. A status-hot page physically under ``.cold/`` (a
+    read-reheated page awaiting Dream relocation) thus renders its canonical
+    ``folder/slug`` link, not ``.cold/folder/slug``. A relpath not under
+    ``.cold/`` is returned unchanged.
+    """
+    prefix = f"{_COLD_COMPONENT}/"
+    return relpath[len(prefix):] if relpath.startswith(prefix) else relpath
+
+
 # Max rendered length of a sanitized inline string (title in the MOC).
 _SAFE_INLINE_MAX = 120
 
@@ -615,12 +626,12 @@ def _regenerate_indexes(
     A hot page absent from its pre-existing ``_index.md`` is an orphan; it
     is counted in ``report.orphans_fixed`` and now appears.
     """
-    hot = [e for e in entries if not e.in_cold]
+    hot = [e for e in entries if e.page.status == "hot"]
 
     # folder -> sorted slug list of its hot pages.
     by_folder: dict[str, list[str]] = {}
     for e in hot:
-        folder = e.relpath.split("/", 1)[0]
+        folder = _canonical_relpath(e.relpath).split("/", 1)[0]
         by_folder.setdefault(folder, []).append(_slug_of(e.relpath))
 
     # Every folder that either has hot pages or has an existing _index.md.
@@ -679,9 +690,9 @@ def _moc_content(vault: Vault, entries: list[_Entry]) -> str:
     -- whether because there are no hot pages or truncation dropped them all
     -- so an empty section is never emitted (M2). Deterministic regardless.
     """
-    hot = [e for e in entries if not e.in_cold]
+    hot = [e for e in entries if e.page.status == "hot"]
     folders = sorted(
-        {e.relpath.split("/", 1)[0] for e in hot}
+        {_canonical_relpath(e.relpath).split("/", 1)[0] for e in hot}
     )
     head = "# Memory\n\n"
     map_lines = ["## Map\n"] + [f"- [[{f}/_index]]\n" for f in folders]
@@ -692,7 +703,7 @@ def _moc_content(vault: Vault, entries: list[_Entry]) -> str:
     )
     recent_lines = []
     for e in recent_sorted:
-        folder = e.relpath.split("/", 1)[0]
+        folder = _canonical_relpath(e.relpath).split("/", 1)[0]
         slug = _slug_of(e.relpath)
         # _safe_inline neutralizes newline / wikilink prompt-injection (I1).
         title = _safe_inline(e.page.title)

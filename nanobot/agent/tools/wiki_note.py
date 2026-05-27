@@ -510,6 +510,10 @@ class WikiNoteTool(_FsTool, ContextAware):
                 atomic_write_text(target, out)
             except OSError as e:
                 return f"Error: {e}"
+            # Reheat flipped status hot in place; surface it in the MOC on the
+            # next cheap post-turn refresh (status-based membership) instead of
+            # waiting for the heavy Dream relocate. Mirrors create/append/bind.
+            mark_vault_dirty(vault_slug(self._session_key()))
             return out
 
     async def _do_append(self, path: str | None, text: str | None) -> str:
