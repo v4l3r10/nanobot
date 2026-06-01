@@ -260,23 +260,14 @@ class GitStore:
         try:
             from dulwich import porcelain
 
-            # .gitignore excludes everything except tracked files, so any
-            # staged/unstaged/untracked change must be in our files. New
-            # per-user vault files (Task 5.1) and journal notes appear as
-            # *untracked* until first committed — count them too, otherwise
-            # a freshly created wiki vault or journal note would never be
-            # versioned. gitignore guarantees untracked entries are only
-            # allowlisted paths (strays are ignored, not untracked).
-            st = porcelain.status(str(self._workspace))
-            if (
-                not st.unstaged
-                and not any(st.staged.values())
-                and not st.untracked
-                and not extra_paths
-            ):
-                return None
-
-            msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
+            # Stage explicitly first so new files inside tracked_dirs (e.g.
+            # a fresh journal note) and per-user wiki vaults under
+            # ``memory/users/**`` (Task 5.1) get picked up — dulwich's
+            # status() with the /* gitignore in place does not always descend
+            # into ignored-then-rewhitelisted directories to surface
+            # untracked files. The .gitignore guarantees only our files are
+            # staged so this is safe; if nothing changed, status.staged is
+            # empty and we no-op.
             add_paths = (
                 list(_add_paths)
                 if _add_paths is not None
@@ -286,6 +277,11 @@ class GitStore:
                 seen = set(add_paths)
                 add_paths += [p for p in extra_paths if p not in seen]
             porcelain.add(str(self._workspace), paths=add_paths)
+            st = porcelain.status(str(self._workspace))
+            if not any(st.staged.values()) and not extra_paths:
+                return None
+
+            msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
             sha_bytes = porcelain.commit(
                 str(self._workspace),
                 message=msg_bytes,

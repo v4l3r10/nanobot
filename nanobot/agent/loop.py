@@ -137,9 +137,14 @@ def _compute_peer_violation_active(tool_events: list[dict[str, Any]]) -> bool:
 class TurnContext:
     msg: InboundMessage
     session_key: str
-    memory_key: str  # CV2: distinct from session_key when unified_memory=true (shared vault) — defaults to session_key elsewhere
     state: TurnState
     turn_id: str
+    # CV2: distinct from session_key when unified_memory=true (shared vault).
+    # Optional so callers that don't care about per-user vault routing (tests,
+    # upstream code paths constructing TurnContext directly) keep working;
+    # internal callers always pass it. None falls back to session_key at use
+    # sites via ``ctx.memory_key or ctx.session_key``.
+    memory_key: str | None = None
     session: Session | None = None
 
     history: list[dict[str, Any]] = field(default_factory=list)
@@ -1645,7 +1650,7 @@ class AgentLoop:
             ctx.msg.metadata.get("message_id"),
             ctx.msg.metadata,
             session_key=ctx.session_key,
-            memory_key=ctx.memory_key,
+            memory_key=ctx.memory_key or ctx.session_key,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):

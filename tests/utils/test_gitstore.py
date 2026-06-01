@@ -300,8 +300,9 @@ class TestTrackedDirs:
         assert revert_sha is not None
         assert note.read_text(encoding="utf-8") == "v1\n"
 
-    def test_revert_does_not_resurrect_files_added_after_target(self, git_with_journal, tmp_path):
-        """Additive revert: V1 keeps post-target files on disk untouched."""
+    def test_revert_undoes_add_of_journal_note(self, git_with_journal, tmp_path):
+        """Per-commit-inverse revert: reverting the commit that ADDED a journal
+        note removes the file (and leaves earlier, unrelated files alone)."""
         existing = tmp_path / "memory" / "journal" / "2026-05-07.md"
         existing.write_text("yesterday\n", encoding="utf-8")
         sha_anchor = git_with_journal.auto_commit("anchor")
@@ -313,6 +314,6 @@ class TestTrackedDirs:
 
         git_with_journal.revert(sha_added)
 
-        # Anchor file untouched, post-target file remains on disk (caveat documented).
+        # Anchor file untouched; the added note is removed by the inverse.
         assert existing.read_text(encoding="utf-8") == "yesterday\n"
-        assert new_note.exists()
+        assert not new_note.exists()

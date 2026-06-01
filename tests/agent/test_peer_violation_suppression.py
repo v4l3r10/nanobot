@@ -60,7 +60,6 @@ def test_peer_violation_narrative_is_suppressed(tmp_path):
         [],
         "completed",
         True,  # had_injections
-        [],
         None,
     )
     assert out is None  # error narrative kept local -> receiver not woken
@@ -77,7 +76,6 @@ def test_peer_normal_reply_not_suppressed_without_violation(tmp_path):
         [],
         "completed",
         True,
-        [],
         None,
     )
     assert out is not None
@@ -97,7 +95,6 @@ def test_violation_does_not_suppress_non_peer_channels(tmp_path):
         [],
         "completed",
         True,
-        [],
         None,
     )
     assert out is not None
