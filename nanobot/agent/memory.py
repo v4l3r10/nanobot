@@ -1009,7 +1009,12 @@ class Consolidator:
             last_active = session.updated_at
             summary: str | None = ""
             if archive_msgs:
-                summary = await self.archive(archive_msgs)
+                # CV2: thread the session so the Consolidator resolves
+                # memory_key via the resolver (unified vs per-user vault) —
+                # without this the archived history tag falls back to the
+                # default ("unified:default") instead of the original
+                # session's effective key.
+                summary = await self.archive(archive_msgs, session=session)
 
             if summary and summary != "(nothing)":
                 session.metadata["_last_summary"] = {
