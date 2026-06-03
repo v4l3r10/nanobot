@@ -50,30 +50,44 @@ _INBOX_SCHEMA_LINE = (
     "  inbox:     { folder: inbox,     cold_after_days: 30 }\n"
 )
 
+# The line appended by the one-shot events-type upgrade. Same column /
+# inline-flow convention as the bundled SCHEMA.md so a post-upgrade diff
+# against the master is line-for-line clean for the events row. Lets the
+# model persist time-anchored pages (incidents, trips) instead of having
+# its `events` creates silently rejected by the admission gate.
+_EVENTS_SCHEMA_LINE = (
+    "  events:    { folder: events,    cold_after_days: 90 }\n"
+)
+
 # A *type-entry* line inside the ``types:`` mapping: an indented YAML key
 # whose value opens with ``{`` (inline flow-style mapping, the bundled
 # convention). Used both as the idempotence probe ("does an inbox type
 # entry already exist?") and to find the LAST type entry to insert after.
 _TYPE_ENTRY_RE = re.compile(r"^\s+\w+:\s*\{")
 _INBOX_ENTRY_RE = re.compile(r"^\s+inbox:\s*\{", re.MULTILINE)
+_EVENTS_ENTRY_RE = re.compile(r"^\s+events:\s*\{", re.MULTILINE)
 # A *top-level* YAML key at column 0 (e.g. ``required_frontmatter:``,
 # ``moc_max_lines:``) -- marks the end of the indented ``types:`` block.
 _TOP_LEVEL_KEY_RE = re.compile(r"^\w+:")
 
 
-def _ensure_inbox_type(schema_path: Path) -> bool:
-    r"""One-shot in-place upgrade: append an 'inbox' type to an old
-    SCHEMA.md that lacks it. Returns True if the file was modified.
+def _ensure_type_entry(
+    schema_path: Path,
+    entry_re: "re.Pattern[str]",
+    schema_line: str,
+) -> bool:
+    r"""One-shot in-place upgrade: append ``schema_line`` (a single type
+    entry) to an old SCHEMA.md that lacks it. Returns True if the file was
+    modified.
 
-    Idempotent: a schema that already contains an indented ``inbox:`` key
-    in inline flow-style short-circuits without writing.
+    ``entry_re`` is the idempotence probe — a schema that already contains
+    that type's indented inline-flow key short-circuits without writing.
 
     Preserves all other user content via string-level insertion (no YAML
     round-trip, so comments and column alignment survive).
 
-    Limitations — these schemas are NOT upgraded; the attachment writer
-    will return an `error` status and the operator must add `inbox`
-    manually:
+    Limitations — these schemas are NOT upgraded and the missing type must
+    be added manually:
 
     * Block-style type definitions (multi-line key/value mappings under
       ``types:``). The helper looks for inline flow-style ``{ ... }``
@@ -87,7 +101,7 @@ def _ensure_inbox_type(schema_path: Path) -> bool:
     master — match the inline format and upgrade cleanly.
     """
     text = schema_path.read_text(encoding="utf-8")
-    if _INBOX_ENTRY_RE.search(text):
+    if entry_re.search(text):
         return False
     lines = text.splitlines(keepends=True)
     in_yaml = False
@@ -115,9 +129,24 @@ def _ensure_inbox_type(schema_path: Path) -> bool:
         # Malformed or unrecognised layout -- leave it to the parser to
         # complain at load time rather than corrupt the file here.
         return False
-    new_lines = lines[: last_type_idx + 1] + [_INBOX_SCHEMA_LINE] + lines[last_type_idx + 1 :]
+    new_lines = lines[: last_type_idx + 1] + [schema_line] + lines[last_type_idx + 1 :]
     atomic_write_text(schema_path, "".join(new_lines))
     return True
+
+
+def _ensure_inbox_type(schema_path: Path) -> bool:
+    """One-shot upgrade: append the ``inbox`` type if missing, so the
+    attachment writer's admission gate stops rejecting eager-hook writes
+    against an old vault. See :func:`_ensure_type_entry`."""
+    return _ensure_type_entry(schema_path, _INBOX_ENTRY_RE, _INBOX_SCHEMA_LINE)
+
+
+def _ensure_events_type(schema_path: Path) -> bool:
+    """One-shot upgrade: append the ``events`` type if missing, so the model's
+    time-anchored pages (incidents, trips, outages) are accepted instead of
+    silently rejected by the create admission gate. See
+    :func:`_ensure_type_entry`."""
+    return _ensure_type_entry(schema_path, _EVENTS_ENTRY_RE, _EVENTS_SCHEMA_LINE)
 
 
 class Vault:
@@ -185,6 +214,11 @@ class Vault:
         # Idempotent: a cheap regex probe inside the helper makes the
         # second (and every subsequent) call a no-op.
         _ensure_inbox_type(schema_path)
+        # One-shot upgrade: append the ``events`` type if missing, so the
+        # model's time-anchored pages (incidents, trips, outages) are
+        # accepted instead of silently rejected. Same idempotent
+        # cheap-regex-probe contract as the inbox upgrade above.
+        _ensure_events_type(schema_path)
         if legacy_workspace is not None:
             from nanobot.agent.wiki.migrate import migrate_legacy
 

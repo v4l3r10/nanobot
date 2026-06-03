@@ -154,9 +154,10 @@ def test_ensure_initialized_with_none_legacy_is_byte_identical(tmp_path):
 
 def test_ensure_initialized_does_not_overwrite_existing_schema(tmp_path):
     """An existing per-vault SCHEMA.md is preserved (never clobbered by the
-    bundled master). The Task-6 one-shot upgrade may APPEND an ``inbox`` type
-    line if missing, but user customizations on other types and other YAML
-    keys (``moc_max_lines``, ``required_frontmatter``) are preserved verbatim.
+    bundled master). The one-shot upgrades may APPEND the ``inbox`` and
+    ``events`` type lines if missing, but user customizations on other types
+    and other YAML keys (``moc_max_lines``, ``required_frontmatter``) are
+    preserved verbatim.
     """
     v = _make_vault(tmp_path, with_schema=False, with_pages=False, with_cold=False)
     v.wiki_dir.mkdir(parents=True, exist_ok=True)
@@ -181,13 +182,16 @@ def test_ensure_initialized_does_not_overwrite_existing_schema(tmp_path):
     ]
 
     # Byte-level "nothing else changed" check: the post-upgrade text minus
-    # the single inserted inbox line must equal the original schema text.
-    from nanobot.agent.wiki.vault import _INBOX_SCHEMA_LINE
+    # the inserted inbox + events type lines must equal the original schema.
+    from nanobot.agent.wiki.vault import _EVENTS_SCHEMA_LINE, _INBOX_SCHEMA_LINE
     final = (v.wiki_dir / "SCHEMA.md").read_text(encoding="utf-8")
-    # The helper inserts the inbox line with a trailing newline.
-    inserted = _INBOX_SCHEMA_LINE
-    assert inserted in final
-    assert final.replace(inserted, "", 1) == custom
+    # Each helper inserts its type line with a trailing newline.
+    assert _INBOX_SCHEMA_LINE in final
+    assert _EVENTS_SCHEMA_LINE in final
+    stripped = final.replace(_INBOX_SCHEMA_LINE, "", 1).replace(
+        _EVENTS_SCHEMA_LINE, "", 1
+    )
+    assert stripped == custom
 
 
 def test_ensure_initialized_upgrades_old_schema_to_include_inbox(tmp_path):
@@ -222,6 +226,43 @@ def test_ensure_initialized_upgrades_old_schema_to_include_inbox(tmp_path):
     assert vault.schema.required_frontmatter == ["type", "title", "status"]
 
 
+def test_ensure_initialized_upgrades_old_schema_to_include_events(tmp_path):
+    """Vaults created before the events type was added must be upgraded
+    in-place when ensure_initialized runs, so the model's time-anchored pages
+    (incidents, trips, outages) are accepted instead of silently rejected.
+    The upgrade preserves other user-customized parts of SCHEMA.md and is
+    idempotent."""
+    vault_root = tmp_path / "v"
+    vault_root.mkdir()
+    wiki = vault_root / "wiki"
+    wiki.mkdir()
+    # Pre-events schema: people + inbox, custom cold value, custom moc_max_lines.
+    (wiki / "SCHEMA.md").write_text(
+        "# Wiki Schema\n"
+        "```yaml\n"
+        "types:\n"
+        "  people: { folder: people, cold_after_days: 200 }\n"
+        "  inbox:  { folder: inbox,  cold_after_days: 30 }\n"
+        "required_frontmatter: [type, title, status]\n"
+        "moc_max_lines: 99\n"
+        "```\n"
+    )
+    from nanobot.agent.wiki.vault import Vault
+    vault = Vault(vault_root)
+    vault.ensure_initialized(None)
+    # After upgrade events is usable:
+    assert vault.schema.is_known_type("events")
+    assert vault.schema.folder("events") == "events"
+    assert vault.schema.cold_after_days("events") == 90
+    # Pre-existing custom values preserved:
+    assert vault.schema.cold_after_days("people") == 200
+    assert vault.schema.cold_after_days("inbox") == 30
+    assert vault.schema.moc_max_lines == 99
+    # Idempotent: a second run adds nothing — events appears exactly once.
+    Vault(vault_root).ensure_initialized(None)
+    assert (wiki / "SCHEMA.md").read_text(encoding="utf-8").count("events:") == 1
+
+
 def test_ensure_initialized_upgrade_is_idempotent(tmp_path):
     """Running ensure_initialized twice must not double-add the inbox type
     or otherwise mutate the schema file content beyond the first run."""
@@ -251,8 +292,8 @@ def test_ensure_initialized_upgrade_is_idempotent(tmp_path):
 
 
 def test_ensure_initialized_modern_schema_unchanged(tmp_path):
-    """A schema that ALREADY has the inbox type (modern bundled) is not
-    rewritten — the upgrade is gated on absence of the inbox type."""
+    """A schema that ALREADY has the inbox and events types (modern bundled)
+    is not rewritten — each upgrade is gated on absence of its type."""
     vault_root = tmp_path / "v"
     vault_root.mkdir()
     wiki = vault_root / "wiki"
@@ -263,6 +304,7 @@ def test_ensure_initialized_modern_schema_unchanged(tmp_path):
         "types:\n"
         "  people: { folder: people, cold_after_days: 180 }\n"
         "  inbox:  { folder: inbox,  cold_after_days: 30 }\n"
+        "  events: { folder: events, cold_after_days: 90 }\n"
         "```\n"
     )
     (wiki / "SCHEMA.md").write_text(schema_text)

@@ -142,8 +142,17 @@ class ContextBuilder:
         # every branch below falls back to the verbatim original behaviour.
         wiki_moc: str | None = None
         vault_user: str | None = None
+        wiki_allowed_types: str | None = None
         if wiki_active:
             vroot = vault_dir(root, vault_key)
+            # Allowed wiki types for the interactive memory skill — the
+            # mirror of the ingest path's {{ allowed_types }} so the model
+            # writes only types the create admission gate accepts (otherwise
+            # it invents plausible-but-unknown types like `events` and the
+            # creates are silently rejected). Defensive: a missing / malformed
+            # SCHEMA.md must never blow up the hot prompt path.
+            with suppress(Exception):
+                wiki_allowed_types = ", ".join(sorted(Vault(vroot).schema.types))
             with suppress(OSError):
                 moc_path = vroot / "MEMORY.md"
                 if moc_path.is_file():
@@ -212,7 +221,10 @@ class ContextBuilder:
                 # body in `memory`'s slot). Other always-skills are loaded
                 # verbatim. This branch is unreachable when wiki is off, so
                 # the wiki-OFF system prompt is byte-identical to before.
-                wiki_mem = render_template("agent/memory_skill_wiki.md").strip()
+                wiki_mem = render_template(
+                    "agent/memory_skill_wiki.md",
+                    allowed_types=wiki_allowed_types or "",
+                ).strip()
                 rendered = []
                 # `### Skill: <name>` wrapper + `\n\n---\n\n` join below MUST mirror the source of
                 # truth nanobot/agent/skills.py:load_skills_for_context (L104-109); keep in sync.

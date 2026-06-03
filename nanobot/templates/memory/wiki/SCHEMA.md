@@ -6,6 +6,7 @@ types:
   concepts:  { folder: concepts,  cold_after_days: 365 }
   decisions: { folder: decisions, cold_after_days: null }
   inbox:     { folder: inbox,     cold_after_days: 30 }
+  events:    { folder: events,    cold_after_days: 90 }
 required_frontmatter: [type, title, status, created, updated, last_touched]
 moc_max_lines: 120
 ```
