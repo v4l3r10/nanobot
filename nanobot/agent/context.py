@@ -19,7 +19,6 @@ from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
-    load_bundled_template,
     truncate_text,
 )
 from nanobot.utils.prompt_templates import (

@@ -325,15 +325,6 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
-        # CV2: resolver maps a Session → its memory/vault key. When
-        # unified_memory (or legacy unified_session) is on, every session
-        # collapses onto UNIFIED_SESSION_KEY for vault lookups, decoupling
-        # chat history (session.key, per-channel) from memory (shared).
-        def _memory_key_for(sess: Session) -> str:
-            if self._unified_memory or self._unified_session:
-                return UNIFIED_SESSION_KEY
-            return sess.key
-
         self.consolidator = Consolidator(
             store=self.context.memory,
             provider=provider,
@@ -344,7 +335,6 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
-            memory_key_resolver=_memory_key_for,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,

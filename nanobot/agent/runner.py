@@ -97,6 +97,7 @@ class AgentRunSpec:
     fail_on_tool_error: bool = False
     workspace: Path | None = None
     session_key: str | None = None
+    memory_key: str | None = None  # CV2: distinct vault key under unified_memory=true; None = use session_key
     context_window_tokens: int | None = None
     context_block_limit: int | None = None
     provider_retry_mode: str = "standard"
