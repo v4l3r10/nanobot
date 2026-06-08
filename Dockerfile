@@ -15,18 +15,24 @@ RUN apt-get update && \
 
 WORKDIR /app
 
+# Optional dense-embedding retrieval for wiki-tree memory. Empty by default →
+# stock image (BM25 retrieval needs no extra deps). Set to "[wiki-search]" to
+# bundle fastembed + numpy and pre-bake the embedding model below:
+#   docker build --build-arg WIKI_EXTRA="[wiki-search]" ...
+ARG WIKI_EXTRA=""
+
 # Install Python dependencies first (cached layer). Hatch reads the custom build
 # hook from hatch_build.py even for this metadata-only install.
 COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md hatch_build.py ./
 RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
-    uv pip install --system --no-cache '.[wiki-search]' && \
+    uv pip install --system --no-cache ".${WIKI_EXTRA}" && \
     rm -rf nanobot bridge
 
 # Copy the full source and install
 COPY nanobot/ nanobot/
 COPY bridge/ bridge/
 COPY webui/ webui/
-RUN NANOBOT_FORCE_WEBUI_BUILD=1 uv pip install --system --no-cache '.[wiki-search]'
+RUN NANOBOT_FORCE_WEBUI_BUILD=1 uv pip install --system --no-cache ".${WIKI_EXTRA}"
 
 # Build the WhatsApp bridge
 WORKDIR /app/bridge
@@ -47,7 +53,9 @@ USER nanobot
 ENV HOME=/home/nanobot
 
 # Pre-bake the wiki-search embedding model into the image so the Dream cycle
-# never downloads it at runtime. fastembed stores models under
+# never downloads it at runtime. ONLY runs when WIKI_EXTRA is set (i.e. the
+# image actually bundles fastembed); a stock BM25-only build skips this entirely
+# and never touches Hugging Face. fastembed stores models under
 # FASTEMBED_CACHE_PATH (it IGNORES HF_HOME), default /tmp/fastembed_cache —
 # pin it to a stable path under $HOME/.cache, which is NOT a mounted volume
 # (only ~/.nanobot is), so the baked layer is exactly what the runtime reads
@@ -67,8 +75,12 @@ ENV FASTEMBED_CACHE_PATH=/home/nanobot/.cache/fastembed
 ENV HF_HOME=/home/nanobot/.cache/huggingface
 ARG WIKI_EMBEDDING_MODEL=ibm-granite/granite-embedding-97m-multilingual-r2
 RUN --mount=type=secret,id=hf_token,uid=1000,required=false \
-    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
-    python -c "from nanobot.agent.wiki.embeddings import warm_embedding_model as w; import sys; sys.exit(0 if w('${WIKI_EMBEDDING_MODEL}') else 1)"
+    if [ -n "${WIKI_EXTRA}" ]; then \
+        HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+        python -c "from nanobot.agent.wiki.embeddings import warm_embedding_model as w; import sys; sys.exit(0 if w('${WIKI_EMBEDDING_MODEL}') else 1)"; \
+    else \
+        echo "WIKI_EXTRA unset → BM25-only image, skipping embedding model pre-bake"; \
+    fi
 
 # Gateway health endpoint and optional WebUI/WebSocket channel ports
 EXPOSE 18790 8765
