@@ -28,6 +28,11 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.wiki.attachments_writer import write_attachment_page
+from nanobot.agent.wiki.lint import rebuild_indexes_and_moc
+from nanobot.agent.wiki.moc_refresh import take_dirty
+from nanobot.agent.wiki.paths import vault_dir, vault_slug
+from nanobot.agent.wiki.vault import Vault
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
@@ -37,6 +42,7 @@ from nanobot.bus.runtime_events import (
     ensure_runtime_event_publisher,
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.config.paths import get_media_dir, get_workspace_path
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
@@ -61,6 +67,7 @@ from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
     SUSTAINED_GOAL_CONTINUE_PROMPT,
 )
+from nanobot.utils.vault_lock import get_vault_lock
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -99,6 +106,12 @@ class TurnContext:
     session_key: str
     state: TurnState
     turn_id: str
+    # CV2: distinct from session_key when unified_memory=true (shared vault).
+    # Optional so callers that don't care about per-user vault routing (tests,
+    # upstream code paths constructing TurnContext directly) keep working;
+    # internal callers always pass it. None falls back to session_key at use
+    # sites via ``ctx.memory_key or ctx.session_key``.
+    memory_key: str | None = None
     session: Session | None = None
 
     history: list[dict[str, Any]] = field(default_factory=list)
@@ -199,6 +212,8 @@ class AgentLoop:
         max_messages: int = 120,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
+        unified_memory: bool = False,
+        wiki_enabled: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
         image_generation_provider_config: ProviderConfig | None = None,
@@ -265,7 +280,12 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+            wiki_enabled=wiki_enabled,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
@@ -286,6 +306,7 @@ class AgentLoop:
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
         )
         self._unified_session = unified_session
+        self._unified_memory = unified_memory
         self._max_messages = max_messages if max_messages > 0 else 120
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -304,6 +325,15 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        # CV2: resolver maps a Session → its memory/vault key. When
+        # unified_memory (or legacy unified_session) is on, every session
+        # collapses onto UNIFIED_SESSION_KEY for vault lookups, decoupling
+        # chat history (session.key, per-channel) from memory (shared).
+        def _memory_key_for(sess: Session) -> str:
+            if self._unified_memory or self._unified_session:
+                return UNIFIED_SESSION_KEY
+            return sess.key
+
         self.consolidator = Consolidator(
             store=self.context.memory,
             provider=provider,
@@ -314,6 +344,7 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
+            memory_key_resolver=_memory_key_for,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
@@ -374,6 +405,8 @@ class AgentLoop:
             channels_config=config.channels,
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
+            unified_memory=defaults.unified_memory,
+            wiki_enabled=defaults.dream.wiki_enabled,
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
@@ -485,6 +518,11 @@ class AgentLoop:
             timezone=self.context.timezone or "UTC",
             workspace_sandbox=self.workspace_scopes.sandbox_status,
             runtime_events=self.runtime_events,
+            # Resolved master switch (ContextBuilder holds the value plumbed
+            # from config.agents.defaults.dream.wiki_enabled). Gates
+            # WikiNoteTool registration so a wiki-OFF install never sends the
+            # tool schema to the provider (byte-identity with v0.2.0).
+            wiki_enabled=self.context.wiki_enabled,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
@@ -506,6 +544,7 @@ class AgentLoop:
         self, channel: str, chat_id: str,
         message_id: str | None = None, metadata: dict | None = None,
         session_key: str | None = None,
+        memory_key: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         from nanobot.agent.tools.context import ContextAware
@@ -517,11 +556,22 @@ class AgentLoop:
         else:
             effective_key = f"{channel}:{chat_id}"
 
+        # CV2: memory_key derivation. Explicit arg wins; else unified_memory
+        # or legacy unified_session collapses to UNIFIED_SESSION_KEY; else
+        # per-chat (== effective_key) — back-compat with pre-CV2 behaviour.
+        if memory_key is not None:
+            effective_memory_key = memory_key
+        elif self._unified_memory or self._unified_session:
+            effective_memory_key = UNIFIED_SESSION_KEY
+        else:
+            effective_memory_key = effective_key
+
         request_ctx = RequestContext(
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
             session_key=effective_key,
+            memory_key=effective_memory_key,
             metadata=dict(metadata or {}),
         )
 
@@ -597,6 +647,16 @@ class AgentLoop:
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
         scope = self.workspace_scopes.for_message(msg, session.metadata)
+        # Pass the effective session key so the wiki read path (when enabled)
+        # resolves THIS user's per-user vault MOC/USER.md. session.key is the
+        # already-resolved effective key (unified or channel:chat); prefer it,
+        # falling back to the msg-derived effective key. When the wiki is off
+        # ContextBuilder ignores this entirely (verbatim original path).
+        effective_key = session.key or self._effective_session_key(msg)
+        # CV2: vault read uses memory_key (may differ from session.key when
+        # unified_memory=true). Threaded through build_messages →
+        # build_system_prompt → vault_dir.
+        memory_key = self._effective_memory_key(msg, effective_key)
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -610,6 +670,8 @@ class AgentLoop:
             runtime_state=self,
             inbound_message=msg,
             include_memory_recent_history=include_memory_recent_history,
+            session_key=effective_key,
+            memory_key=memory_key,
         )
 
     async def _dispatch_command_inline(
@@ -645,6 +707,27 @@ class AgentLoop:
         if self._unified_session and not msg.session_key_override:
             return UNIFIED_SESSION_KEY
         return msg.session_key
+
+    def _effective_memory_key(self, msg: InboundMessage, session_key: str) -> str:
+        """Return the memory/vault key for this turn.
+
+        CV2: distinct from ``_effective_session_key``. While *session_key*
+        drives chat history, locks, and follow-up routing, *memory_key*
+        drives which wiki vault / MEMORY.md / history.jsonl the consolidator
+        and wiki tools read and write.
+
+        Resolution order:
+        1. explicit ``memory_key_override`` on the inbound message
+        2. ``unified_memory=True`` or legacy ``unified_session=True``
+           → ``UNIFIED_SESSION_KEY`` (single shared vault)
+        3. fallback → ``session_key`` (pre-CV2 behaviour: 1:1 with session)
+        """
+        override = getattr(msg, "memory_key_override", None)
+        if override:
+            return override
+        if self._unified_memory or self._unified_session:
+            return UNIFIED_SESSION_KEY
+        return session_key
 
     def _replay_token_budget(self) -> int:
         """Derive a token budget for session history replay from the context window."""
@@ -864,6 +947,18 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
+            # Eager wiki ingest: fire-and-forget. Never blocks dispatch.
+            # Gated internally by ``self.context.wiki_enabled``. Captures
+            # ``msg.media`` paths the moment a channel publishes them, so the
+            # model doesn't have to "decide" to call wiki_note. The Dream
+            # reconciler (attachments_reconciler.run_attachments_reconcile,
+            # invoked from memory.py) is the
+            # catch-up sweep for files arrived out-of-band or when this hook
+            # failed. The ``if msg.media:`` short-circuit keeps the common
+            # plain-text path zero-cost (no task creation).
+            if msg.media:
+                self._schedule_background(self._eager_attachment_ingest(msg))
+
             raw = msg.content.strip()
             effective_key = self._effective_session_key(msg)
             if await agent_context.handle_runtime_control(self, msg, self.tools):
@@ -919,8 +1014,14 @@ class AgentLoop:
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
         session_key = self._effective_session_key(msg)
+        memory_key = self._effective_memory_key(msg, session_key)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
+        if memory_key != session_key and not getattr(msg, "memory_key_override", None):
+            # Carry the resolved memory_key on the message so downstream
+            # consumers (subagents, mid-turn injection) don't need to
+            # re-derive it from the loop's flags.
+            msg = dataclasses.replace(msg, memory_key_override=memory_key)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
 
@@ -979,6 +1080,15 @@ class AgentLoop:
                             channel=msg.channel, chat_id=msg.chat_id,
                             content="", metadata=msg.metadata or {},
                         ))
+                    # Wiki MOC decouple: keep the always-injected root MOC fresh
+                    # within the turn it was written, decoupled from the heavy 2h
+                    # Dream Ingest. Gated on the same master switch; per-vault
+                    # isolated; the dirty signal is only set by a successful
+                    # wiki_note write (which itself cannot fire when wiki is off
+                    # -> double-gated -> golden-safe). Runs for ALL channels
+                    # (placed before the websocket-only block).
+                    if self.context.wiki_enabled and take_dirty(vault_slug(session_key)):
+                        self._schedule_background(self._refresh_vault_moc(session_key))
                     continuing = turn_continuation.internal_continuation_pending(msg.metadata)
                     if not continuing:
                         await self._runtime_events().turn_completed(
@@ -1081,6 +1191,103 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
+    async def _eager_attachment_ingest(self, msg: InboundMessage) -> None:
+        """Best-effort: write any files in ``msg.media`` to the wiki as
+        ``inbox`` pages. Scheduled fire-and-forget from :meth:`run`; any
+        exception is logged and swallowed — this MUST NEVER interfere with
+        the agent's message-dispatch path.
+
+        Gated by ``self.context.wiki_enabled`` (the same master switch the
+        Dream cycle and the post-turn MOC refresh use). In v1 every
+        attachment is routed to the **unified** vault (slug
+        ``vault_slug("unified:default")``), symmetric with the Task-4
+        reconciler — per-sender routing arrives once sender→slug metadata
+        is standardized across channels.
+
+        The unified vault's per-slug lock is held for the duration of the
+        writes, sharing serialization with ``wiki_note``, ``run_ingest``,
+        ``run_lint`` and ``_refresh_vault_moc``. ``allowed_roots`` pins the
+        writer's containment check to the workspace + media-dir roots
+        (see :mod:`nanobot.agent.wiki.attachments_writer`).
+
+        Pre-flight invariants — strict no-op when ANY of these holds:
+
+        * ``wiki_enabled`` is off (the master switch);
+        * ``msg.media`` is empty or contains no usable string paths.
+
+        ``vault.ensure_initialized()`` runs inside the per-vault lock (no
+        ``legacy_workspace`` — isolation, same as :meth:`_refresh_vault_moc`)
+        so that vaults created before this feature shipped get their
+        SCHEMA.md upgraded with the ``inbox`` type before the first write;
+        otherwise every eager write would fail with "vault schema lacks
+        'inbox' type" until the next Dream sweep.
+        """
+        if not self.context.wiki_enabled:
+            return
+        media = [p for p in (msg.media or []) if isinstance(p, str) and p]
+        if not media:
+            return
+        slug = vault_slug(UNIFIED_SESSION_KEY)
+        try:
+            vault = Vault(vault_dir(Path(self.workspace), UNIFIED_SESSION_KEY))
+            allowed_roots = [get_workspace_path(), get_media_dir()]
+            async with get_vault_lock(slug):
+                vault.ensure_initialized()  # NO legacy_workspace (isolation)
+                for raw in media:
+                    p = Path(raw)
+                    if not p.is_file():
+                        continue
+                    # Eager hook msg_id: align with reconciler conventions so
+                    # the same file discovered by either path produces the
+                    # same `Source:` header.
+                    # - peer layout: <workspace>/peer/<msg_subdir>/<file>
+                    #   -> msg_id = <msg_subdir>
+                    # - flat layout: <data>/media/<channel>/<file>
+                    #   -> msg_id = <file stem>
+                    # Heuristic: if the parent directory looks like a
+                    # per-message subdir (i.e. parent's parent's name ==
+                    # msg.channel), use parent.name; else stem.
+                    if p.parent.parent.name == msg.channel:
+                        file_msg_id = p.parent.name
+                    else:
+                        file_msg_id = p.stem
+                    result = write_attachment_page(
+                        vault, slug, p,
+                        channel=msg.channel,
+                        msg_id=file_msg_id,
+                        allowed_roots=allowed_roots,
+                    )
+                    if result.status == "error":
+                        logger.warning(
+                            "eager attachment write error for {}: {}",
+                            p, result.reason,
+                        )
+        except Exception:
+            logger.exception("eager attachment ingest failed (non-fatal)")
+
+    async def _refresh_vault_moc(self, session_key: str) -> None:
+        """Post-turn: regenerate this vault's _index.md + root MEMORY.md
+        (deterministic, LLM-free) so a just-written wiki_note page is in
+        the always-injected MOC next turn -- without waiting for Dream.
+
+        Serialized against wiki_note / Dream's wiki block via the SAME
+        per-vault lock. ensure_initialized() is called with NO
+        legacy_workspace: per-user vaults must NEVER run migrate_legacy
+        (it would fan the single global memory blob into this vault ->
+        permanent cross-user bleed; that gate stays Dream/unified-only).
+        Best-effort: any failure is logged and swallowed so it never
+        breaks the user's turn (the next write / Dream will retry).
+        """
+        slug = vault_slug(session_key)
+        try:
+            async with get_vault_lock(slug):
+                vault = Vault(vault_dir(Path(self.workspace), session_key))
+                vault.ensure_initialized()  # NO legacy_workspace (isolation)
+                rebuild_indexes_and_moc(vault)
+        except Exception:
+            logger.exception(
+                "post-turn MOC refresh failed for vault {}", slug)
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -1119,9 +1326,11 @@ class AgentLoop:
         if is_subagent and self._persist_subagent_followup(session, msg):
             logger.debug("Subagent result persisted for session {}", key)
             self.sessions.save(session)
+        # CV2: memory_key may diverge from session key when unified_memory=true.
+        sys_memory_key = self._effective_memory_key(msg, key)
         self._set_tool_context(
             channel, chat_id, msg.metadata.get("message_id"),
-            msg.metadata, session_key=key,
+            msg.metadata, session_key=key, memory_key=sys_memory_key,
         )
         _hist_kwargs: dict[str, Any] = {
             "max_messages": self._max_messages,
@@ -1145,6 +1354,9 @@ class AgentLoop:
             runtime_state=self,
             inbound_message=msg,
             skip_runtime_lines=is_subagent,
+            # `key` is the effective session key resolved above; lets the
+            # wiki read path target this user's vault (no-op when wiki off).
+            session_key=key,
         )
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
@@ -1184,6 +1396,7 @@ class AgentLoop:
         self,
         msg: InboundMessage,
         session_key: str | None = None,
+        memory_key: str | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
@@ -1206,10 +1419,12 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         t0 = time.time()
+        mem_key = memory_key or self._effective_memory_key(msg, key)
         ctx = TurnContext(
             msg=msg,
             session=None,
             session_key=key,
+            memory_key=mem_key,
             state=TurnState.RESTORE,
             turn_id=f"{key}:{time.time_ns()}",
             turn_wall_started_at=t0,
@@ -1389,6 +1604,7 @@ class AgentLoop:
             ctx.msg.metadata.get("message_id"),
             ctx.msg.metadata,
             session_key=ctx.session_key,
+            memory_key=ctx.memory_key or ctx.session_key,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):

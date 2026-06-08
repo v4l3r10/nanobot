@@ -28,6 +28,7 @@ class InboundMessage:
     media: list[str] = field(default_factory=list)  # Media URLs
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
     session_key_override: str | None = None  # Optional override for thread-scoped sessions
+    memory_key_override: str | None = None  # CV2: optional override for memory/vault key (separate from chat session)
 
     @property
     def session_key(self) -> str:
