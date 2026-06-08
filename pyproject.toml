@@ -98,6 +98,10 @@ pdf = [
 olostep = [
     "olostep>=0.1.0",
 ]
+wiki-search = [
+    "fastembed>=0.4",
+    "numpy>=1.24",
+]
 dev = [
     "pytest>=9.0.0,<10.0.0",
     "pytest-asyncio>=1.3.0,<2.0.0",
@@ -172,6 +176,9 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "slow: tests that download/run a real embedding model; skipped without the wiki-search extra",
+]
 
 [tool.coverage.run]
 source = ["nanobot"]

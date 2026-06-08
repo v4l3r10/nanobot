@@ -58,6 +58,21 @@ class DreamConfig(Base):
     max_batch_size: int = Field(default=20, ge=1)  # Deprecated: no longer used
     max_iterations: int = Field(default=15, ge=1)  # Deprecated: no longer used
     annotate_line_ages: bool = True  # Deprecated: no longer used
+    # --- wiki-tree memory knobs (opt-in; default off = stock behavior) ---
+    # Master gate for the wiki-tree memory subsystem: per-user MOC context
+    # injection + the consolidation Ingest/Lint passes. Default off so a stock
+    # install behaves exactly as before.
+    wiki_enabled: bool = False
+    # Optional dense semantic tier for wiki_note search. Requires the
+    # nanobot[wiki-search] extra (fastembed). Off by default — BM25 lexical
+    # search always works without it; when on, search fuses BM25 + cosine via RRF.
+    wiki_embeddings: bool = False
+    # Embedding model id for the dense tier (Granite R2 multilingual; the dim is
+    # read from the model and recorded in the manifest). A model fastembed can't
+    # load degrades gracefully to BM25-only. See .agent/wiki-search.md.
+    wiki_embedding_model: str = "ibm-granite/granite-embedding-97m-multilingual-r2"
+    # Cadence for the wiki Lint curation pass. None => use interval_h.
+    lint_cadence_h: int | None = Field(default=None, ge=1)
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""
@@ -136,7 +151,8 @@ class AgentDefaults(Base):
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
     bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
-    unified_session: bool = False  # Share one session across all channels (single-user multi-device)
+    unified_session: bool = False  # Share one session across all channels (single-user multi-device). Legacy: implies unified_memory.
+    unified_memory: bool = False  # CV2: share memory/wiki across users while keeping per-user chat sessions. Suited to multi-user setups in a trusted context (family, small team).
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
     session_ttl_minutes: int = Field(
         default=0,
@@ -156,6 +172,20 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+
+    @model_validator(mode="after")
+    def _check_memory_session_flags(self) -> "AgentDefaults":
+        # CV2: unified_session is the legacy flag and IMPLIES unified_memory.
+        # Setting both true is harmless but ambiguous — emit a warning so
+        # operators converging on multi-user shared-memory setups can drop
+        # unified_session and keep only unified_memory.
+        if self.unified_session and self.unified_memory:
+            import logging
+            logging.getLogger(__name__).warning(
+                "AgentDefaults: unified_session=true implies unified_memory; "
+                "set only unified_memory=true for multi-user shared-memory setups."
+            )
+        return self
 
 
 class AgentsConfig(Base):
