@@ -143,11 +143,16 @@ Dream is configured under `agents.defaults.dream`:
 {
   "agents": {
     "defaults": {
+      "unifiedMemory": false,
       "dream": {
         "intervalH": 2,
         "modelOverride": null,
         "maxBatchSize": 20,
-        "maxIterations": 10
+        "maxIterations": 10,
+        "wikiEnabled": false,
+        "wikiEmbeddings": false,
+        "wikiEmbeddingModel": "ibm-granite/granite-embedding-97m-multilingual-r2",
+        "lintCadenceH": null
       }
     }
   }
@@ -161,6 +166,11 @@ Dream is configured under `agents.defaults.dream`:
 | `modelOverride` | Optional Dream-specific model override *(pending implementation)* |
 | `maxBatchSize` | *(Deprecated — not used)* |
 | `maxIterations` | *(Deprecated — not used)* |
+| `wikiEnabled` | Master switch for [wiki-tree memory](#wiki-tree-memory-opt-in) (default `false`) |
+| `wikiEmbeddings` | Add dense-embedding retrieval over the vault, on top of BM25 (default `false`; needs the `wiki-search` extra) |
+| `wikiEmbeddingModel` | Embedding model id used when `wikiEmbeddings` is on |
+| `lintCadenceH` | How often the deterministic vault Lint runs, in hours (`null` = each consolidation). *Reserved for the consolidation pass.* |
+| `unifiedMemory` *(on `agents.defaults`, not `dream`)* | Share one memory/wiki vault across users while keeping per-user chat sessions (default `false`) |
 
 In practical terms:
 
@@ -168,6 +178,37 @@ In practical terms:
 - `cron` overrides `intervalH` when set, allowing precise cron expressions (e.g. `0 */4 * * *`).
 - `modelOverride` is reserved for a future release. Currently Dream uses the same model as the main agent.
 - `maxBatchSize` and `maxIterations` are preserved for config compatibility but no longer affect behavior.
+- `wikiEnabled` turns on the wiki-tree memory layer described below. With it off (the default), the
+  system prompt and memory behavior are byte-identical to a stock install.
+- All keys accept their snake_case form too (`wiki_enabled`, `unified_memory`, …) — both spellings work.
+
+## Wiki-tree memory (opt-in)
+
+When `wikiEnabled` is on, durable knowledge is stored not as flat prose but as a navigable,
+Obsidian-style **per-user vault**: typed Markdown leaf pages (one subject per page) connected by
+`[[wikilinks]]`, with an auto-generated **Map-of-Content (MOC)** index. It is opt-in and
+default-off; the full design rationale is in
+[`wiki-tree-memory-design.md`](wiki-tree-memory-design.md).
+
+How it changes the flow:
+
+- **Read path.** Instead of pasting the whole memory into every turn, only the compact MOC index
+  (plus the vault's `USER.md`) is injected at context-build time. Per-turn cost stays roughly
+  constant as the vault grows; the agent navigates from the index to the specific page it needs.
+- **Write path ("dual pen").** The `wiki_note` tool writes pages immediately during a turn, so
+  nothing is lost between consolidations. The MOC is refreshed cheaply after each turn.
+- **Retrieval.** A `search` over the vault ranks pages with BM25, and — when `wikiEmbeddings` is on
+  — fuses in dense-embedding similarity. This is what makes long-term facts *recalled by topic*,
+  not just stored.
+- **Hot/cold decay.** Pages untouched past a per-type threshold move to a cold area and reheat on
+  read, so the working set stays bounded without anything being deleted.
+
+The vault lives under `memory/users/<key>/` and is auto-committed via `GitStore`, so wiki memory is
+versioned and restorable just like the rest.
+
+> **Status:** this opt-in layer ships the engine, the `wiki_note` tool, and the read/write path.
+> Automatic consolidation (distilling history into pages on the Dream cron) is tracked separately —
+> see HKUDS/nanobot#4241. Until then, pages are written by the tool during conversations.
 
 ## In Practice
 
